@@ -2,7 +2,7 @@
 use crate::{
     backend::{self, Backend},
     error::invalid,
-    netlink::Netlink,
+    netlink::{Netlink, NlFamily, Notifications},
     rpc_api::*,
     transport,
 };
@@ -33,6 +33,7 @@ pub struct Session {
     connected: AtomicBool,
     closed: AtomicBool,
     control: UnixStream,
+    event_sockets: Mutex<Option<[Netlink; 2]>>,
 }
 impl Session {
     fn fail(&self) {
@@ -56,60 +57,46 @@ impl Drop for Service {
         }
     }
 }
-fn event_loop(session: Arc<Session>, xfrm: bool, socket: Netlink) {
-    while !session.closed.load(Ordering::Acquire) {
-        let mut fds = [rustix::event::PollFd::new(
-            &socket,
-            rustix::event::PollFlags::IN,
-        )];
-        if !matches!(rustix::event::poll(&mut fds, Some(&rustix::event::Timespec { tv_sec: 0, tv_nsec: 200_000_000 })), Ok(n) if n > 0)
-        {
-            continue;
+fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
+    for notification in notifications {
+        if session.closed.load(Ordering::Acquire) {
+            return;
         }
-        let replies = match socket.receive() {
-            Ok(r) => r,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) =>
-            {
-                continue
-            }
+        let r = match notification {
+            Ok(reply) => reply,
             Err(_) => {
                 session.fail();
-                break;
+                return;
             }
         };
-        for r in replies {
-            let result = if xfrm {
-                let mut backend = session.backend.lock().unwrap();
-                let result = backend.xfrm.event(&r);
-                if let Err(e) = backend.reconcile_interfaces() {
-                    eprintln!("kernel-daemon: interface cleanup: {e}");
-                }
-                result
-            } else {
-                Ok(Some(Event {
-                    kind: Event_kind::roam,
-                    addressChanged: Some([16, 17, 20, 21].contains(&r.kind)),
-                    expiry: None,
-                    acquire: None,
-                    mapping: None,
-                }))
-            };
-            match result {
-                Ok(Some(event)) if session.connected.load(Ordering::Acquire) => {
-                    if session.events.try_send(Some(event)).is_err() {
-                        session.fail();
-                    }
-                }
-                Err(e) => eprintln!("kernel-daemon: kernel event: {e}"),
-                _ => (),
+        let result = if xfrm {
+            let mut backend = session.backend.lock().unwrap();
+            let result = backend.xfrm.event(&r);
+            if let Err(e) = backend.reconcile_interfaces() {
+                eprintln!("kernel-daemon: interface cleanup: {e}");
             }
+            result
+        } else {
+            Ok(Some(Event {
+                kind: Event_kind::roam,
+                addressChanged: Some([16, 17, 20, 21].contains(&r.kind)),
+                expiry: None,
+                acquire: None,
+                mapping: None,
+            }))
+        };
+        match result {
+            Ok(Some(event)) if session.connected.load(Ordering::Acquire) => {
+                if session.events.try_send(Some(event)).is_err() {
+                    session.fail();
+                }
+            }
+            Err(e) => eprintln!("kernel-daemon: kernel event: {e}"),
+            _ => (),
         }
+    }
+    if !session.closed.load(Ordering::Acquire) {
+        session.fail();
     }
 }
 macro_rules! request {
@@ -161,8 +148,9 @@ impl VarlinkInterface for Service {
                 interfaces_use,
                 interfaces_ignore,
             )?;
-            let xfrm = Netlink::new(libc::NETLINK_XFRM, 1 | 2 | 128)?;
-            let route = Netlink::new(libc::NETLINK_ROUTE, 1 | 0x10 | 0x100 | 0x40 | 0x400)?;
+            let (xfrm_socket, xfrm) = Netlink::subscribe(NlFamily::Xfrm, 1 | 2 | 128)?;
+            let (route_socket, route) =
+                Netlink::subscribe(NlFamily::Route, 1 | 0x10 | 0x100 | 0x40 | 0x400)?;
             let mut token = [0u8; 32];
             std::fs::File::open("/dev/urandom")?.read_exact(&mut token)?;
             let token: String = token
@@ -182,6 +170,7 @@ impl VarlinkInterface for Service {
                 connected: AtomicBool::new(true),
                 closed: AtomicBool::new(false),
                 control: self.socket.try_clone()?,
+                event_sockets: Mutex::new(Some([xfrm_socket, route_socket])),
             });
             Ok((s, token, features, xfrm, route))
         };
@@ -206,6 +195,9 @@ impl VarlinkInterface for Service {
                 let s = self.control.lock().unwrap().as_ref().unwrap().clone();
                 s.connected.store(false, Ordering::Release);
                 s.closed.store(true, Ordering::Release);
+                // Dropping the neli routers stops their receive threads and
+                // closes the notification streams, waking our event workers.
+                s.event_sockets.lock().unwrap().take();
                 // Wake WatchEvents immediately so clean, rapid restarts do not
                 // exhaust the bounded connection slots waiting for its timeout.
                 let _ = s.events.try_send(None);

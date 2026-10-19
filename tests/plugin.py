@@ -151,13 +151,24 @@ def run(prefix):
                     time.sleep(0.01)
                 else:
                     raise AssertionError("daemon did not start")
+                def daemon_resources():
+                    return (len(os.listdir(f"/proc/{daemon.pid}/fd")),
+                            len(os.listdir(f"/proc/{daemon.pid}/task")))
+                baseline_resources = daemon_resources()
                 subprocess.run(["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups",
                                 "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
                                 sys.executable, str(script), str(prefix), "--child", str(config)], check=True)
+                for _ in range(500):
+                    resources = daemon_resources()
+                    if all(current <= baseline for current, baseline in zip(resources, baseline_resources)):
+                        break
+                    time.sleep(0.01)
+                else:
+                    raise AssertionError(f"daemon leaked descriptors or workers: {baseline_resources} -> {resources}")
             finally:
                 daemon.terminate()
                 daemon.wait(timeout=10)
-    print("PASS: Rust enumerate/venumerate C ABI, IPv4/IPv6 addresses/subnets, eight clean capability-free sessions without descriptor leaks")
+    print("PASS: Rust enumerate/venumerate C ABI, IPv4/IPv6 addresses/subnets, eight clean capability-free sessions without client/daemon descriptor or daemon worker leaks")
 
 
 if __name__ == "__main__":

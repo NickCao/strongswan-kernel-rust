@@ -6,7 +6,7 @@ use crate::{
     backend::{endpoint, rpc_selector},
     error::invalid,
     model::*,
-    netlink::{self, Message, Netlink, Reply, ACK},
+    netlink::{self, Message, Netlink, NlFamily, NlmF, Reply},
     rpc_api as rpc,
     uapi::*,
 };
@@ -232,7 +232,7 @@ impl Xfrm {
             .map(|s| s.parse::<u32>().unwrap_or(0));
         let version = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
         Ok(Self {
-            socket: Netlink::new(libc::NETLINK_XFRM, 0)?,
+            socket: Netlink::new(NlFamily::Xfrm)?,
             sas: HashSet::new(),
             allocations: HashSet::new(),
             policies: HashMap::new(),
@@ -263,7 +263,7 @@ impl Xfrm {
         put16(&mut b, off!(Sa, family), src.family());
         put32(&mut b, off!(Spi, min), min);
         put32(&mut b, off!(Spi, max), max);
-        let mut msg = Message::new(ALLOCSPI, 0, b);
+        let mut msg = Message::new(ALLOCSPI, NlmF::empty(), b);
         if self.sa_dir {
             msg.attr(SA_DIR, &[1])?;
         }
@@ -333,7 +333,7 @@ impl Xfrm {
         if !data.esn && replay <= 32 {
             b[off!(Sa, replay_window)] = replay as u8;
         }
-        let mut m = Message::new(if data.update { UPDSA } else { NEWSA }, ACK, b);
+        let mut m = Message::new(if data.update { UPDSA } else { NEWSA }, NlmF::ACK, b);
         if data.enc_alg != 1024 {
             let (name, icv) = enc_algorithm(data.enc_alg)
                 .or_else(|| (!data.enc_name.is_empty()).then_some((data.enc_name.as_str(), None)))
@@ -412,7 +412,7 @@ impl Xfrm {
         if !self.owned(id) {
             return Err(missing());
         }
-        let mut m = Message::new(GETSA, 0, sa_id(id));
+        let mut m = Message::new(GETSA, NlmF::empty(), sa_id(id));
         id_attrs(&mut m, id.mark, id.if_id)?;
         self.socket
             .request(&m)?
@@ -424,7 +424,7 @@ impl Xfrm {
         let r = self.read_sa(id)?;
         let o = off!(Sa, curlft);
         let mut last = 0;
-        for (kind, b) in netlink::attrs(&r.payload[netlink::align(size_of::<Sa>())..])? {
+        for (kind, b) in netlink::attrs(&r.payload[netlink::align(size_of::<Sa>())..])?.iter() {
             if kind == LASTUSED && b.len() == 8 {
                 last = get64(b, 0);
             }
@@ -439,7 +439,7 @@ impl Xfrm {
         if !self.owned(id) {
             return Err(missing());
         }
-        let mut m = Message::new(DELSA, ACK, sa_id(id));
+        let mut m = Message::new(DELSA, NlmF::ACK, sa_id(id));
         id_attrs(&mut m, id.mark, id.if_id)?;
         match self.socket.ack(&m) {
             Ok(()) => (),
@@ -534,7 +534,7 @@ impl Xfrm {
         put32(&mut b, off!(Policy, priority), Self::priorities(id, data).0);
         b[off!(Policy, dir)] = id.dir;
         b[off!(Policy, action)] = u8::from(data.kind == 3);
-        let mut m = Message::new(if update { UPDPOLICY } else { NEWPOLICY }, ACK, b);
+        let mut m = Message::new(if update { UPDPOLICY } else { NEWPOLICY }, NlmF::ACK, b);
         if data.kind == 1 && data.reqid != 0 {
             let mut t = buffer::<Template>();
             t[off!(Template, id) + off!(Id, proto)] = 50;
@@ -584,7 +584,7 @@ impl Xfrm {
         let sel = selector(&id.src, &id.dst, "")?;
         b[..sel.len()].copy_from_slice(&sel);
         b[off!(crate::uapi::PolicyId, dir)] = id.dir;
-        let mut m = Message::new(DELPOLICY, ACK, b);
+        let mut m = Message::new(DELPOLICY, NlmF::ACK, b);
         id_attrs(&mut m, id.mark, id.if_id)?;
         Ok(m)
     }
@@ -616,7 +616,7 @@ impl Xfrm {
         }
         let mut m = Self::delete_policy_message(id)?;
         m.kind = GETPOLICY;
-        m.flags = netlink::REQUEST;
+        m.flags = NlmF::empty();
         let r = self
             .socket
             .request(&m)?
@@ -715,7 +715,8 @@ impl Xfrm {
                 }
                 let mut reqid = 0;
                 let mut if_id = 0;
-                for (kind, a) in netlink::attrs(&b[netlink::align(size_of::<Acquire>())..])? {
+                for (kind, a) in netlink::attrs(&b[netlink::align(size_of::<Acquire>())..])?.iter()
+                {
                     if kind == TMPL && a.len() >= size_of::<Template>() {
                         reqid = get32(a, off!(Template, reqid));
                     }
@@ -751,7 +752,7 @@ impl Xfrm {
                 let src = Host::from_kernel(family, &b[off!(Sa, saddr)..], 0)?;
                 let mut mark = Mark::default();
                 let mut if_id = 0;
-                for (kind, a) in netlink::attrs(&b[netlink::align(size_of::<Expire>())..])? {
+                for (kind, a) in netlink::attrs(&b[netlink::align(size_of::<Expire>())..])?.iter() {
                     if kind == IF_ID && a.len() == 4 {
                         if_id = get32(a, 0);
                     }

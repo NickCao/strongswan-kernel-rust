@@ -4,10 +4,16 @@
 use crate::{
     error::invalid,
     model::*,
-    netlink::{self, Message, Netlink, ACK, CREATE, DUMP, EXCL},
-    uapi::{get16, get32, put32},
+    netlink::{self, attribute, Netlink, NlFamily, NlmF},
+    uapi::{get16, get32},
 };
-use std::io;
+use neli::{
+    consts::rtnl::{Ifa, Ifla, IflaInfo, RtAddrFamily, Rta, Rtm},
+    rtnl::{Ifaddrmsg, Ifinfomsg, IfinfomsgBuilder, RtgenmsgBuilder, Rtmsg},
+    types::RtBuffer,
+    FromBytesWithInput,
+};
+use std::io::{self, Cursor};
 
 #[derive(Clone, Debug)]
 pub struct Link {
@@ -66,38 +72,48 @@ pub fn index(name: &str) -> io::Result<u32> {
 impl Network {
     pub fn new() -> io::Result<Self> {
         Ok(Self {
-            socket: Netlink::new(libc::NETLINK_ROUTE, 0)?,
+            socket: Netlink::new(NlFamily::Route)?,
             config: Config::default(),
         })
     }
     pub fn links(&mut self) -> io::Result<Vec<Link>> {
         let mut links = Vec::new();
-        for r in self.socket.request(&Message::new(18, DUMP, vec![0; 16]))? {
-            if r.kind != 16 || r.payload.len() < 16 {
+        let request = IfinfomsgBuilder::default()
+            .ifi_family(RtAddrFamily::Unspecified)
+            .build()
+            .map_err(io::Error::other)?;
+        for r in self
+            .socket
+            .request_payload(Rtm::Getlink.into(), NlmF::DUMP, request)?
+        {
+            if r.kind != u16::from(Rtm::Newlink) {
                 continue;
             }
-            let b = &r.payload;
+            let info =
+                Ifinfomsg::from_bytes_with_input(&mut Cursor::new(&r.payload), r.payload.len())
+                    .map_err(io::Error::other)?;
             let mut link = Link {
-                index: get32(b, 4),
-                flags: get32(b, 8),
+                index: *info.ifi_index() as u32,
+                flags: info.ifi_flags().bits(),
                 name: String::new(),
                 mtu: 0,
                 xfrm: None,
             };
-            for (kind, value) in netlink::attrs(&b[16..])? {
-                match kind {
-                    3 => link.name = text(value)?,
-                    4 if value.len() == 4 => link.mtu = get32(value, 0),
-                    18 => {
+            for attr in info.rtattrs().iter() {
+                let value = attr.rta_payload().as_ref();
+                match Ifla::from(u16::from(*attr.rta_type()) & 0x3fff) {
+                    Ifla::Ifname => link.name = text(value)?,
+                    Ifla::Mtu if value.len() == 4 => link.mtu = get32(value, 0),
+                    Ifla::Linkinfo => {
                         let nested = netlink::attrs(value)?;
                         if nested
                             .iter()
-                            .any(|(k, v)| *k == 1 && v.starts_with(b"xfrm\0"))
+                            .any(|(k, v)| k == 1 && v.starts_with(b"xfrm\0"))
                         {
                             let mut if_id = 0;
                             let mut phys = 0;
                             for (_, data) in nested.iter().filter(|(k, _)| *k == 2) {
-                                for (k, v) in netlink::attrs(data)? {
+                                for (k, v) in netlink::attrs(data)?.iter() {
                                     if v.len() == 4 {
                                         match k {
                                             1 => phys = get32(v, 0),
@@ -121,33 +137,44 @@ impl Network {
     }
     pub fn addresses(&mut self) -> io::Result<Vec<AddressEntry>> {
         let mut out = Vec::new();
-        for r in self.socket.request(&Message::new(22, DUMP, vec![0; 8]))? {
-            let b = &r.payload;
-            if r.kind != 20 || b.len() < 8 {
+        let request = RtgenmsgBuilder::default()
+            .rtgen_family(RtAddrFamily::Unspecified)
+            .build()
+            .map_err(io::Error::other)?;
+        for r in self
+            .socket
+            .request_payload(Rtm::Getaddr.into(), NlmF::DUMP, request)?
+        {
+            if r.kind != u16::from(Rtm::Newaddr) {
                 continue;
             }
-            if ![libc::AF_INET as u8, libc::AF_INET6 as u8].contains(&b[0]) {
+            let info =
+                Ifaddrmsg::from_bytes_with_input(&mut Cursor::new(&r.payload), r.payload.len())
+                    .map_err(io::Error::other)?;
+            let family = u8::from(*info.ifa_family());
+            if ![libc::AF_INET as u8, libc::AF_INET6 as u8].contains(&family) {
                 continue;
             }
             let mut bytes = None;
             let mut local = None;
-            let mut flags = b[2] as u32;
-            for (kind, value) in netlink::attrs(&b[8..])? {
-                match kind {
-                    1 => bytes = Some(value),
-                    2 => local = Some(value),
-                    8 if value.len() == 4 => flags = get32(value, 0),
+            let mut flags = info.ifa_flags().bits() as u32;
+            for attr in info.rtattrs().iter() {
+                let value = attr.rta_payload().as_ref();
+                match attr.rta_type() {
+                    Ifa::Address => bytes = Some(value),
+                    Ifa::Local => local = Some(value),
+                    Ifa::Flags if value.len() == 4 => flags = get32(value, 0),
                     _ => (),
                 }
             }
             if let Some(bytes) = local.or(bytes) {
-                let host = Host::from_kernel(b[0] as u16, bytes, 0)?;
+                let host = Host::from_kernel(family.into(), bytes, 0)?;
                 out.push(AddressEntry {
                     host,
-                    prefix: b[1],
-                    scope: b[3],
+                    prefix: *info.ifa_prefixlen(),
+                    scope: u8::from(*info.ifa_scope()),
                     flags,
-                    index: get32(b, 4),
+                    index: *info.ifa_index(),
                 });
             }
         }
@@ -209,37 +236,45 @@ impl Network {
         Err(absent())
     }
     fn candidates(&mut self, family: u16) -> io::Result<Vec<Candidate>> {
-        let mut query = vec![0; 12];
-        query[0] = family as u8;
+        let query = RtgenmsgBuilder::default()
+            .rtgen_family(RtAddrFamily::from(family as u8))
+            .build()
+            .map_err(io::Error::other)?;
         let mut out = Vec::new();
-        for r in self.socket.request(&Message::new(26, DUMP, query))? {
-            let b = &r.payload;
-            if r.kind != 24
-                || b.len() < 12
-                || b[0] as u16 != family
-                || b[1] > if family == 2 { 32 } else { 128 }
+        for r in self
+            .socket
+            .request_payload(Rtm::Getroute.into(), NlmF::DUMP, query)?
+        {
+            if r.kind != u16::from(Rtm::Newroute) {
+                continue;
+            }
+            let info = Rtmsg::from_bytes_with_input(&mut Cursor::new(&r.payload), r.payload.len())
+                .map_err(io::Error::other)?;
+            if u8::from(*info.rtm_family()) as u16 != family
+                || *info.rtm_dst_len() > if family == 2 { 32 } else { 128 }
             {
                 continue;
             }
             let mut route = Candidate {
                 dst: Host::any(family)?,
-                prefix: b[1],
+                prefix: *info.rtm_dst_len(),
                 gateway: None,
                 source: None,
                 index: 0,
-                table: b[4] as u32,
+                table: u8::from(*info.rtm_table()) as u32,
                 priority: 0,
-                kind: b[7],
+                kind: u8::from(*info.rtm_type()),
             };
-            for (kind, v) in netlink::attrs(&b[12..])? {
-                match kind {
-                    1 => route.dst = Host::from_kernel(family, v, 0)?,
-                    4 if v.len() == 4 => route.index = get32(v, 0),
-                    5 => route.gateway = Some(Host::from_kernel(family, v, 0)?),
-                    6 if v.len() == 4 => route.priority = get32(v, 0),
-                    7 => route.source = Some(Host::from_kernel(family, v, 0)?),
-                    15 if v.len() == 4 => route.table = get32(v, 0),
-                    9 if v.len() >= 8 => {
+            for attr in info.rtattrs().iter() {
+                let v = attr.rta_payload().as_ref();
+                match attr.rta_type() {
+                    Rta::Dst => route.dst = Host::from_kernel(family, v, 0)?,
+                    Rta::Oif if v.len() == 4 => route.index = get32(v, 0),
+                    Rta::Gateway => route.gateway = Some(Host::from_kernel(family, v, 0)?),
+                    Rta::Priority if v.len() == 4 => route.priority = get32(v, 0),
+                    Rta::Prefsrc => route.source = Some(Host::from_kernel(family, v, 0)?),
+                    Rta::Table if v.len() == 4 => route.table = get32(v, 0),
+                    Rta::Multipath if v.len() >= 8 => {
                         // First live multipath nexthop
                         let mut hops = v;
                         while hops.len() >= 8 {
@@ -249,7 +284,7 @@ impl Network {
                             }
                             if hops[2] & 1 == 0 {
                                 route.index = get32(hops, 4);
-                                for (k, a) in netlink::attrs(&hops[8..len])? {
+                                for (k, a) in netlink::attrs(&hops[8..len])?.iter() {
                                     if k == 5 {
                                         route.gateway = Some(Host::from_kernel(family, a, 0)?);
                                     }
@@ -340,39 +375,50 @@ impl Network {
         if name.is_empty() || name.len() >= libc::IFNAMSIZ {
             return Err(invalid());
         }
-        let mut b = vec![0; 16];
-        put32(&mut b, 8, 1);
-        put32(&mut b, 12, 1);
-        let mut m = Message::new(16, ACK | CREATE | EXCL, b);
-        m.attr(3, &nul(&name))?;
+        let mut attributes = RtBuffer::new();
+        attributes.push(attribute(Ifla::Ifname, name.as_str())?);
         if mtu != 0 {
-            m.attr32(4, mtu)?;
+            attributes.push(attribute(Ifla::Mtu, mtu)?);
         }
-        let mut info = Message::new(0, 0, vec![]);
-        info.attr(1, b"xfrm\0")?;
-        let mut data = Message::new(0, 0, vec![]);
-        data.attr32(2, if_id)?;
+        let mut data = RtBuffer::new();
+        data.push(attribute(2u16, if_id)?);
         if !phys.is_empty() {
-            data.attr32(1, index(&phys)?)?;
+            data.push(attribute(1u16, index(&phys)?)?);
         }
-        info.attr(2 | 0x8000, &data.payload)?;
-        m.attr(18 | 0x8000, &info.payload)?;
-        self.socket.ack(&m)?;
+        let info: RtBuffer<_, _> = [
+            attribute(u16::from(IflaInfo::Kind), "xfrm")?,
+            attribute(u16::from(IflaInfo::Data) | 0x8000, data)?,
+        ]
+        .into_iter()
+        .collect();
+        attributes.push(attribute(
+            Ifla::from(u16::from(Ifla::Linkinfo) | 0x8000),
+            info,
+        )?);
+        let payload = IfinfomsgBuilder::default()
+            .ifi_family(RtAddrFamily::Unspecified)
+            .up()
+            .rtattrs(attributes)
+            .build()
+            .map_err(io::Error::other)?;
+        self.socket.request_payload(
+            Rtm::Newlink.into(),
+            NlmF::ACK | NlmF::CREATE | NlmF::EXCL,
+            payload,
+        )?;
         Ok(())
     }
     pub(crate) fn delete_xfrmi(&mut self, index: u32) -> io::Result<()> {
-        let mut b = vec![0; 16];
-        put32(&mut b, 4, index);
-        self.socket.ack(&Message::new(17, ACK, b))?;
+        let payload = IfinfomsgBuilder::default()
+            .ifi_family(RtAddrFamily::Unspecified)
+            .ifi_index(index as i32)
+            .build()
+            .map_err(io::Error::other)?;
+        self.socket
+            .request_payload(Rtm::Dellink.into(), NlmF::ACK, payload)?;
         Ok(())
     }
 }
-fn nul(s: &str) -> Vec<u8> {
-    let mut b = s.as_bytes().to_vec();
-    b.push(0);
-    b
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -186,18 +186,22 @@ isolated location for its compile-time PID file; the dynamic-user tunnel test
 does this with a systemd-managed runtime directory mounted at `/run`.
 
 The daemon has a separate lifetime from charon. SA keys travel over the private
-socket and are never returned by query methods. Binary key buffers and Netlink buffers
-are wiped on release; JSON libraries may make transient copies. Core dumps
-are disabled in the daemon. Avoid tracing RPC payloads.
+socket and are never returned by query methods. Netlink uses neli's standard
+buffers; these and library serialization copies are not guaranteed to be wiped.
+Core dumps are disabled in the daemon. Avoid tracing RPC or Netlink payloads.
 
 ## Safety boundaries
 
 The daemon and shared protocol crate use `#![forbid(unsafe_code)]`, including
-the RPC client and socket framing. Linux calls use safe Rustix APIs, and peer
+the RPC client and socket framing. Linux calls use safe library APIs, and peer
 credentials use Nix's raw PID representation, which also handles a peer PID of
-zero across PID namespaces. Netlink messages are encoded and decoded as bounded
-byte slices. The daemon uses errno replies and does not request unused extended
-acknowledgment text.
+zero across PID namespaces. [neli](https://docs.rs/neli/0.7.4/neli/)
+handles Netlink sockets, message and attribute serialization, multipart replies,
+ACKs, sequence/PID checks, and multicast notifications. Network discovery and
+XFRM interface operations use its routing types. The daemon retains the XFRM
+UAPI payload layouts, which neli does not provide, and translates kernel errors
+to errno replies. Closing a session drops its notification routers and wakes
+the event workers.
 
 The plugin still implements strongSwan's C interfaces. Its remaining unsafe
 code borrows C callback arguments, invokes host functions, manages the exported
@@ -259,7 +263,8 @@ selectors, high ports, output marks, traffic counters, actual rekeying with
 stable interface indices, and final-SA interface deletion. The ABI test uses
 the stock strongSwan 6.1 function tables to exercise both variadic `enumerate`
 and C `va_list` forwarding to Rust's `venumerate`, with IPv4/IPv6 addresses and
-subnets, plus repeated clean sessions and descriptor cleanup. The default tunnel run
+subnets, plus repeated clean sessions and client/daemon descriptor and daemon
+worker cleanup. The default tunnel run
 negotiates default ESP proposals; the second forces AES-CBC/HMAC-SHA256
 with ESN.
 The `--dynamic-user` variant needs a system systemd instance and the existing
