@@ -11,7 +11,8 @@ let
           local_port = 13000
           remote_port = 13000
           proposals = aes128-sha256-x25519
-          encap = yes
+          # The backend must force ESP-in-UDP without a connection override.
+          encap = no
           mobike = no
           if_id_in = %unique
           if_id_out = %unique

@@ -18,6 +18,10 @@ IPComp, IP-TFS, hardware offload, labels, virtual IPs, and host route/rule
 installation are outside this backend's scope. The plugin rejects these
 features instead of silently changing their behavior.
 
+The backend advertises `KERNEL_REQUIRE_UDP_ENCAPSULATION`, so charon forces
+ESP-in-UDP for its connections. Existing `encap=yes` configurations behave
+the same.
+
 An interface named `ranet<if_id in eight hex digits>` is created and brought
 up **before its first SA is installed**. Its default MTU is 1400. Every SA
 using that ID shares the interface, including inbound/outbound SAs and old/new

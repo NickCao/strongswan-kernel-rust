@@ -23,6 +23,13 @@ use std::{
 const SA_DIR: u16 = 33;
 pub const NEWSA: u16 = packet::XFRM_MSG_NEWSA;
 
+// kernel_feature_t from strongSwan's kernel_interface.h.
+const KERNEL_ESP_V3_TFC: u32 = 1 << 0;
+const KERNEL_REQUIRE_UDP_ENCAPSULATION: u32 = 1 << 2;
+const KERNEL_POLICY_SPI: u32 = 1 << 4;
+const KERNEL_SA_USE_TIME: u32 = 1 << 5;
+const KERNEL_ACQUIRE_SEQ: u32 = 1 << 6;
+
 fn missing() -> io::Error {
     io::Error::from_raw_os_error(libc::ENOENT)
 }
@@ -227,7 +234,11 @@ impl Xfrm {
         })
     }
     pub fn features(&self) -> u32 {
-        1 | 16 | 64 | if self.lastused { 32 } else { 0 }
+        KERNEL_ESP_V3_TFC
+            | KERNEL_REQUIRE_UDP_ENCAPSULATION
+            | KERNEL_POLICY_SPI
+            | KERNEL_ACQUIRE_SEQ
+            | if self.lastused { KERNEL_SA_USE_TIME } else { 0 }
     }
     pub fn allocate(
         &mut self,
