@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Safe Varlink client. No C objects, raw descriptors, callbacks, or host globals.
-use crate::{self as api, transport::peer};
+use crate as api;
 use rustix::net::{recv, RecvFlags};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
@@ -21,7 +21,6 @@ use varlink::sansio::{Client as Protocol, ClientEvent};
 
 pub struct Config {
     pub path: String,
-    pub daemon_uid: u32,
     pub interfaces_use: String,
     pub interfaces_ignore: String,
 }
@@ -51,11 +50,8 @@ struct Channel {
     protocol: Protocol,
 }
 impl Channel {
-    fn connect(path: &str, uid: u32) -> io::Result<Self> {
+    fn connect(path: &str) -> io::Result<Self> {
         let stream = UnixStream::connect(path)?;
-        if peer(&stream)?.uid != uid {
-            return Err(io::ErrorKind::PermissionDenied.into());
-        }
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
         Ok(Self {
@@ -132,7 +128,7 @@ impl Events {
 
 impl Client {
     pub fn connect(config: &Config) -> io::Result<(Arc<Self>, Events)> {
-        let mut control = Channel::connect(&config.path, config.daemon_uid)?;
+        let mut control = Channel::connect(&config.path)?;
         control.send(
             "OpenSession",
             &api::OpenSession_Args {
@@ -153,7 +149,7 @@ impl Client {
                 return Err(io::ErrorKind::InvalidData.into());
             }
             let features = i32::try_from(session.features).map_err(io::Error::other)?;
-            let mut events = Channel::connect(&config.path, config.daemon_uid)?;
+            let mut events = Channel::connect(&config.path)?;
             events.send(
                 "WatchEvents",
                 &api::WatchEvents_Args {
@@ -274,10 +270,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("kernel.sock");
         let listener = UnixListener::bind(&path).unwrap();
-        let (a, _b) = UnixStream::pair().unwrap();
         let config = Config {
             path: path.to_str().unwrap().into(),
-            daemon_uid: peer(&a).unwrap().uid,
             interfaces_use: "eth0".into(),
             interfaces_ignore: "lo".into(),
         };
@@ -405,21 +399,6 @@ mod tests {
             reply(&mut control, json!({}));
         });
         assert!(Client::connect(&config).is_err());
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn wrong_daemon_uid_is_rejected_before_sending_session_data() {
-        let (_directory, listener, mut config) = fixture();
-        config.daemon_uid = config.daemon_uid.wrapping_add(1);
-        let server = thread::spawn(move || {
-            let (mut control, _) = listener.accept().unwrap();
-            let mut bytes = [0u8];
-            assert_eq!(control.read(&mut bytes).unwrap(), 0);
-        });
-        assert!(
-            matches!(Client::connect(&config), Err(error) if error.kind() == io::ErrorKind::PermissionDenied)
-        );
         server.join().unwrap();
     }
 

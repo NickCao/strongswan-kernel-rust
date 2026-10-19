@@ -126,8 +126,6 @@ def run(prefix, cbc=False, vici_python=None, dynamic_user=False):
                 else:
                     # PID files are isolated too. /run is private to this mount
                     # namespace; the outer VM's runtime directory is untouched.
-                    # From this child PID namespace SO_PEERCRED reports pid 0 for
-                    # the external daemon; only its UID is required by the client.
                     script = pdir / "start.sh"
                     script.write_text("""#!/bin/sh
 set -eu

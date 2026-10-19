@@ -61,7 +61,7 @@ pub fn index(name: &str) -> io::Result<u32> {
         return Err(invalid());
     }
     let socket = rustix::net::socket_with(
-        rustix::net::AddressFamily::INET,
+        rustix::net::AddressFamily::UNIX,
         rustix::net::SocketType::DGRAM,
         rustix::net::SocketFlags::CLOEXEC,
         None,

@@ -49,7 +49,6 @@ pub unsafe fn config() -> Result<kernel_rust_protocol::client::Config> {
                 c"%s.plugins.kernel-rust.socket",
                 c"/run/charon-kernel/charon-kernel.sock",
             )?,
-            daemon_uid: setting_int(c"%s.plugins.kernel-rust.daemon_uid", 0) as u32,
             interfaces_use: setting_str(c"%s.interfaces_use", c"")?,
             interfaces_ignore: setting_str(c"%s.interfaces_ignore", c"")?,
         })

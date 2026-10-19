@@ -31,6 +31,56 @@ interfaces are wanted. Route/address configuration for the overlay remains
 with the network configuration, using the daemon-created interface names.
 There are no interface creation/deletion RPCs exposed to charon.
 
+## Build with Nix
+
+The flake provides packages for `x86_64-linux` and `aarch64-linux`:
+
+```sh
+nix build                         # daemon and plugin
+nix build .#charon-kernel-daemon  # daemon alone, without strongSwan headers
+nix build .#strongswan            # matching strongSwan for NixOS
+nix develop                      # Cargo/cargo-c shell with both header paths set
+nix flake check -L               # package checks and a two-machine NixOS VM test
+```
+
+`flake.lock` pins nixpkgs and the Rust overlay. The toolchain follows
+`rust-toolchain.toml`. The flake supplies a recent cargo-c and prepares a
+header tree and `config.h` using the strongSwan package's source, patches,
+dependencies, and configure flags. No manual header paths are needed.
+
+Import `kernel-rust.nixosModules.default` from the flake into your NixOS
+configuration and set `services.charon-kernel.enable = true`. The module adds
+the daemon, plugin, and matching strongSwan to `environment.systemPackages`,
+links `/lib/ipsec/plugins` into the system profile, and selects the matching
+package for `services.strongswan-swanctl`. The strongSwan package uses
+`--with-plugindir=/run/current-system/sw/lib/ipsec/plugins`, so external
+plugins in the system profile are discoverable. Installation overrides
+`plugindir` to the package's `lib/ipsec/plugins` directory. EAP plugins are
+disabled; ranet uses public-key authentication. `--with-piddir=/run/strongswan`
+sets the default VICI socket to `/run/strongswan/charon.vici`, so `swanctl`
+needs no `--uri` flag. The module lets systemd create that directory when the
+IKE service is enabled.
+
+The module starts the kernel daemon as a dynamic user with primary group
+`ipsec` and only `CAP_NET_ADMIN`. Systemd manages its runtime directory.
+The service restricts filesystems, namespaces, syscalls, and socket families;
+only `AF_UNIX` and `AF_NETLINK` are allowed. Enable and configure the IKE
+service separately, granting it the `ipsec` supplementary group.
+
+The VM check uses actual strongSwan `charon-systemd` processes with dynamic
+users and no capabilities, alongside the restricted dynamic kernel daemons.
+It checks plugin discovery from the system profile, socket authorization,
+AES-GCM and AES-CBC/HMAC, encrypted IPv4/IPv6 traffic, rekeying without
+interface replacement, final-SA cleanup, and runtime directory removal.
+The test requires KVM on the build host. Run it directly with:
+
+```sh
+nix build .#checks.x86_64-linux.end-to-end -L
+```
+
+See [nix/test.nix](nix/test.nix) for the unprivileged IKE service setup and
+[nix/module.nix](nix/module.nix) for the kernel service's restrictions.
+
 ## Build with Cargo and cargo-c
 
 The repository pins Rust **1.99.1** with `rust-toolchain.toml`. This provides
@@ -114,8 +164,9 @@ Rebuild the plugin when upgrading or changing the host strongSwan build.
 
 ## Run
 
-The daemon needs `CAP_NET_ADMIN` in the relevant network namespace and
-permission to set the socket owner/group (normally root with CAP_CHOWN). Charon
+The daemon needs `CAP_NET_ADMIN` in the relevant network namespace. For an
+unprivileged daemon, its socket access group must be its primary or
+supplementary group. Charon
 needs no capabilities when started as its final user, using writable runtime
 and credential directories and UDP ports at least 1024. It binds its own
 sockets and configures UDP_ENCAP/UDP_GRO locally. The daemon installs global
@@ -136,6 +187,12 @@ its runtime directory. For example, the daemon service can use:
 ```ini
 [Service]
 ExecStart=/usr/bin/charon-kernel-daemon --group ipsec
+DynamicUser=yes
+User=charon-kernel
+Group=ipsec
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
 RuntimeDirectory=charon-kernel
 RuntimeDirectoryMode=0755
 ```
@@ -148,9 +205,8 @@ mode **0660**, and uses the group selected by `--group NAME|GID` (default GID
 0). Linux authorizes connections using filesystem permissions, including
 supplementary groups. There is no configured charon UID. `SO_PEERCRED` binds
 the two connections of a session to the same actual PID/UID; its primary GID
-alone cannot authorize supplementary-group membership. The plugin separately
-verifies the daemon's UID (root by default); set `daemon_uid` if the daemon
-runs as another user with CAP_NET_ADMIN.
+alone cannot authorize supplementary-group membership. The client trusts
+the protected socket path; no daemon UID is configured or pinned.
 
 Example strongswan.conf excerpt, with ranet's endpoint port set to 13000:
 
@@ -167,7 +223,6 @@ charon {
         kernel-rust {
             load = yes
             socket = /run/charon-kernel/charon-kernel.sock
-            daemon_uid = 0
         }
     }
 }
@@ -193,9 +248,9 @@ AmbientCapabilities=
 RuntimeDirectory=strongswan
 ```
 
-Keep the kernel daemon in a separate service. Its root-owned socket and group
-remain stable while systemd allocates and recycles charon's UID and primary
-GID. Configure VICI under the service's runtime directory, for example
+Keep the kernel daemon in a separate service. Its protected socket directory
+and static access group allow systemd to allocate dynamic users to both
+services. Configure VICI under the IKE service's runtime directory, for example
 `unix:///run/strongswan/charon.vici`, and deliver keys through VICI or systemd
 credentials. With the plain `charon` executable, also provide a writable,
 isolated location for its compile-time PID file; the dynamic-user tunnel test
