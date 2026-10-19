@@ -46,78 +46,104 @@ let
       }
     '';
 
-  node = peer: { config, lib, ... }: {
-    imports = [ module ];
-    services.charon-kernel = {
-      enable = true;
-    }
-    // lib.optionalAttrs (peer == 2) {
-      mtu = 1380;
-      interfaceNamePrefix = "gn";
-    };
-    virtualisation = {
-      vlans = [ 1 ];
-      memorySize = 768;
-      cores = 2;
-    };
-    boot.kernelModules = [
-      "xfrm_user"
-      "xfrm_interface"
-      "esp4"
-      "esp6"
-    ];
-    networking = {
-      useDHCP = false;
-      interfaces.eth1.ipv4.addresses = lib.mkForce [
-        {
-          address = "192.0.2.${toString peer}";
-          prefixLength = 24;
-        }
-      ];
-      interfaces.lo = {
-        ipv4.addresses = [
-          {
-            address = "10.${toString peer}.0.1";
-            prefixLength = 32;
-          }
-        ];
-        ipv6.addresses = [
-          {
-            address = "fd10:${toString peer}::1";
-            prefixLength = 128;
-          }
-        ];
-      };
-      firewall = {
-        allowedUDPPorts = [ 13000 ];
-        checkReversePath = false;
-      };
-    };
-    environment.systemPackages = [
-      pkgs.iproute2
-      pkgs.python3
-      pkgs.util-linux
-    ];
-    systemd.services.network-addresses-lo.wantedBy = [ "network.target" ];
-
-    services.strongswan-swanctl.strongswan.extraConfig = ''
-      charon {
-        port = 0
-        port_nat_t = 13000
-        install_routes = no
-        load_modular = yes
-        plugins {
-          include ${config.services.strongswan-swanctl.package}/share/strongswan/templates/config/plugins/*.conf
-          kernel-netlink {
-            load = no
-          }
-          kernel-rust {
-            load = yes
-          }
-        }
+  node =
+    peer:
+    { config, lib, ... }:
+    let
+      master = if peer == 1 then "gravity" else "overlay";
+    in
+    {
+      imports = [ module ];
+      services.charon-kernel = {
+        enable = true;
       }
-    '';
-  };
+      // lib.optionalAttrs (peer == 2) {
+        mtu = 1380;
+        interfaceNamePrefix = "gn";
+        masterDevice = master;
+      };
+      virtualisation = {
+        vlans = [ 1 ];
+        memorySize = 768;
+        cores = 2;
+      };
+      boot.kernelModules = [
+        "xfrm_user"
+        "xfrm_interface"
+        "esp4"
+        "esp6"
+        "vrf"
+      ];
+      networking = {
+        useDHCP = false;
+        interfaces.eth1.ipv4.addresses = lib.mkForce [
+          {
+            address = "192.0.2.${toString peer}";
+            prefixLength = 24;
+          }
+        ];
+        firewall = {
+          allowedUDPPorts = [ 13000 ];
+          checkReversePath = false;
+        };
+      };
+      environment.systemPackages = [
+        pkgs.iproute2
+        pkgs.python3
+        pkgs.util-linux
+      ];
+      systemd.network = {
+        enable = true;
+        netdevs = {
+          "20-overlay-vrf" = {
+            netdevConfig = {
+              Name = master;
+              Kind = "vrf";
+            };
+            vrfConfig.Table = 42;
+          };
+          "20-overlay-addresses".netdevConfig = {
+            Name = "overlay0";
+            Kind = "dummy";
+          };
+        };
+        networks = {
+          "20-overlay-vrf" = {
+            matchConfig.Name = master;
+            networkConfig.LinkLocalAddressing = "no";
+          };
+          "20-overlay-addresses" = {
+            matchConfig.Name = "overlay0";
+            address = [
+              "10.${toString peer}.0.1/32"
+              "fd10:${toString peer}::1/128"
+            ];
+            networkConfig = {
+              VRF = master;
+              LinkLocalAddressing = "no";
+            };
+          };
+        };
+      };
+
+      services.strongswan-swanctl.strongswan.extraConfig = ''
+        charon {
+          port = 0
+          port_nat_t = 13000
+          install_routes = no
+          load_modular = yes
+          plugins {
+            include ${config.services.strongswan-swanctl.package}/share/strongswan/templates/config/plugins/*.conf
+            kernel-netlink {
+              load = no
+            }
+            kernel-rust {
+              load = yes
+            }
+          }
+        }
+      '';
+    };
 in
 {
   name = "strongswan-kernel-rust";
@@ -132,7 +158,7 @@ in
     import time
 
     machines = [left, right]
-    interface_settings = [("ranet", 1400), ("gn", 1380)]
+    interface_settings = [("ranet", 1400, "gravity"), ("gn", 1380, "overlay")]
     capability_fields = ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"]
 
     def ctl(machine, arguments):
@@ -171,15 +197,19 @@ in
 
     def ping_overlay(machine, peer):
         other = 3 - peer
-        machine.succeed(f"ping -c 3 -W 2 -I 10.{peer}.0.1 10.{other}.0.1")
-        machine.succeed(f"ping -6 -c 3 -W 2 -I fd10:{peer}::1 fd10:{other}::1")
+        master = interface_settings[peer - 1][2]
+        machine.succeed(f"ip vrf exec {master} ping -c 3 -W 2 -I 10.{peer}.0.1 10.{other}.0.1")
+        machine.succeed(f"ip vrf exec {master} ping -6 -c 3 -W 2 -I fd10:{peer}::1 fd10:{other}::1")
 
     start_all()
     with subtest("systemd runtime directories and least privilege"):
-        for machine in machines:
+        for peer, machine in enumerate(machines, 1):
             machine.wait_for_unit("strongswan-swanctl.service")
             machine.wait_for_unit("charon-kernel.service")
-            machine.wait_for_unit("network-addresses-lo.service")
+            machine.wait_for_unit("systemd-networkd.service")
+            machine.wait_until_succeeds(
+                f"ip -o -6 address show dev overlay0 | grep -F 'fd10:{peer}::1/128' | grep -v tentative"
+            )
             machine.succeed("test -S /run/charon-kernel/charon-kernel.sock")
             assert property(machine, "charon-kernel.service", "Type") == "notify"
             backend = process_status(machine, "charon-kernel.service")
@@ -233,15 +263,16 @@ in
                 listing = ctl(machine, "--list-sas --raw")
                 match = re.search(r"if-id-out=([0-9a-f]+)", listing)
                 assert match is not None, listing
-                prefix, mtu = interface_settings[peer - 1]
+                prefix, mtu, master = interface_settings[peer - 1]
                 name_out = f"{prefix}{int(match[1], 16):08x}"
                 current = links(machine)
                 assert len(current) == 1 and current[0]["ifname"] == name_out, current
-                assert current[0]["mtu"] == mtu and "UP" in current[0]["flags"]
+                assert current[0]["mtu"] == mtu and {"UP", "MULTICAST"} <= set(current[0]["flags"]), current
+                assert current[0]["master"] == master, current
                 original_indices.append(indices(machine))
                 other = 3 - peer
-                machine.succeed(f"ip route add 10.{other}.0.1/32 dev {name_out}")
-                machine.succeed(f"ip -6 route add fd10:{other}::1/128 dev {name_out}")
+                machine.succeed(f"ip route add vrf {master} 10.{other}.0.1/32 dev {name_out}")
+                machine.succeed(f"ip -6 route add vrf {master} fd10:{other}::1/128 dev {name_out}")
             for peer, machine in enumerate(machines, 1):
                 ping_overlay(machine, peer)
                 state = machine.succeed("ip -s xfrm state")
@@ -262,12 +293,16 @@ in
             for peer, machine in enumerate(machines, 1):
                 ping_overlay(machine, peer)
                 assert indices(machine) == original_indices[peer - 1]
+                assert all(link["master"] == interface_settings[peer - 1][2]
+                           and "MULTICAST" in link["flags"] for link in links(machine))
 
         with subtest(name + ": removing the final SA removes its interface"):
             ctl(left, "--terminate --ike tunnel")
-            for machine in machines:
+            for peer, machine in enumerate(machines, 1):
                 machine.wait_until_succeeds("test -z \"$(ip xfrm state)\"")
                 machine.wait_until_succeeds("test \"$(ip -j link show type xfrm)\" = '[]'")
+                master = interface_settings[peer - 1][2]
+                machine.succeed(f"ip link show dev {master}")
                 policies = machine.succeed("ip xfrm policy list nosock")
                 assert "if_id" not in policies and "priority 32" in policies, policies
 

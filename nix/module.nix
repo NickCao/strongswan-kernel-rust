@@ -34,6 +34,11 @@ in
     masterDevice = lib.mkOption {
       type = lib.types.str;
       default = "gravity";
+      description = ''
+        Existing master interface, usually a VRF, for daemon-owned XFRM
+        interfaces. It must exist before the first CHILD_SA is installed.
+        The daemon manages attachment, but does not create or remove the master.
+      '';
     };
   };
 

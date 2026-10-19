@@ -22,7 +22,11 @@ using that ID shares the interface, including inbound/outbound SAs and old/new
 SAs during rekeying. Removing or hard-expiring the final SA deletes the
 interface. A failed first installation rolls it back. Policies alone do not
 retain an interface. Existing interfaces are never adopted or deleted.
-`--ifname-prefix` and `--mtu` change the naming prefix and MTU.
+`--ifname-prefix` and `--mtu` change the naming prefix and MTU. Interfaces
+have multicast enabled. `--master-device NAME` attaches them to an existing
+master, such as a VRF, before installing the first SA. Without this option,
+the standalone daemon leaves them unattached. The master remains owned by
+the network configuration and is never created or deleted by the daemon.
 
 Remove ranet's interface creation/deletion updown script. Keep its
 `if_id_in = %unique` and `if_id_out = %unique` settings. Those produce a
@@ -56,11 +60,33 @@ services.charon-kernel = {
   enable = true;
   mtu = 1400;
   interfaceNamePrefix = "ranet";
+  masterDevice = "gravity";
 };
 ```
 
 The MTU accepts 1280–65535 and the prefix accepts 1–7 ASCII letters, digits,
-underscores, or hyphens. The module adds
+underscores, or hyphens. The module defaults `masterDevice` to `gravity`;
+that interface must exist before the first CHILD_SA is installed. For example,
+create the VRF with networkd:
+
+```nix
+systemd.network = {
+  enable = true;
+  netdevs."20-gravity" = {
+    netdevConfig = {
+      Name = "gravity";
+      Kind = "vrf";
+    };
+    vrfConfig.Table = 42;
+  };
+  networks."20-gravity" = {
+    matchConfig.Name = "gravity";
+    networkConfig.LinkLocalAddressing = "no";
+  };
+};
+```
+
+The module adds
 the daemon, plugin, and matching strongSwan to `environment.systemPackages`,
 links `/lib/ipsec/plugins` into the system profile, and selects the matching
 package for `services.strongswan-swanctl`. The strongSwan package uses
@@ -119,6 +145,7 @@ users and no capabilities, alongside the restricted dynamic kernel daemons.
 It checks plugin discovery from the system profile, socket authorization,
 AES-GCM and AES-CBC/HMAC, encrypted IPv4/IPv6 traffic, rekeying without
 interface replacement, final-SA cleanup, configurable interface names/MTUs,
+default and custom VRF masters, multicast flags, VRF-routed IPv4/IPv6 traffic,
 VICI access from a separate dynamic controller, coordinated stop/restart,
 startup failure, daemon failure, and runtime directory removal.
 The test requires KVM on the build host. Run it directly with:
@@ -136,24 +163,10 @@ interface naming and ranet group membership. Pass
 `--vici=/run/strongswan/charon.vici` to ranet. Replace gravity's static charon
 user, ambient network capability, and `SecureBits` setting with this module's
 service setup, and remove the updown script that creates/deletes interfaces.
-Networkd can attach the daemon-created interfaces to the VRF and enable
-multicast without granting charon privileges:
-
-```nix
-systemd.network.networks."50-gravity-ipsec" = {
-  matchConfig = {
-    Name = "gn*";
-    Kind = "xfrm";
-  };
-  linkConfig.Multicast = true;
-  networkConfig = {
-    VRF = "gravity";
-    LinkLocalAddressing = "no";
-  };
-};
-```
-
-The `gravity` VRF must already exist and networkd must be enabled. Keep
+The daemon attaches interfaces to the existing `gravity` VRF (the module's
+default `masterDevice`), enables multicast, and sets the MTU. Networkd no
+longer needs to perform that attachment or enable multicast. Keep overlay
+addresses, routes, and the VRF itself in the network configuration, and keep
 gravity's IP-TFS option disabled. This describes the integration changes;
 the VM check exercises the backend and shared VICI access, not gravity's
 external registry and credential services.
