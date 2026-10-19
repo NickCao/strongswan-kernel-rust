@@ -23,6 +23,8 @@ let
 
   # Keep upstream plugins and external plugins in the NixOS system profile.
   strongswan = pkgs.strongswan.overrideAttrs (old: {
+    # Upstream uses Python to generate the installed plugin configuration snippets.
+    nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.python3 ];
     # EAP is unused by ranet. Its helper libraries require libtool relinking,
     # which prevents overriding the plugin installation directory.
     configureFlags = lib.filter (flag: !(lib.hasPrefix "--enable-eap-" flag)) old.configureFlags ++ [

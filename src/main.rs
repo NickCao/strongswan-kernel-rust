@@ -110,6 +110,7 @@ fn run() -> io::Result<()> {
         prefix,
         mtu,
     });
+    sd_notify::notify(&[sd_notify::NotifyState::Ready])?;
     let pending = Arc::new(AtomicUsize::new(0));
     for socket in listener.incoming() {
         let socket = socket?;

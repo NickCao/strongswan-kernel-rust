@@ -49,7 +49,18 @@ header tree and `config.h` using the strongSwan package's source, patches,
 dependencies, and configure flags. No manual header paths are needed.
 
 Import `kernel-rust.nixosModules.default` from the flake into your NixOS
-configuration and set `services.charon-kernel.enable = true`. The module adds
+configuration and set `services.charon-kernel.enable = true`. For example:
+
+```nix
+services.charon-kernel = {
+  enable = true;
+  mtu = 1400;
+  interfaceNamePrefix = "ranet";
+};
+```
+
+The MTU accepts 1280–65535 and the prefix accepts 1–7 ASCII letters, digits,
+underscores, or hyphens. The module adds
 the daemon, plugin, and matching strongSwan to `environment.systemPackages`,
 links `/lib/ipsec/plugins` into the system profile, and selects the matching
 package for `services.strongswan-swanctl`. The strongSwan package uses
@@ -61,25 +72,91 @@ sets the default VICI socket to `/run/strongswan/charon.vici`, so `swanctl`
 needs no `--uri` flag. The module lets systemd create that directory when the
 IKE service is enabled.
 
-The module starts the kernel daemon as a dynamic user with primary group
-`ipsec` and only `CAP_NET_ADMIN`. Systemd manages its runtime directory.
+The module enables `services.strongswan-swanctl` with a dynamic user and no
+capabilities. The kernel daemon runs as a
+separate dynamic user with only `CAP_NET_ADMIN`. Both services use the static
+`ipsec` group for their sockets; change it with `services.charon-kernel.group`.
+Systemd manages their runtime directories.
 The service restricts filesystems, namespaces, syscalls, and socket families;
-only `AF_UNIX` and `AF_NETLINK` are allowed. Enable and configure the IKE
-service separately, granting it the `ipsec` supplementary group.
+only `AF_UNIX` and `AF_NETLINK` are allowed in the kernel daemon.
+
+StrongSwan pulls in the kernel service with `BindsTo` and `After` and waits
+for its readiness notification after the socket is ready. `PartOf` propagates
+strongSwan stops/restarts to the daemon, with strongSwan stopping first so it
+can remove its SAs. `StopWhenUnneeded` also stops the daemon if IKE exits on
+its own. Losing the kernel daemon stops IKE. The kernel daemon starts only as
+a dependency of IKE.
+
+The module does not write strongSwan configuration or firewall rules.
+Use `services.strongswan-swanctl.strongswan.extraConfig` and `swanctl` to
+configure plugins, ports, and peers. Enable `kernel-rust`, disable
+`kernel-netlink`, and use high UDP ports for the unprivileged IKE service.
+For example, with `config` in your NixOS module arguments:
+
+```nix
+networking.firewall.allowedUDPPorts = [ 13000 ];
+services.strongswan-swanctl.strongswan.extraConfig = ''
+  charon {
+    port = 0
+    port_nat_t = 13000
+    install_routes = no
+    load_modular = yes
+    plugins {
+      include ${config.services.strongswan-swanctl.package}/share/strongswan/templates/config/plugins/*.conf
+      kernel-netlink { load = no }
+      kernel-rust { load = yes }
+    }
+  }
+'';
+```
+
+Modular loading is needed because the standalone plugin is absent from
+strongSwan's compile-time plugin list. Include the package-generated snippets
+to retain its enabled plugins without maintaining a global `load` list.
 
 The VM check uses actual strongSwan `charon-systemd` processes with dynamic
 users and no capabilities, alongside the restricted dynamic kernel daemons.
 It checks plugin discovery from the system profile, socket authorization,
 AES-GCM and AES-CBC/HMAC, encrypted IPv4/IPv6 traffic, rekeying without
-interface replacement, final-SA cleanup, and runtime directory removal.
+interface replacement, final-SA cleanup, configurable interface names/MTUs,
+VICI access from a separate dynamic controller, coordinated stop/restart,
+startup failure, daemon failure, and runtime directory removal.
 The test requires KVM on the build host. Run it directly with:
 
 ```sh
 nix build .#checks.x86_64-linux.end-to-end -L
 ```
 
-See [nix/test.nix](nix/test.nix) for the unprivileged IKE service setup and
+See [nix/test.nix](nix/test.nix) for the peer configuration and
 [nix/module.nix](nix/module.nix) for the kernel service's restrictions.
+
+For integration with [gravity](https://github.com/NickCao/flakes/blob/master/modules/gravity/default.nix),
+use `interfaceNamePrefix = "gn"` and `group = "strongswan"` to preserve its
+interface naming and ranet group membership. Pass
+`--vici=/run/strongswan/charon.vici` to ranet. Replace gravity's static charon
+user, ambient network capability, and `SecureBits` setting with this module's
+service setup, and remove the updown script that creates/deletes interfaces.
+Networkd can attach the daemon-created interfaces to the VRF and enable
+multicast without granting charon privileges:
+
+```nix
+systemd.network.networks."50-gravity-ipsec" = {
+  matchConfig = {
+    Name = "gn*";
+    Kind = "xfrm";
+  };
+  linkConfig.Multicast = true;
+  networkConfig = {
+    VRF = "gravity";
+    LinkLocalAddressing = "no";
+  };
+};
+```
+
+The `gravity` VRF must already exist and networkd must be enabled. Keep
+gravity's IP-TFS option disabled. This describes the integration changes;
+the VM check exercises the backend and shared VICI access, not gravity's
+external registry and credential services.
 
 ## Build with Cargo and cargo-c
 
@@ -186,6 +263,7 @@ its runtime directory. For example, the daemon service can use:
 
 ```ini
 [Service]
+Type=notify
 ExecStart=/usr/bin/charon-kernel-daemon --group ipsec
 DynamicUser=yes
 User=charon-kernel

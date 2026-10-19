@@ -46,9 +46,15 @@ let
       }
     '';
 
-  node = peer: { lib, ... }: {
+  node = peer: { config, lib, ... }: {
     imports = [ module ];
-    services.charon-kernel.enable = true;
+    services.charon-kernel = {
+      enable = true;
+    }
+    // lib.optionalAttrs (peer == 2) {
+      mtu = 1380;
+      interfaceNamePrefix = "gn";
+    };
     virtualisation = {
       vlans = [ 1 ];
       memorySize = 768;
@@ -83,10 +89,7 @@ let
         ];
       };
       firewall = {
-        allowedUDPPorts = [
-          13000
-          13001
-        ];
+        allowedUDPPorts = [ 13000 ];
         checkReversePath = false;
       };
     };
@@ -97,30 +100,23 @@ let
     ];
     systemd.services.network-addresses-lo.wantedBy = [ "network.target" ];
 
-    services.strongswan-swanctl = {
-      enable = true;
-      strongswan.extraConfig = ''
-        charon {
-          port = 13001
-          port_nat_t = 13000
-          install_routes = no
-          load = random nonce x509 pubkey pkcs1 pem openssl kdf kernel-rust! socket-default vici
+    services.strongswan-swanctl.strongswan.extraConfig = ''
+      charon {
+        port = 0
+        port_nat_t = 13000
+        install_routes = no
+        load_modular = yes
+        plugins {
+          include ${config.services.strongswan-swanctl.package}/share/strongswan/templates/config/plugins/*.conf
+          kernel-netlink {
+            load = no
+          }
+          kernel-rust {
+            load = yes
+          }
         }
-      '';
-    };
-    systemd.services.strongswan-swanctl = {
-      # Start IKE explicitly after checking the kernel daemon's socket.
-      wantedBy = lib.mkForce [ ];
-      requires = [ "charon-kernel.service" ];
-      after = [ "charon-kernel.service" ];
-      serviceConfig = {
-        DynamicUser = true;
-        SupplementaryGroups = [ "ipsec" ];
-        CapabilityBoundingSet = "";
-        AmbientCapabilities = "";
-        ExecStartPost = lib.mkForce [ ];
-      };
-    };
+      }
+    '';
   };
 in
 {
@@ -136,6 +132,7 @@ in
     import time
 
     machines = [left, right]
+    interface_settings = [("ranet", 1400), ("gn", 1380)]
     capability_fields = ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"]
 
     def ctl(machine, arguments):
@@ -151,13 +148,26 @@ in
         return set(re.findall(r"spi (0x[0-9a-f]+)", machine.succeed("ip xfrm state")))
 
     def process_status(machine, unit):
-        pid = machine.succeed("systemctl show " + unit + " -p MainPID --value").strip()
+        pid = property(machine, unit, "MainPID")
         assert int(pid) > 1
         return dict(
             line.split(":", 1)
             for line in machine.succeed("cat /proc/" + pid + "/status").splitlines()
             if ":" in line
         )
+
+    def property(machine, unit, name):
+        return machine.succeed("systemctl show " + unit + " -p " + name + " --value").strip()
+
+    def assert_stopped(machine, unit):
+        machine.wait_until_succeeds(
+            "systemctl show " + unit + " -p ActiveState --value | grep -Eq '^(inactive|failed)$'"
+        )
+        assert property(machine, unit, "MainPID") == "0"
+
+    def assert_empty(machine):
+        assert not spis(machine) and not links(machine)
+        assert not machine.succeed("ip xfrm policy list nosock").strip()
 
     def ping_overlay(machine, peer):
         other = 3 - peer
@@ -167,11 +177,11 @@ in
     start_all()
     with subtest("systemd runtime directories and least privilege"):
         for machine in machines:
+            machine.wait_for_unit("strongswan-swanctl.service")
             machine.wait_for_unit("charon-kernel.service")
             machine.wait_for_unit("network-addresses-lo.service")
-            machine.wait_until_succeeds(
-                "test -S /run/charon-kernel/charon-kernel.sock"
-            )
+            machine.succeed("test -S /run/charon-kernel/charon-kernel.sock")
+            assert property(machine, "charon-kernel.service", "Type") == "notify"
             backend = process_status(machine, "charon-kernel.service")
             backend_uid = int(backend["Uid"].split()[0])
             assert 61184 <= backend_uid <= 65519
@@ -193,8 +203,6 @@ in
                 + "\"import socket; socket.socket(socket.AF_UNIX).connect("
                 + "'/run/charon-kernel/charon-kernel.sock')\""
             )
-            machine.succeed("systemctl start strongswan-swanctl.service")
-            machine.wait_for_unit("strongswan-swanctl.service")
             ike = process_status(machine, "strongswan-swanctl.service")
             ike_uid = int(ike["Uid"].split()[0])
             assert 61184 <= ike_uid <= 65519 and ike_uid != backend_uid
@@ -203,6 +211,13 @@ in
             statistics = ctl(machine, "--stats")
             assert "kernel-rust" in statistics and "kernel-netlink" not in statistics
             assert not links(machine) and not spis(machine)
+            controller = machine.succeed(
+                "systemd-run --quiet --wait --pipe --collect "
+                "--property=DynamicUser=yes --property=SupplementaryGroups=ipsec "
+                "--property=CapabilityBoundingSet= --property=AmbientCapabilities= "
+                + machine.succeed("command -v swanctl").strip() + " --stats"
+            )
+            assert "kernel-rust" in controller
 
     proposals = [
         ("AES-GCM", "${connection 1 "aes128gcm128-esn"}", "${connection 2 "aes128gcm128-esn"}", "rfc4106(gcm(aes))"),
@@ -218,10 +233,11 @@ in
                 listing = ctl(machine, "--list-sas --raw")
                 match = re.search(r"if-id-out=([0-9a-f]+)", listing)
                 assert match is not None, listing
-                name_out = f"ranet{int(match[1], 16):08x}"
+                prefix, mtu = interface_settings[peer - 1]
+                name_out = f"{prefix}{int(match[1], 16):08x}"
                 current = links(machine)
                 assert len(current) == 1 and current[0]["ifname"] == name_out, current
-                assert current[0]["mtu"] == 1400 and "UP" in current[0]["flags"]
+                assert current[0]["mtu"] == mtu and "UP" in current[0]["flags"]
                 original_indices.append(indices(machine))
                 other = 3 - peer
                 machine.succeed(f"ip route add 10.{other}.0.1/32 dev {name_out}")
@@ -255,12 +271,66 @@ in
                 policies = machine.succeed("ip xfrm policy list nosock")
                 assert "if_id" not in policies and "priority 32" in policies, policies
 
-    with subtest("clean shutdown and systemd runtime directory cleanup"):
+    with subtest("strongSwan restart restarts the backend after cleaning live SAs"):
+        for machine, config_file in zip(machines, [proposals[0][1], proposals[0][2]]):
+            ctl(machine, "--load-all --noprompt --file " + config_file)
+        assert "established" in ctl(left, "--initiate --child net")
+        previous = {
+            unit: property(left, unit, "MainPID")
+            for unit in ["strongswan-swanctl.service", "charon-kernel.service"]
+        }
+        left.succeed("systemctl restart strongswan-swanctl.service")
+        for unit, pid in previous.items():
+            left.wait_for_unit(unit)
+            assert property(left, unit, "MainPID") != pid
+        assert "kernel-rust" in ctl(left, "--stats")
+        for machine in machines:
+            machine.wait_until_succeeds("test -z \"$(ip xfrm state)\"")
+            assert not links(machine)
+
+    with subtest("restarting the backend also restarts its strongSwan dependent"):
+        previous = property(left, "strongswan-swanctl.service", "MainPID")
+        left.succeed("systemctl restart charon-kernel.service")
+        left.wait_for_unit("strongswan-swanctl.service")
+        assert property(left, "strongswan-swanctl.service", "MainPID") != previous
+        assert "kernel-rust" in ctl(left, "--stats")
+
+    with subtest("strongSwan exiting without a stop job stops the unused backend"):
+        right.succeed("systemctl kill --signal=TERM --kill-whom=main strongswan-swanctl.service")
+        assert_stopped(right, "strongswan-swanctl.service")
+        assert_stopped(right, "charon-kernel.service")
+        assert_empty(right)
+        right.succeed("test ! -e /run/strongswan && test ! -e /run/charon-kernel")
+        right.succeed("systemctl start strongswan-swanctl.service")
+        assert "kernel-rust" in ctl(right, "--stats")
+
+    with subtest("stopping strongSwan stops the backend and removes runtime directories"):
         for machine in machines:
             machine.succeed("systemctl stop strongswan-swanctl.service")
+            assert_stopped(machine, "charon-kernel.service")
             machine.succeed("test ! -e /run/strongswan")
-            machine.wait_until_succeeds("test -z \"$(ip xfrm policy list nosock)\"")
-            machine.succeed("systemctl stop charon-kernel.service")
             machine.succeed("test ! -e /run/charon-kernel")
+            assert_empty(machine)
+
+    with subtest("failed backend startup prevents strongSwan startup"):
+        left.succeed("mkdir -p /run/systemd/system/charon-kernel.service.d")
+        left.succeed(
+            "printf '[Service]\\nExecStartPre=/run/current-system/sw/bin/false\\n' "
+            "> /run/systemd/system/charon-kernel.service.d/test-failure.conf"
+        )
+        left.succeed("systemctl daemon-reload")
+        left.fail("systemctl start strongswan-swanctl.service")
+        assert_stopped(left, "strongswan-swanctl.service")
+        assert_stopped(left, "charon-kernel.service")
+        left.succeed("rm /run/systemd/system/charon-kernel.service.d/test-failure.conf")
+        left.succeed("systemctl daemon-reload && systemctl reset-failed")
+        left.succeed("systemctl start strongswan-swanctl.service")
+        assert "kernel-rust" in ctl(left, "--stats")
+
+    with subtest("backend process failure stops strongSwan"):
+        left.succeed("systemctl kill --signal=KILL --kill-whom=main charon-kernel.service")
+        assert_stopped(left, "charon-kernel.service")
+        assert_stopped(left, "strongswan-swanctl.service")
+        left.succeed("test ! -e /run/strongswan && test ! -e /run/charon-kernel")
   '';
 }

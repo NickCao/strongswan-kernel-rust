@@ -10,7 +10,7 @@ let
 in
 {
   options.services.charon-kernel = {
-    enable = lib.mkEnableOption "the privileged Rust kernel backend for strongSwan";
+    enable = lib.mkEnableOption "the Rust kernel backend and unprivileged strongSwan IKE service";
     package = lib.mkOption {
       type = lib.types.package;
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
@@ -19,7 +19,17 @@ in
     group = lib.mkOption {
       type = lib.types.str;
       default = "ipsec";
-      description = "Static group authorized to connect to the kernel daemon.";
+      description = "Static group authorized to access the kernel daemon and strongSwan VICI sockets.";
+    };
+    mtu = lib.mkOption {
+      type = lib.types.ints.between 1280 65535;
+      default = 1400;
+      description = "MTU of daemon-owned XFRM interfaces.";
+    };
+    interfaceNamePrefix = lib.mkOption {
+      type = lib.types.strMatching "[A-Za-z0-9_-]{1,7}";
+      default = "ranet";
+      description = "Interface name prefix, followed by the XFRM interface ID as eight hexadecimal digits.";
     };
   };
 
@@ -30,17 +40,38 @@ in
       cfg.package.strongswan
     ];
     environment.pathsToLink = [ "/lib/ipsec/plugins" ];
-    services.strongswan-swanctl.package = lib.mkDefault cfg.package.strongswan;
+    services.strongswan-swanctl = {
+      enable = true;
+      package = lib.mkDefault cfg.package.strongswan;
+    };
 
-    systemd.services.strongswan-swanctl = lib.mkIf config.services.strongswan-swanctl.enable {
-      serviceConfig.RuntimeDirectory = "strongswan";
+    systemd.services.strongswan-swanctl = {
+      bindsTo = [ "charon-kernel.service" ];
+      after = [ "charon-kernel.service" ];
+      serviceConfig = {
+        DynamicUser = lib.mkDefault true;
+        Group = lib.mkDefault cfg.group;
+        CapabilityBoundingSet = lib.mkDefault "";
+        AmbientCapabilities = lib.mkDefault "";
+        RuntimeDirectory = "strongswan";
+      };
     };
 
     systemd.services.charon-kernel = {
       description = "strongSwan Rust kernel backend";
-      wantedBy = [ "multi-user.target" ];
+      partOf = [ "strongswan-swanctl.service" ];
+      unitConfig.StopWhenUnneeded = true;
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/charon-kernel-daemon --group ${lib.escapeShellArg cfg.group}";
+        Type = "notify";
+        ExecStart = lib.escapeShellArgs [
+          "${cfg.package}/bin/charon-kernel-daemon"
+          "--group"
+          cfg.group
+          "--mtu"
+          (toString cfg.mtu)
+          "--ifname-prefix"
+          cfg.interfaceNamePrefix
+        ];
         RuntimeDirectory = "charon-kernel";
         RuntimeDirectoryMode = "0755";
         DynamicUser = true;
