@@ -34,7 +34,7 @@ fn encode(value: &impl Emitable) -> Vec<u8> {
     bytes
 }
 fn message(kind: u16, flags: NlmF, value: &impl Emitable) -> Message {
-    Message::new(kind, flags, encode(value))
+    Message::new(kind, flags, value)
 }
 fn attributes(bytes: &[u8]) -> io::Result<Vec<Attr>> {
     NlasIterator::new(bytes)

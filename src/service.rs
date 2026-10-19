@@ -6,6 +6,7 @@ use crate::{
     rpc_api::*,
     transport,
 };
+use neli::consts::rtnl::Rtm;
 use std::{
     io,
     os::unix::net::UnixStream,
@@ -80,11 +81,12 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
             // A routing daemon can send thousands of notifications per second.
             // Keep one pending roam update, retaining address/link changes,
             // instead of queueing a separate IKE-wide job for every route.
-            let change = if [16, 17, 20, 21].contains(&r.kind) {
-                session.network_changed.store(true, Ordering::Release);
-                ADDRESS_CHANGED
-            } else {
-                ROUTE_CHANGED
+            let change = match Rtm::from(r.kind) {
+                Rtm::Newlink | Rtm::Dellink | Rtm::Newaddr | Rtm::Deladdr => {
+                    session.network_changed.store(true, Ordering::Release);
+                    ADDRESS_CHANGED
+                }
+                _ => ROUTE_CHANGED,
             };
             session.roam.fetch_or(change, Ordering::Relaxed);
             continue;

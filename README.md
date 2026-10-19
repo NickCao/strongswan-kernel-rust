@@ -5,7 +5,9 @@ charon's `kernel-netlink` plugin with a Rust `cdylib` and a
 Rust process, `charon-kernel-daemon`. They communicate using
 [Varlink](https://varlink.org/) over Unix stream sockets. The Rust daemon
 implements Linux XFRM and link operations directly; it never loads the C
-netlink backend. The canonical API is [io.ranet.Kernel.varlink](io.ranet.Kernel.varlink).
+netlink backend. Netlink transport uses `neli`; typed network and XFRM payloads
+use `netlink-packet-route` and `netlink-packet-xfrm`. The canonical API is
+[io.ranet.Kernel.varlink](io.ranet.Kernel.varlink).
 
 The scope follows [ranet's VICI configuration](https://github.com/NickCao/ranet/blob/b0e52359f7c5816263f83cd5f12065945c5e4eaa/src/vici.rs):
 tunnel-mode ESP, nonzero XFRM interface IDs, forced UDP encapsulation, high

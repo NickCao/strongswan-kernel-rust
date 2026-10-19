@@ -4,26 +4,22 @@
 use crate::{
     error::invalid,
     model::*,
-    netlink::{self, attribute, get32, Netlink, NlFamily, NlmF},
+    netlink::{Message, Netlink, NlFamily, NlmF},
 };
-use neli::{
-    consts::rtnl::{
-        Ifa, Iff, Ifla, IflaInfo, RtAddrFamily, RtScope, RtTable, Rta, Rtm, Rtn, Rtprot,
-    },
-    rtnl::{Ifaddrmsg, Ifinfomsg, IfinfomsgBuilder, RtgenmsgBuilder, Rtmsg, RtmsgBuilder},
-    types::RtBuffer,
-    FromBytesWithInput,
+use netlink_packet_core::ParseableParametrized;
+use netlink_packet_route::{
+    address::{AddressAttribute, AddressFlags, AddressMessage, AddressScope},
+    link::{InfoData, InfoKind, InfoXfrm, LinkAttribute, LinkFlags, LinkInfo, LinkMessage},
+    route::{RouteAddress, RouteAttribute, RouteMessage, RouteType},
+    AddressFamily, RouteNetlinkMessage,
 };
-use std::{
-    io::{self, Cursor},
-    sync::Arc,
-};
+use std::{io, sync::Arc};
 
 #[derive(Clone, Debug)]
 pub struct Link {
     pub index: u32,
     pub name: String,
-    pub flags: u32,
+    pub flags: LinkFlags,
     pub mtu: u32,
     pub xfrm: Option<(u32, u32)>,
 }
@@ -32,7 +28,7 @@ pub struct AddressEntry {
     pub host: Host,
     pub prefix: u8,
     pub scope: u8,
-    pub flags: u32,
+    pub flags: AddressFlags,
     pub index: u32,
 }
 struct Snapshot {
@@ -47,11 +43,13 @@ pub struct Network {
 fn absent() -> io::Error {
     io::Error::from_raw_os_error(libc::ENOENT)
 }
-fn text(b: &[u8]) -> io::Result<String> {
-    let n = b.iter().position(|b| *b == 0).unwrap_or(b.len());
-    std::str::from_utf8(&b[..n])
-        .map(str::to_owned)
-        .map_err(|_| invalid())
+fn route_host(address: RouteAddress) -> io::Result<Host> {
+    let ip = match address {
+        RouteAddress::Inet(ip) => ip.into(),
+        RouteAddress::Inet6(ip) => ip.into(),
+        _ => return Err(invalid()),
+    };
+    Ok(Host { ip, port: 0 })
 }
 pub fn index(name: &str) -> io::Result<u32> {
     if name.is_empty() {
@@ -76,6 +74,20 @@ impl Network {
             snapshot: None,
         })
     }
+    fn request(
+        &self,
+        request: RouteNetlinkMessage,
+        flags: NlmF,
+    ) -> io::Result<Vec<RouteNetlinkMessage>> {
+        self.socket
+            .request(&Message::new(request.message_type(), flags, &request))?
+            .into_iter()
+            .map(|reply| {
+                RouteNetlinkMessage::parse_with_param(&reply.payload, reply.kind)
+                    .map_err(io::Error::other)
+            })
+            .collect()
+    }
     pub fn invalidate(&mut self) {
         self.snapshot = None;
     }
@@ -90,52 +102,40 @@ impl Network {
     }
     pub fn links(&mut self) -> io::Result<Vec<Link>> {
         let mut links = Vec::new();
-        let request = IfinfomsgBuilder::default()
-            .ifi_family(RtAddrFamily::Unspecified)
-            .build()
-            .map_err(io::Error::other)?;
-        for r in self
-            .socket
-            .request_payload(Rtm::Getlink.into(), NlmF::DUMP, request)?
-        {
-            if r.kind != u16::from(Rtm::Newlink) {
+        let request = RouteNetlinkMessage::GetLink(LinkMessage::default());
+        for reply in self.request(request, NlmF::DUMP)? {
+            let RouteNetlinkMessage::NewLink(info) = reply else {
                 continue;
-            }
-            let info =
-                Ifinfomsg::from_bytes_with_input(&mut Cursor::new(&r.payload), r.payload.len())
-                    .map_err(io::Error::other)?;
+            };
             let mut link = Link {
-                index: *info.ifi_index() as u32,
-                flags: info.ifi_flags().bits(),
+                index: info.header.index,
+                flags: info.header.flags,
                 name: String::new(),
                 mtu: 0,
                 xfrm: None,
             };
-            for attr in info.rtattrs().iter() {
-                let value = attr.rta_payload().as_ref();
-                match Ifla::from(u16::from(*attr.rta_type()) & 0x3fff) {
-                    Ifla::Ifname => link.name = text(value)?,
-                    Ifla::Mtu if value.len() == 4 => link.mtu = get32(value, 0),
-                    Ifla::Linkinfo => {
-                        let nested = netlink::attrs(value)?;
-                        if nested
-                            .iter()
-                            .any(|(k, v)| k == 1 && v.starts_with(b"xfrm\0"))
-                        {
-                            let mut if_id = 0;
-                            let mut phys = 0;
-                            for (_, data) in nested.iter().filter(|(k, _)| *k == 2) {
-                                for (k, v) in netlink::attrs(data)?.iter() {
-                                    if v.len() == 4 {
-                                        match k {
-                                            1 => phys = get32(v, 0),
-                                            2 => if_id = get32(v, 0),
+            for attr in info.attributes {
+                match attr {
+                    LinkAttribute::IfName(name) => link.name = name,
+                    LinkAttribute::Mtu(mtu) => link.mtu = mtu,
+                    LinkAttribute::LinkInfo(infos) => {
+                        for info in infos {
+                            match info {
+                                LinkInfo::Kind(InfoKind::Xfrm) => {
+                                    link.xfrm.get_or_insert((0, 0));
+                                }
+                                LinkInfo::Data(InfoData::Xfrm(attrs)) => {
+                                    let (if_id, phys) = link.xfrm.get_or_insert((0, 0));
+                                    for attr in attrs {
+                                        match attr {
+                                            InfoXfrm::IfId(value) => *if_id = value,
+                                            InfoXfrm::Link(value) => *phys = value,
                                             _ => (),
                                         }
                                     }
                                 }
+                                _ => (),
                             }
-                            link.xfrm = Some((if_id, phys));
                         }
                     }
                     _ => (),
@@ -149,44 +149,35 @@ impl Network {
     }
     pub fn addresses(&mut self) -> io::Result<Vec<AddressEntry>> {
         let mut out = Vec::new();
-        let request = RtgenmsgBuilder::default()
-            .rtgen_family(RtAddrFamily::Unspecified)
-            .build()
-            .map_err(io::Error::other)?;
-        for r in self
-            .socket
-            .request_payload(Rtm::Getaddr.into(), NlmF::DUMP, request)?
-        {
-            if r.kind != u16::from(Rtm::Newaddr) {
+        let request = RouteNetlinkMessage::GetAddress(AddressMessage::default());
+        for reply in self.request(request, NlmF::DUMP)? {
+            let RouteNetlinkMessage::NewAddress(info) = reply else {
+                continue;
+            };
+            if !matches!(
+                info.header.family,
+                AddressFamily::Inet | AddressFamily::Inet6
+            ) {
                 continue;
             }
-            let info =
-                Ifaddrmsg::from_bytes_with_input(&mut Cursor::new(&r.payload), r.payload.len())
-                    .map_err(io::Error::other)?;
-            let family = u8::from(*info.ifa_family());
-            if ![libc::AF_INET as u8, libc::AF_INET6 as u8].contains(&family) {
-                continue;
-            }
-            let mut bytes = None;
+            let mut address = None;
             let mut local = None;
-            let mut flags = info.ifa_flags().bits() as u32;
-            for attr in info.rtattrs().iter() {
-                let value = attr.rta_payload().as_ref();
-                match attr.rta_type() {
-                    Ifa::Address => bytes = Some(value),
-                    Ifa::Local => local = Some(value),
-                    Ifa::Flags if value.len() == 4 => flags = get32(value, 0),
+            let mut flags = AddressFlags::from_bits_retain(info.header.flags.bits().into());
+            for attr in info.attributes {
+                match attr {
+                    AddressAttribute::Address(ip) => address = Some(ip),
+                    AddressAttribute::Local(ip) => local = Some(ip),
+                    AddressAttribute::Flags(value) => flags = value,
                     _ => (),
                 }
             }
-            if let Some(bytes) = local.or(bytes) {
-                let host = Host::from_kernel(family.into(), bytes, 0)?;
+            if let Some(ip) = local.or(address) {
                 out.push(AddressEntry {
-                    host,
-                    prefix: *info.ifa_prefixlen(),
-                    scope: u8::from(*info.ifa_scope()),
+                    host: Host { ip, port: 0 },
+                    prefix: info.header.prefix_len,
+                    scope: info.header.scope.into(),
                     flags,
-                    index: *info.ifa_index(),
+                    index: info.header.index,
                 });
             }
         }
@@ -201,12 +192,19 @@ impl Network {
                 let Some(link) = snapshot.links.iter().find(|l| l.index == a.index) else {
                     return false;
                 };
-                if link.xfrm.is_some() || a.scope >= 254 || a.flags & (0x08 | 0x20 | 0x40) != 0 {
+                if link.xfrm.is_some()
+                    || a.scope >= u8::from(AddressScope::Host)
+                    || a.flags.intersects(
+                        AddressFlags::Dadfailed
+                            | AddressFlags::Deprecated
+                            | AddressFlags::Tentative,
+                    )
+                {
                     return false;
                 }
                 let class = if !self.config.usable(&link.name) {
                     4
-                } else if link.flags & 1 == 0 {
+                } else if !link.flags.contains(LinkFlags::Up) {
                     2
                 } else {
                     1
@@ -223,9 +221,14 @@ impl Network {
             .iter()
             .filter_map(|a| {
                 let link = snapshot.links.iter().find(|l| {
-                    l.index == a.index && l.flags & 1 != 0 && self.config.usable(&l.name)
+                    l.index == a.index
+                        && l.flags.contains(LinkFlags::Up)
+                        && self.config.usable(&l.name)
                 })?;
-                if link.xfrm.is_some() || a.scope >= 254 || a.prefix == a.host.bits() {
+                if link.xfrm.is_some()
+                    || a.scope >= u8::from(AddressScope::Host)
+                    || a.prefix == a.host.bits()
+                {
                     return None;
                 }
                 Some((network(&a.host, a.prefix), a.prefix, link.name.clone()))
@@ -238,7 +241,7 @@ impl Network {
             if a.host.ip == host.ip {
                 if let Some(link) = snapshot.links.iter().find(|l| {
                     l.index == a.index
-                        && l.flags & 1 != 0
+                        && l.flags.contains(LinkFlags::Up)
                         && l.xfrm.is_none()
                         && self.config.usable(&l.name)
                 }) {
@@ -264,44 +267,36 @@ impl Network {
         }
         let src = src.filter(|s| !s.ip.is_unspecified());
         let family = dest.family();
-        let mut attributes = RtBuffer::new();
-        attributes.push(attribute(Rta::Dst, dest.bytes().as_slice())?);
+        let mut query = RouteMessage::default();
+        query.header.address_family = dest.ip.into();
+        query.header.destination_prefix_length = dest.bits();
+        query.header.source_prefix_length = if src.is_some() { dest.bits() } else { 0 };
+        query
+            .attributes
+            .push(RouteAttribute::Destination(dest.ip.into()));
         if let Some(src) = src {
-            attributes.push(attribute(Rta::Src, src.bytes().as_slice())?);
+            query.attributes.push(RouteAttribute::Source(src.ip.into()));
         }
-        let query = RtmsgBuilder::default()
-            .rtm_family(RtAddrFamily::from(family as u8))
-            .rtm_dst_len(dest.bits())
-            .rtm_src_len(if src.is_some() { dest.bits() } else { 0 })
-            .rtm_tos(0)
-            .rtm_table(RtTable::Unspec)
-            .rtm_protocol(Rtprot::Unspec)
-            .rtm_scope(RtScope::Universe)
-            .rtm_type(Rtn::Unspec)
-            .rtattrs(attributes)
-            .build()
-            .map_err(io::Error::other)?;
         // Use the kernel's FIB and routing rules, without dumping BGP tables
         // or trying to choose an alternative to an excluded kernel route.
-        let r = self
-            .socket
-            .request_payload(Rtm::Getroute.into(), NlmF::empty(), query)?
+        let info = self
+            .request(RouteNetlinkMessage::GetRoute(query), NlmF::empty())?
             .into_iter()
-            .find(|r| r.kind == u16::from(Rtm::Newroute))
+            .find_map(|reply| match reply {
+                RouteNetlinkMessage::NewRoute(info) => Some(info),
+                _ => None,
+            })
             .ok_or_else(absent)?;
-        let info = Rtmsg::from_bytes_with_input(&mut Cursor::new(&r.payload), r.payload.len())
-            .map_err(io::Error::other)?;
         let unreachable = || io::Error::from_raw_os_error(libc::ENETUNREACH);
-        if !matches!(*info.rtm_type(), Rtn::Unicast | Rtn::Local) {
+        if !matches!(info.header.kind, RouteType::Unicast | RouteType::Local) {
             return Err(unreachable());
         }
         let (mut index, mut gateway, mut source) = (0, None, None);
-        for attr in info.rtattrs().iter() {
-            let value = attr.rta_payload().as_ref();
-            match attr.rta_type() {
-                Rta::Oif if value.len() == 4 => index = get32(value, 0),
-                Rta::Gateway => gateway = Some(Host::from_kernel(family, value, 0)?),
-                Rta::Prefsrc => source = Some(Host::from_kernel(family, value, 0)?),
+        for attr in info.attributes {
+            match attr {
+                RouteAttribute::Oif(value) => index = value,
+                RouteAttribute::Gateway(value) => gateway = Some(route_host(value)?),
+                RouteAttribute::PrefSource(value) => source = Some(route_host(value)?),
                 _ => (),
             }
         }
@@ -311,13 +306,17 @@ impl Network {
             .iter()
             .find(|l| {
                 l.index == index
-                    && l.flags & 1 != 0
+                    && l.flags.contains(LinkFlags::Up)
                     && l.xfrm.is_none()
                     && self.config.usable(&l.name)
             })
             .ok_or_else(unreachable)?;
-        let valid =
-            |a: &&AddressEntry| a.host.family() == family && a.flags & (0x08 | 0x20 | 0x40) == 0;
+        let valid = |a: &&AddressEntry| {
+            a.host.family() == family
+                && !a.flags.intersects(
+                    AddressFlags::Dadfailed | AddressFlags::Deprecated | AddressFlags::Tentative,
+                )
+        };
         let source = if let Some(src) = src {
             if !snapshot
                 .addresses
@@ -335,7 +334,7 @@ impl Network {
                 .addresses
                 .iter()
                 .filter(valid)
-                .find(|a| a.index == index && a.scope < 254)
+                .find(|a| a.index == index && a.scope < u8::from(AddressScope::Host))
                 .ok_or_else(unreachable)?
                 .host
                 .clone()
@@ -357,53 +356,37 @@ impl Network {
         if name.is_empty() || name.len() >= libc::IFNAMSIZ {
             return Err(invalid());
         }
-        let mut attributes = RtBuffer::new();
-        attributes.push(attribute(Ifla::Ifname, name.as_str())?);
+        let mut payload = LinkMessage::default();
+        payload.header.flags = LinkFlags::Up | LinkFlags::Multicast;
+        payload.header.change_mask = payload.header.flags;
+        payload.attributes.push(LinkAttribute::IfName(name));
         if mtu != 0 {
-            attributes.push(attribute(Ifla::Mtu, mtu)?);
+            payload.attributes.push(LinkAttribute::Mtu(mtu));
         }
         if !master.is_empty() {
-            attributes.push(attribute(Ifla::Master, index(&master)?)?);
+            payload
+                .attributes
+                .push(LinkAttribute::Controller(index(&master)?));
         }
-        let mut data = RtBuffer::new();
-        data.push(attribute(2u16, if_id)?);
+        let mut data = vec![InfoXfrm::IfId(if_id)];
         if !phys.is_empty() {
-            data.push(attribute(1u16, index(&phys)?)?);
+            data.push(InfoXfrm::Link(index(&phys)?));
         }
-        let info: RtBuffer<_, _> = [
-            attribute(u16::from(IflaInfo::Kind), "xfrm")?,
-            attribute(u16::from(IflaInfo::Data) | 0x8000, data)?,
-        ]
-        .into_iter()
-        .collect();
-        attributes.push(attribute(
-            Ifla::from(u16::from(Ifla::Linkinfo) | 0x8000),
-            info,
-        )?);
-        let flags = Iff::UP | Iff::MULTICAST;
-        let payload = IfinfomsgBuilder::default()
-            .ifi_family(RtAddrFamily::Unspecified)
-            .ifi_flags(flags)
-            .ifi_change(flags)
-            .rtattrs(attributes)
-            .build()
-            .map_err(io::Error::other)?;
-        self.socket.request_payload(
-            Rtm::Newlink.into(),
+        payload.attributes.push(LinkAttribute::LinkInfo(vec![
+            LinkInfo::Kind(InfoKind::Xfrm),
+            LinkInfo::Data(InfoData::Xfrm(data)),
+        ]));
+        self.request(
+            RouteNetlinkMessage::NewLink(payload),
             NlmF::ACK | NlmF::CREATE | NlmF::EXCL,
-            payload,
         )?;
         self.invalidate();
         Ok(())
     }
     pub(crate) fn delete_xfrmi(&mut self, index: u32) -> io::Result<()> {
-        let payload = IfinfomsgBuilder::default()
-            .ifi_family(RtAddrFamily::Unspecified)
-            .ifi_index(index as i32)
-            .build()
-            .map_err(io::Error::other)?;
-        self.socket
-            .request_payload(Rtm::Dellink.into(), NlmF::ACK, payload)?;
+        let mut payload = LinkMessage::default();
+        payload.header.index = index;
+        self.request(RouteNetlinkMessage::DelLink(payload), NlmF::ACK)?;
         self.invalidate();
         Ok(())
     }

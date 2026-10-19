@@ -1,23 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Netlink requests and notifications through neli. XFRM payloads are encoded
-//! by netlink-packet-xfrm and remain opaque at this transport layer.
-use crate::error::invalid;
+//! Netlink requests and notifications through neli. Payloads are encoded by
+//! netlink-packet-route and netlink-packet-xfrm and remain opaque here.
 pub use neli::consts::{nl::NlmF, socket::NlFamily};
 use neli::{
     err::{RouterError, SocketError},
     genl::Genlmsghdr,
     nl::{NlPayload, Nlmsghdr},
     router::synchronous::{NlRouter, NlRouterReceiverHandle},
-    rtnl::{Rtattr, RtattrBuilder},
-    types::{Buffer, RtBuffer},
+    types::Buffer,
     utils::Groups,
-    FromBytesWithInput, Size, ToBytes,
 };
-use std::io::{self, Cursor};
-
-pub fn align(n: usize) -> usize {
-    neli::consts::alignto(n)
-}
+use netlink_packet_core::Emitable;
+use std::io;
 
 pub struct Message {
     pub kind: u16,
@@ -25,45 +19,15 @@ pub struct Message {
     pub payload: Vec<u8>,
 }
 impl Message {
-    pub fn new(kind: u16, flags: NlmF, payload: Vec<u8>) -> Self {
+    pub fn new(kind: u16, flags: NlmF, value: &impl Emitable) -> Self {
+        let mut payload = vec![0; value.buffer_len()];
+        value.emit(&mut payload);
         Self {
             kind,
             flags,
             payload,
         }
     }
-}
-
-pub fn get16(bytes: &[u8], offset: usize) -> u16 {
-    netlink_packet_core::parse_u16(&bytes[offset..offset + 2]).unwrap()
-}
-pub fn get32(bytes: &[u8], offset: usize) -> u32 {
-    netlink_packet_core::parse_u32(&bytes[offset..offset + 4]).unwrap()
-}
-
-pub fn attribute<T: Size, P: Size + ToBytes>(kind: T, payload: P) -> io::Result<Rtattr<T, Buffer>> {
-    if payload.unpadded_size() > u16::MAX as usize - 4 {
-        return Err(invalid());
-    }
-    RtattrBuilder::default()
-        .rta_type(kind)
-        .rta_payload(payload)
-        .build()
-        .map_err(io::Error::other)
-}
-
-pub struct Attributes(RtBuffer<u16, Buffer>);
-impl Attributes {
-    pub fn iter(&self) -> impl Iterator<Item = (u16, &[u8])> {
-        self.0
-            .iter()
-            .map(|attr| (*attr.rta_type() & 0x3fff, attr.rta_payload().as_ref()))
-    }
-}
-pub fn attrs(data: &[u8]) -> io::Result<Attributes> {
-    RtBuffer::from_bytes_with_input(&mut Cursor::new(data), data.len())
-        .map(Attributes)
-        .map_err(|_| invalid())
 }
 
 pub struct Reply {
@@ -113,21 +77,13 @@ impl Netlink {
         Ok((Self { router }, Notifications { receiver }))
     }
     pub fn request(&self, message: &Message) -> io::Result<Vec<Reply>> {
-        self.request_payload(
-            message.kind,
-            message.flags,
-            Buffer::from(message.payload.as_slice()),
-        )
-    }
-    pub fn request_payload<P: Size + ToBytes>(
-        &self,
-        kind: u16,
-        flags: NlmF,
-        payload: P,
-    ) -> io::Result<Vec<Reply>> {
         let receiver = self
             .router
-            .send::<_, _, u16, Buffer>(kind, flags, NlPayload::Payload(payload))
+            .send::<_, _, u16, Buffer>(
+                message.kind,
+                message.flags,
+                NlPayload::Payload(Buffer::from(message.payload.as_slice())),
+            )
             .map_err(router_error)?;
         let mut replies = Vec::new();
         for message in receiver {
@@ -163,20 +119,19 @@ impl Iterator for Notifications {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn malformed_attributes() {
-        for bytes in [&[1u8, 0, 1, 0][..], &[8, 0, 1, 0][..], &[4, 0, 1][..]] {
-            assert!(attrs(bytes).is_err());
-        }
-    }
+    use netlink_packet_core::ParseableParametrized;
+    use netlink_packet_route::{link::LinkMessage, RouteNetlinkMessage};
 
     #[test]
     fn real_unprivileged_link_dump() {
         let netlink = Netlink::new(NlFamily::Route).unwrap();
+        let request = RouteNetlinkMessage::GetLink(LinkMessage::default());
         let replies = netlink
-            .request(&Message::new(18u16, NlmF::DUMP, vec![0; 16]))
+            .request(&Message::new(request.message_type(), NlmF::DUMP, &request))
             .unwrap();
-        assert!(replies.iter().any(|reply| reply.kind == 16));
+        assert!(replies.iter().any(|reply| matches!(
+            RouteNetlinkMessage::parse_with_param(&reply.payload, reply.kind).unwrap(),
+            RouteNetlinkMessage::NewLink(_)
+        )));
     }
 }
