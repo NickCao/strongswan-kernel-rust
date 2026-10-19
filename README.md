@@ -1,7 +1,7 @@
 # strongSwan Rust kernel backend
 
 This repository builds independently of strongSwan. `kernel-rust` replaces
-charon's `kernel-netlink` plugin with a C proxy and a
+charon's `kernel-netlink` plugin with a Rust `cdylib` and a
 Rust process, `charon-kernel-daemon`. They communicate using
 [Varlink](https://varlink.org/) over Unix stream sockets. The Rust daemon
 implements Linux XFRM and link operations directly; it never loads the C
@@ -13,7 +13,7 @@ IKE ports, IPv4/IPv6 selectors, SA output marks, statistics, expiry events,
 and CHILD_SA rekeying. Both default ESP proposals (including AES-GCM and
 AES-CBC with HMAC) and ESN are supported. MOBIKE, transport/BEET mode, AH,
 IPComp, IP-TFS, hardware offload, labels, virtual IPs, and host route/rule
-installation are outside this backend's scope. The C adapter rejects these
+installation are outside this backend's scope. The plugin rejects these
 features instead of silently changing their behavior.
 
 An interface named `ranet<if_id in eight hex digits>` is created and brought
@@ -31,12 +31,24 @@ interfaces are wanted. Route/address configuration for the overlay remains
 with the network configuration, using the daemon-created interface names.
 There are no interface creation/deletion RPCs exposed to charon.
 
-## Build with Meson
+## Build with Cargo and cargo-c
 
-The standalone build needs a C compiler, Meson 1.1 or newer, Ninja,
-pkg-config, and Jansson development headers (`libjansson-dev` on Debian).
-Building the daemon also needs Cargo/Rust 1.85 or newer; its dependencies are
-pinned in `Cargo.lock`.
+The repository pins Rust **1.99.1** with `rust-toolchain.toml`. This provides
+stable C variadic functions and `std::ffi::VaList` for strongSwan's enumerators,
+including the 1.99.1 C ABI fixes. Both the plugin and daemon are implemented
+in Rust; no C shim or Jansson is used. The small `plugin/wrapper.h` is only
+input to bindgen, which generates layouts from the host's headers.
+
+Use [cargo-c](https://github.com/lu-zero/cargo-c) **0.10.26 or newer** to build
+and install the unversioned plugin module. The build also needs a native
+linker and libclang (`build-essential libclang-dev` on Debian). Installing
+cargo-c from source additionally needs pkg-config and OpenSSL development
+headers (`pkg-config libssl-dev`). Rust dependencies are pinned in `Cargo.lock`.
+
+```sh
+rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
+cargo install cargo-c --version '0.10.26+cargo-0.100.0' --locked
+```
 
 The plugin must use the **source headers and generated config.h matching the
 installed strongSwan**, including its version, build options, and distribution
@@ -44,48 +56,49 @@ patches. It uses charon's C interfaces, so it is not a version-independent
 binary. StrongSwan's installed development headers only cover libstrongswan;
 they do not supply the libcharon kernel interfaces. Obtain both trees from
 the package's matching source/build artifacts, or from your own strongSwan
-build. Meson reads them without modifying or building strongSwan.
+build. Bindgen reads them without modifying or building strongSwan.
 
 ```sh
-meson setup build \
-    -Dstrongswan_source=/absolute/path/to/strongswan-source \
-    -Dstrongswan_build=/absolute/path/to/strongswan-build \
-    --prefix=/usr \
-    -Dplugin_dir=/usr/lib/ipsec/plugins
-meson compile -C build
-meson test -C build
-meson install -C build
+export STRONGSWAN_SOURCE=/absolute/path/to/strongswan-source
+export STRONGSWAN_BUILD=/absolute/path/to/strongswan-build
+cargo cbuild -p strongswan-kernel-rust --release --locked --library-type=cdylib
+cargo build -p charon-kernel-daemon --release --locked
+cargo test --locked -p charon-kernel-daemon -p kernel-rust-protocol
+cargo clippy --locked --workspace --all-targets -- -D warnings
+
+# Install into the prefix containing the matching strongSwan.
+cargo cinstall -p strongswan-kernel-rust --release --locked \
+    --library-type=cdylib --prefix=/usr --libdir=lib
+cargo install --locked --path . --root /usr
 ```
 
-For an in-source strongSwan build, omit `strongswan_build`; it defaults to
-`strongswan_source`. Set `plugin_dir` to the installed strongSwan plugin
-location. Its default is Meson's `libdir` plus `ipsec/plugins`, which may
-differ from a distribution's layout. The daemon installs under
-`libexecdir/ipsec/charon-kernel-daemon`. `-Dpiddir=/run` controls the plugin's
-default socket location, independently of the installation prefix.
+For an in-source strongSwan build, omit `STRONGSWAN_BUILD`; it defaults to
+`STRONGSWAN_SOURCE`. `IPSEC_PIDDIR` defaults to `/run` and controls the plugin's
+default socket location independently of the installation prefix.
 
-Meson builds the C module as `libstrongswan-kernel-rust.so` and calls Cargo
-with `--locked --release` for the daemon. It does not link a second copy of
-strongSwan's libraries into the plugin; the existing daemon supplies the host
-symbols when it loads the module. No libtool `.la` file, core patch, or
-`--enable-kernel-rust` strongSwan configure option is needed.
+cargo-c installs `libstrongswan-kernel-rust.so` under
+`<prefix>/<libdir>/ipsec/plugins`, with the same unversioned SONAME. Select
+`--libdir` to match the host's layout; an absolute libdir overrides the prefix.
+Plugin mode installs only the shared module, without headers, static libraries,
+or pkg-config files. The existing charon supplies its host symbols at `dlopen`;
+the module does not link another copy of strongSwan's libraries. No libtool
+`.la` file, core patch, or `--enable-kernel-rust` configure option is needed.
 
-Build only the plugin without a Rust toolchain by passing `-Ddaemon=false`.
-Build only the daemon with `-Dplugin=false`; this does not require strongSwan
-headers. The normal Cargo workflow remains available:
+`cargo install --path .` installs the daemon in `<root>/bin`. Building only the
+daemon requires no strongSwan headers or libclang. Plain `cargo build` also
+builds the Rust module with `-p strongswan-kernel-rust`; cargo-c handles its
+loader filename, SONAME, and installation. There are no Meson files or custom
+Python build scripts.
 
-```sh
-cargo build --locked --release
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-```
-
-Use Meson's native/cross files for plugin toolchains. For a cross build, set
-`-Ddaemon=false` and build the daemon separately with Cargo for that target.
-Meson's installation supports `DESTDIR` for packaging:
+For packaging, cargo-c supports `--destdir`. Stage the daemon with the standard
+`install` utility:
 
 ```sh
-DESTDIR=/tmp/kernel-rust-package meson install -C build
+cargo cinstall -p strongswan-kernel-rust --release --locked \
+    --library-type=cdylib --prefix=/usr --libdir=lib \
+    --destdir=/tmp/kernel-rust-package
+install -Dm755 target/release/charon-kernel-daemon \
+    /tmp/kernel-rust-package/usr/bin/charon-kernel-daemon
 ```
 
 The build does not install or enable a strongswan.conf fragment. Enable the
@@ -169,7 +182,7 @@ Routes through deleted interfaces disappear with the links.
 ## Verification
 
 Tested with an unmodified strongSwan 6.1.0 checkout, with the plugin and
-daemon built and installed solely through this repository's Meson build.
+daemon built and installed independently through Cargo/cargo-c.
 The tunnel test needs an installed disposable strongSwan prefix containing
 the separate plugin and daemon. It requires root, iproute2, OpenSSL, ping,
 setpriv, and the Python VICI library. Install that library, or point
@@ -177,7 +190,8 @@ setpriv, and the Python VICI library. Install that library, or point
 network namespaces and leave the caller's network namespace untouched:
 
 ```sh
-unshare --net -- python3 tests/integration.py build/charon-kernel-daemon
+unshare --net -- python3 tests/integration.py target/release/charon-kernel-daemon
+unshare --net -- python3 tests/plugin.py /tmp/strongswan-install
 unshare --net -- python3 tests/tunnel.py /tmp/strongswan-install \
     --vici-python /path/to/strongswan/src/libcharon/plugins/vici/python
 unshare --net -- python3 tests/tunnel.py /tmp/strongswan-install --cbc \
@@ -190,7 +204,10 @@ foreign objects, overlapping SAs, scoped flushes, larval allocation, hard
 expiry, and expiry after losing the client. The tunnel tests use
 capability-free charons, Ed25519 raw public keys, ranet's wildcard IPv4/IPv6
 selectors, high ports, output marks, traffic counters, actual rekeying with
-stable interface indices, and final-SA interface deletion. The default run
+stable interface indices, and final-SA interface deletion. The ABI test uses
+the stock strongSwan 6.1 function tables to exercise both variadic `enumerate`
+and C `va_list` forwarding to Rust's `venumerate`, with IPv4/IPv6 addresses and
+subnets, plus repeated clean sessions and descriptor cleanup. The default tunnel run
 negotiates default ESP proposals; the second forces AES-CBC/HMAC-SHA256
 with ESN.
 

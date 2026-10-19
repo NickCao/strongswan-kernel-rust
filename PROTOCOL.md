@@ -1,9 +1,9 @@
 # Varlink kernel API
 
 [io.ranet.Kernel.varlink](io.ranet.Kernel.varlink) defines the types, methods,
-and errors. Rust bindings and server dispatch are generated from this IDL
-with varlink_generator; the C adapter uses Jansson and standard Varlink JSON
-framing. The service supports org.varlink.service.GetInfo and
+and errors. The Rust plugin and daemon share bindings generated from this IDL
+with varlink_generator, along with bounded standard Varlink JSON framing.
+The service supports org.varlink.service.GetInfo and
 GetInterfaceDescription. For example:
 
 ```sh

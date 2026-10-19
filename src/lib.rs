@@ -12,16 +12,6 @@ pub mod network;
 pub mod transport;
 pub mod uapi;
 pub mod xfrm;
-#[allow(clippy::all, non_snake_case, non_camel_case_types, dead_code)]
-pub mod rpc_api {
-    include!(concat!(env!("OUT_DIR"), "/kernel.rs"));
-}
+pub use kernel_rust_protocol as rpc_api;
 
 pub mod service;
-
-// Wipe the typed input key strings as well as the decoded binary buffers.
-impl Drop for rpc_api::Algorithm {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.key);
-    }
-}

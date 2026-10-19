@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Real IKEv2 tunnel between two capability-free charons and Rust daemons.
 
-Run after make install into a disposable prefix:
+Run after Cargo/cargo-c installation into a disposable prefix:
 unshare --net -- python3 tests/tunnel.py /tmp/strongswan-rust-install --vici-python /path/to/strongswan/src/libcharon/plugins/vici/python
 """
 import argparse
@@ -70,7 +70,7 @@ def run(prefix, cbc=False, vici_python=None):
                 pdir = root / str(peer); pdir.mkdir(mode=0o755)
                 runtime = pdir / "run"; runtime.mkdir(); os.chown(runtime, 65534, 65534)
                 kernel_socket = pdir / "kernel.sock"
-                daemon = start(peer, [prefix / "libexec/ipsec/charon-kernel-daemon", "--socket", kernel_socket, "--uid", "65534", "--gid", "65534"], pdir / "kernel.log")
+                daemon = start(peer, [prefix / "bin/charon-kernel-daemon", "--socket", kernel_socket, "--uid", "65534", "--gid", "65534"], pdir / "kernel.log")
                 wait_file(kernel_socket, [daemon])
                 config = pdir / "strongswan.conf"
                 config.write_text(f"""charon {{

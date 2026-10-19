@@ -1,0 +1,40 @@
+[package]
+name = "strongswan-kernel-rust"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99.1"
+license = "GPL-2.0-or-later"
+description = "Unprivileged strongSwan kernel backend Varlink client"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+# Host symbols are supplied by charon at dlopen, not by a Rust test executable.
+test = false
+doctest = false
+
+[features]
+capi = []
+
+[package.metadata.capi]
+min_version = "0.10.26"
+
+[package.metadata.capi.header]
+enabled = false
+
+[package.metadata.capi.library]
+# strongSwan looks up this exact unversioned dlopen basename.
+name = "libstrongswan-kernel-rust"
+plugin = true
+install_subdir = "ipsec/plugins"
+versioning = false
+
+[dependencies]
+kernel-rust-protocol = { path = "../protocol" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "1.8"
+
+[build-dependencies]
+bindgen = "0.72"

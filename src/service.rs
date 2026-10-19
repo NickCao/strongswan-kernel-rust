@@ -28,8 +28,8 @@ pub struct Session {
     pid: i32,
     token: String,
     backend: Mutex<Backend>,
-    events: SyncSender<Event>,
-    receiver: Mutex<Option<Receiver<Event>>>,
+    events: SyncSender<Option<Event>>,
+    receiver: Mutex<Option<Receiver<Option<Event>>>>,
     connected: AtomicBool,
     closed: AtomicBool,
     control: UnixStream,
@@ -102,7 +102,7 @@ fn event_loop(session: Arc<Session>, xfrm: bool, socket: Netlink) {
             };
             match result {
                 Ok(Some(event)) if session.connected.load(Ordering::Acquire) => {
-                    if session.events.try_send(event).is_err() {
+                    if session.events.try_send(Some(event)).is_err() {
                         session.fail();
                     }
                 }
@@ -206,6 +206,9 @@ impl VarlinkInterface for Service {
                 let s = self.control.lock().unwrap().as_ref().unwrap().clone();
                 s.connected.store(false, Ordering::Release);
                 s.closed.store(true, Ordering::Release);
+                // Wake WatchEvents immediately so clean, rapid restarts do not
+                // exhaust the bounded connection slots waiting for its timeout.
+                let _ = s.events.try_send(None);
                 *self.server.active.lock().unwrap() = None;
                 Ok(())
             },
@@ -245,12 +248,16 @@ impl VarlinkInterface for Service {
         }
         while s.connected.load(Ordering::Acquire) && !s.closed.load(Ordering::Acquire) {
             match receiver.recv_timeout(Duration::from_millis(200)) {
-                Ok(event) => {
+                Ok(Some(event)) => {
+                    if s.closed.load(Ordering::Acquire) {
+                        break;
+                    }
                     if let Err(e) = call.reply(event) {
                         s.fail();
                         return Err(e);
                     }
                 }
+                Ok(None) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => (),
                 Err(_) => break,
             }
