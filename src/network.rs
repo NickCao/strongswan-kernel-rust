@@ -7,7 +7,7 @@ use crate::{
     netlink::{self, attribute, get16, get32, Netlink, NlFamily, NlmF},
 };
 use neli::{
-    consts::rtnl::{Ifa, Ifla, IflaInfo, RtAddrFamily, Rta, Rtm},
+    consts::rtnl::{Ifa, Iff, Ifla, IflaInfo, RtAddrFamily, Rta, Rtm},
     rtnl::{Ifaddrmsg, Ifinfomsg, IfinfomsgBuilder, RtgenmsgBuilder, Rtmsg},
     types::RtBuffer,
     FromBytesWithInput,
@@ -369,6 +369,7 @@ impl Network {
         name: String,
         if_id: u32,
         phys: String,
+        master: String,
         mtu: u32,
     ) -> io::Result<()> {
         if name.is_empty() || name.len() >= libc::IFNAMSIZ {
@@ -378,6 +379,9 @@ impl Network {
         attributes.push(attribute(Ifla::Ifname, name.as_str())?);
         if mtu != 0 {
             attributes.push(attribute(Ifla::Mtu, mtu)?);
+        }
+        if !master.is_empty() {
+            attributes.push(attribute(Ifla::Master, index(&master)?)?);
         }
         let mut data = RtBuffer::new();
         data.push(attribute(2u16, if_id)?);
@@ -394,9 +398,11 @@ impl Network {
             Ifla::from(u16::from(Ifla::Linkinfo) | 0x8000),
             info,
         )?);
+        let flags = Iff::UP | Iff::MULTICAST;
         let payload = IfinfomsgBuilder::default()
             .ifi_family(RtAddrFamily::Unspecified)
-            .up()
+            .ifi_flags(flags)
+            .ifi_change(flags)
             .rtattrs(attributes)
             .build()
             .map_err(io::Error::other)?;

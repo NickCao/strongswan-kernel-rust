@@ -32,6 +32,9 @@ struct Args {
     /// Prefix for daemon-owned XFRM interface names.
     #[arg(long, default_value = "ranet", value_parser = interface_prefix)]
     ifname_prefix: String,
+    /// Master device for daemon-owned XFRM interfaces.
+    #[arg(long, value_name = "NAME", value_parser = interface_name)]
+    master_device: Option<String>,
     /// MTU of daemon-owned XFRM interfaces.
     #[arg(long, default_value_t = 1400, value_parser = clap::value_parser!(u32).range(1280..=65535))]
     mtu: u32,
@@ -53,6 +56,12 @@ fn interface_prefix(value: &str) -> Result<String, String> {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
         return Err("expected 1–7 ASCII letters, digits, underscores, or hyphens".into());
+    }
+    Ok(value.to_owned())
+}
+fn interface_name(value: &str) -> Result<String, String> {
+    if value.is_empty() || value.len() >= libc::IFNAMSIZ || value.contains('\0') {
+        return Err("expected an interface name shorter than 16 bytes".into());
     }
     Ok(value.to_owned())
 }
@@ -96,6 +105,7 @@ fn run() -> io::Result<()> {
         socket: path,
         group: gid,
         ifname_prefix: prefix,
+        master_device,
         mtu,
     } = Args::parse();
     rustix::process::umask(rustix::fs::Mode::from_bits_retain(0o077));
@@ -108,6 +118,7 @@ fn run() -> io::Result<()> {
     let server = Arc::new(Server {
         active: Mutex::new(None),
         prefix,
+        master_device,
         mtu,
     });
     sd_notify::notify(&[sd_notify::NotifyState::Ready])?;

@@ -21,6 +21,7 @@ use std::{
 pub struct Server {
     pub active: Mutex<Option<Arc<Session>>>,
     pub prefix: String,
+    pub master_device: Option<String>,
     pub mtu: u32,
 }
 pub struct Session {
@@ -144,6 +145,7 @@ impl VarlinkInterface for Service {
             }
             let backend = Backend::new(
                 self.server.prefix.clone(),
+                self.server.master_device.clone(),
                 self.server.mtu,
                 interfaces_use,
                 interfaces_ignore,

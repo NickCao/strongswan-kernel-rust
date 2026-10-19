@@ -31,6 +31,10 @@ in
       default = "ranet";
       description = "Interface name prefix, followed by the XFRM interface ID as eight hexadecimal digits.";
     };
+    masterDevice = lib.mkOption {
+      type = lib.types.str;
+      default = "gravity";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -71,6 +75,8 @@ in
           (toString cfg.mtu)
           "--ifname-prefix"
           cfg.interfaceNamePrefix
+          "--master-device"
+          cfg.masterDevice
         ];
         RuntimeDirectory = "charon-kernel";
         RuntimeDirectoryMode = "0755";

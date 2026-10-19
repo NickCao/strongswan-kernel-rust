@@ -18,11 +18,13 @@ pub struct Backend {
     pub net: Network,
     interfaces: HashMap<u32, Interface>,
     prefix: String,
+    master_device: Option<String>,
     mtu: u32,
 }
 impl Backend {
     pub fn new(
         prefix: String,
+        master_device: Option<String>,
         mtu: u32,
         interfaces_use: String,
         interfaces_ignore: String,
@@ -47,6 +49,7 @@ impl Backend {
             net,
             interfaces: HashMap::new(),
             prefix,
+            master_device,
             mtu,
         })
     }
@@ -69,8 +72,13 @@ impl Backend {
         {
             return Err(io::Error::from_raw_os_error(libc::EEXIST));
         }
-        self.net
-            .create_xfrmi(name.clone(), id, String::new(), self.mtu)?;
+        self.net.create_xfrmi(
+            name.clone(),
+            id,
+            String::new(),
+            self.master_device.clone().unwrap_or_default(),
+            self.mtu,
+        )?;
         self.interfaces.insert(
             id,
             Interface {
