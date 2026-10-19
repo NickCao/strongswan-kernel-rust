@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Standard Varlink framing: bounded NUL-terminated JSON on a Unix stream.
-pub use kernel_rust_protocol::transport::{peer, Frames, Peer, MAX_FRAME};
+//! Filesystem socket setup and peer credentials; Varlink owns the protocol.
+pub use kernel_rust_protocol::transport::{peer, Peer};
 use rustix::net::{recv, RecvFlags};
 use std::{
     io,

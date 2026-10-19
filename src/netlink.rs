@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Netlink requests and notifications through neli. XFRM payloads are opaque
-//! here; their Linux UAPI records live in xfrm.rs and uapi.rs.
+//! Netlink requests and notifications through neli. XFRM payloads are encoded
+//! by netlink-packet-xfrm and remain opaque at this transport layer.
 use crate::error::invalid;
 pub use neli::consts::{nl::NlmF, socket::NlFamily};
 use neli::{
@@ -32,18 +32,13 @@ impl Message {
             payload,
         }
     }
-    pub fn attr(&mut self, kind: u16, bytes: &[u8]) -> io::Result<()> {
-        let attr = attribute(kind, bytes)?;
-        self.payload.resize(align(self.payload.len()), 0);
-        let mut buffer = Cursor::new(std::mem::take(&mut self.payload));
-        buffer.set_position(buffer.get_ref().len() as u64);
-        let result = attr.to_bytes(&mut buffer).map_err(io::Error::other);
-        self.payload = buffer.into_inner();
-        result
-    }
-    pub fn attr32(&mut self, kind: u16, value: u32) -> io::Result<()> {
-        self.attr(kind, &value.to_ne_bytes())
-    }
+}
+
+pub fn get16(bytes: &[u8], offset: usize) -> u16 {
+    netlink_packet_core::parse_u16(&bytes[offset..offset + 2]).unwrap()
+}
+pub fn get32(bytes: &[u8], offset: usize) -> u32 {
+    netlink_packet_core::parse_u32(&bytes[offset..offset + 4]).unwrap()
 }
 
 pub fn attribute<T: Size, P: Size + ToBytes>(kind: T, payload: P) -> io::Result<Rtattr<T, Buffer>> {

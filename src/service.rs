@@ -7,7 +7,7 @@ use crate::{
     transport,
 };
 use std::{
-    io::{self, Read},
+    io,
     os::unix::net::UnixStream,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -151,13 +151,7 @@ impl VarlinkInterface for Service {
             let (xfrm_socket, xfrm) = Netlink::subscribe(NlFamily::Xfrm, 1 | 2 | 128)?;
             let (route_socket, route) =
                 Netlink::subscribe(NlFamily::Route, 1 | 0x10 | 0x100 | 0x40 | 0x400)?;
-            let mut token = [0u8; 32];
-            std::fs::File::open("/dev/urandom")?.read_exact(&mut token)?;
-            let token: String = token
-                .iter()
-                .flat_map(|b| [b >> 4, b & 15])
-                .map(|n| char::from(b"0123456789abcdef"[n as usize]))
-                .collect();
+            let token = hex::encode(rand::random::<[u8; 32]>());
             let features = backend.xfrm.features().into();
             let (tx, rx) = mpsc::sync_channel(256);
             let s = Arc::new(Session {

@@ -198,10 +198,20 @@ credentials use Nix's raw PID representation, which also handles a peer PID of
 zero across PID namespaces. [neli](https://docs.rs/neli/0.7.4/neli/)
 handles Netlink sockets, message and attribute serialization, multipart replies,
 ACKs, sequence/PID checks, and multicast notifications. Network discovery and
-XFRM interface operations use its routing types. The daemon retains the XFRM
-UAPI payload layouts, which neli does not provide, and translates kernel errors
-to errno replies. Closing a session drops its notification routers and wakes
-the event workers.
+XFRM interface operations use its routing types. XFRM payload records,
+attributes, and byte order use
+[netlink-packet-xfrm](https://docs.rs/netlink-packet-xfrm/0.5.0/netlink_packet_xfrm/).
+`SA_DIR` uses its generic attribute extension; expiry parsing retains trailing
+interface ID/mark attributes that its high-level expiry message omits.
+The daemon translates kernel errors to errno replies. Closing a session drops
+its notification routers and wakes the event workers.
+
+Varlink's protocol engine handles client framing and streaming state; its
+standard service dispatcher handles server framing. Socket credentials and
+the session's ownership/disconnect rules stay in this repository. Subnet
+arithmetic uses `ipnet`, hexadecimal keys and tokens use `hex`, session token
+randomness uses `rand`, and daemon arguments use `clap`. Library buffers use
+their normal allocation and release behavior.
 
 The plugin still implements strongSwan's C interfaces. Its remaining unsafe
 code borrows C callback arguments, invokes host functions, manages the exported

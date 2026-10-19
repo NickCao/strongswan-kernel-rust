@@ -283,13 +283,8 @@ pub fn policy_config(p: rpc::PolicyConfig) -> io::Result<PolicyData> {
     Ok(d)
 }
 fn decode_key(s: &str) -> io::Result<Zeroizing<Vec<u8>>> {
-    if !s.len().is_multiple_of(2) || s.len() > 16384 {
+    if s.len() > 16384 {
         return Err(invalid());
     }
-    let mut bytes = Zeroizing::new(Vec::with_capacity(s.len() / 2));
-    for pair in s.as_bytes().as_chunks::<2>().0 {
-        let digit = |c: u8| (c as char).to_digit(16).ok_or_else(invalid);
-        bytes.push((digit(pair[0])? * 16 + digit(pair[1])?) as u8);
-    }
-    Ok(bytes)
+    hex::decode(s).map(Zeroizing::new).map_err(|_| invalid())
 }

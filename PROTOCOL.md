@@ -2,7 +2,8 @@
 
 [io.ranet.Kernel.varlink](io.ranet.Kernel.varlink) defines the types, methods,
 and errors. The Rust plugin and daemon share bindings generated from this IDL
-with varlink_generator, along with bounded standard Varlink JSON framing.
+with varlink_generator. The Varlink library handles standard JSON framing and
+client protocol state, including streaming event replies.
 The service supports org.varlink.service.GetInfo and
 GetInterfaceDescription. For example:
 
@@ -10,10 +11,9 @@ GetInterfaceDescription. For example:
 varlinkctl introspect /run/charon-kernel.sock io.ranet.Kernel
 ```
 
-Connections are Unix SOCK_STREAM sockets. Each JSON message ends with NUL,
-with a limit of 131072 bytes including the terminator. Requests on the
-control connection are serialized, as required by Varlink. Replies may omit
-`parameters` for methods with no output. Standard Varlink errors describe
+Connections are Unix SOCK_STREAM sockets. Each JSON message ends with NUL.
+Requests on the control connection are serialized, as required by Varlink.
+Replies may omit `parameters` for methods with no output. Standard Varlink errors describe
 unknown methods and invalid parameter types; io.ranet.Kernel.KernelError
 contains a positive Linux errno for rejected/kernel operations.
 

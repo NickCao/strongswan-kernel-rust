@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 use crate::error::invalid;
+use ipnet::IpNet;
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -45,10 +46,6 @@ impl Host {
         };
         Ok(Self { ip, port })
     }
-    pub fn put(&self, data: &mut [u8], offset: usize) {
-        let b = self.bytes();
-        data[offset..offset + b.len()].copy_from_slice(&b);
-    }
     pub fn without_port(&self) -> Self {
         Self {
             ip: self.ip,
@@ -67,18 +64,18 @@ pub struct Ts {
 }
 impl Ts {
     pub fn subnet(&self) -> (Host, u8) {
-        let a = self.from.bytes();
-        let b = self.to.bytes();
-        let mut prefix = 0;
-        for (x, y) in a.iter().zip(&b) {
-            if x == y {
-                prefix += 8;
-            } else {
-                prefix += (x ^ y).leading_zeros() as u8;
-                break;
-            }
+        let mut subnet = IpNet::from(self.from.ip);
+        while !subnet.contains(&self.to.ip) {
+            // Traffic selector validation requires matching address families.
+            subnet = subnet.supernet().unwrap();
         }
-        (network(&self.from, prefix), prefix)
+        (
+            Host {
+                ip: subnet.network(),
+                port: 0,
+            },
+            subnet.prefix_len(),
+        )
     }
     pub fn ports(&self) -> (u16, u16) {
         let bits = (self.from_port ^ self.to_port).leading_zeros();
@@ -99,15 +96,15 @@ impl Ts {
         from_port: u16,
         to_port: u16,
     ) -> io::Result<Self> {
-        if prefix > host.bits() {
-            return Err(invalid());
-        }
-        let from = network(&host, prefix);
-        let mut last = from.bytes();
-        for i in prefix..host.bits() {
-            last[i as usize / 8] |= 0x80 >> (i % 8);
-        }
-        let to = Host::from_kernel(host.family(), &last, 0)?;
+        let subnet = IpNet::new(host.ip, prefix).map_err(|_| invalid())?;
+        let from = Host {
+            ip: subnet.network(),
+            port: 0,
+        };
+        let to = Host {
+            ip: subnet.broadcast(),
+            port: 0,
+        };
         Ok(Self {
             from,
             to,
@@ -118,12 +115,10 @@ impl Ts {
     }
 }
 pub fn network(host: &Host, prefix: u8) -> Host {
-    let mut bytes = host.bytes();
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        let bits = prefix.saturating_sub(i as u8 * 8).min(8);
-        *byte &= if bits == 0 { 0 } else { 0xff << (8 - bits) };
+    Host {
+        ip: IpNet::new(host.ip, prefix).unwrap().network(),
+        port: 0,
     }
-    Host::from_kernel(host.family(), &bytes, 0).unwrap()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

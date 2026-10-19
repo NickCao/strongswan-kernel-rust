@@ -4,8 +4,9 @@ use charon_kernel_daemon::{
     error::invalid,
     rpc_api,
     service::{Server, Service},
-    transport::{self, Frames},
+    transport,
 };
+use clap::Parser;
 use std::{
     io,
     os::unix::net::UnixStream,
@@ -18,12 +19,48 @@ use std::{
     time::Duration,
 };
 use varlink::ConnectionHandler;
+
+#[derive(Parser)]
+#[command(version, about)]
+struct Args {
+    /// Filesystem path for the Varlink socket.
+    #[arg(long, default_value = "/run/charon-kernel.sock")]
+    socket: PathBuf,
+    /// Socket access group, specified by name or numeric GID.
+    #[arg(long, default_value = "0", value_name = "NAME|GID", value_parser = group_id)]
+    group: u32,
+    /// Prefix for daemon-owned XFRM interface names.
+    #[arg(long, default_value = "ranet", value_parser = interface_prefix)]
+    ifname_prefix: String,
+    /// MTU of daemon-owned XFRM interfaces.
+    #[arg(long, default_value_t = 1400, value_parser = clap::value_parser!(u32).range(1280..=65535))]
+    mtu: u32,
+}
+fn group_id(value: &str) -> Result<u32, String> {
+    if let Ok(gid) = value.parse() {
+        return Ok(gid);
+    }
+    nix::unistd::Group::from_name(value)
+        .map_err(|error| error.to_string())?
+        .map(|group| group.gid.as_raw())
+        .ok_or_else(|| format!("unknown group {value:?}"))
+}
+fn interface_prefix(value: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value.len() + 8 >= libc::IFNAMSIZ
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err("expected 1–7 ASCII letters, digits, underscores, or hyphens".into());
+    }
+    Ok(value.to_owned())
+}
 fn connection(
     mut socket: UnixStream,
     peer: transport::Peer,
     server: Arc<Server>,
 ) -> io::Result<()> {
-    socket.set_read_timeout(Some(Duration::from_secs(1)))?;
     socket.set_write_timeout(Some(Duration::from_secs(10)))?;
     let service = Service {
         server,
@@ -38,75 +75,29 @@ fn connection(
         "https://github.com/NickCao/ranet",
         vec![Box::new(rpc_api::new(Box::new(service)))],
     );
-    let mut frames = Frames::default();
+    let mut reader = io::BufReader::new(socket.try_clone()?);
+    // Varlink owns request framing and generated dispatch. Error payloads may
+    // contain key material, so only report an error kind to the accept loop.
     loop {
-        let frame = match frames.read(&mut socket) {
-            Ok(f) => f,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) && !frames.partial() =>
-            {
-                continue
+        match dispatcher.handle(&mut reader, &mut socket, None) {
+            // Generated dispatch has already replied InvalidParameter; the
+            // connection remains usable for a subsequent semantic request.
+            Err(error) if matches!(error.kind(), varlink::ErrorKind::SerdeJsonDe(_)) => continue,
+            Err(error) if matches!(error.kind(), varlink::ErrorKind::ConnectionClosed) => {
+                return Ok(())
             }
-            Err(e) => return Err(e),
-        };
-        // A single bounded standard Varlink frame is dispatched by the generated
-        // interface. Never log parse errors, which may contain key material.
-        let (unread, upgraded) =
-            match dispatcher.handle(&mut io::Cursor::new(&frame[..]), &mut socket, None) {
-                Ok(v) => v,
-                Err(e) if matches!(e.kind(), varlink::ErrorKind::SerdeJsonDe(_)) => continue,
-                Err(_) => return Err(invalid()),
-            };
-        if !unread.is_empty() || upgraded.is_some() {
-            return Err(invalid());
+            Ok((unread, None)) if unread.is_empty() => return Ok(()),
+            _ => return Err(invalid()),
         }
     }
 }
 fn run() -> io::Result<()> {
-    let mut path = PathBuf::from("/run/charon-kernel.sock");
-    let (mut gid, mut mtu) = (0, 1400);
-    let mut prefix = "ranet".to_string();
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--socket" => path = args.next().ok_or_else(invalid)?.into(),
-            "--group" => {
-                let group = args.next().ok_or_else(invalid)?;
-                gid = match group.parse() {
-                    Ok(gid) => gid,
-                    Err(_) => nix::unistd::Group::from_name(&group)?
-                        .ok_or_else(invalid)?
-                        .gid
-                        .as_raw(),
-                };
-            }
-            "--mtu" => {
-                mtu = args
-                    .next()
-                    .ok_or_else(invalid)?
-                    .parse()
-                    .map_err(|_| invalid())?
-            }
-            "--ifname-prefix" => prefix = args.next().ok_or_else(invalid)?,
-            "--help" => {
-                println!("charon-kernel-daemon [--socket PATH] [--group NAME|GID] [--ifname-prefix ranet] [--mtu 1400]");
-                return Ok(());
-            }
-            _ => return Err(invalid()),
-        }
-    }
-    if prefix.is_empty()
-        || prefix.len() + 8 >= libc::IFNAMSIZ
-        || !prefix
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        || !(1280..=65535).contains(&mtu)
-    {
-        return Err(invalid());
-    }
+    let Args {
+        socket: path,
+        group: gid,
+        ifname_prefix: prefix,
+        mtu,
+    } = Args::parse();
     rustix::process::umask(rustix::fs::Mode::from_bits_retain(0o077));
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)?;
     let listener = transport::listen(&path, gid)?;

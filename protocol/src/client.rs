@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Safe Varlink client. No C objects, raw descriptors, callbacks, or host globals.
-use crate::{
-    self as api,
-    transport::{peer, Frames, MAX_FRAME},
-};
-use rustix::net::RecvFlags;
+use crate::{self as api, transport::peer};
+use rustix::net::{recv, RecvFlags};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     fmt,
@@ -20,7 +17,7 @@ use std::{
     },
     time::Duration,
 };
-use zeroize::Zeroizing;
+use varlink::sansio::{Client as Protocol, ClientEvent};
 
 pub struct Config {
     pub path: String,
@@ -49,24 +46,9 @@ impl std::error::Error for Error {}
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Empty {}
 
-#[derive(Serialize)]
-struct Request<'a, P> {
-    method: String,
-    parameters: &'a P,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    more: Option<bool>,
-}
-
-#[derive(Deserialize)]
-struct Reply<T> {
-    parameters: Option<T>,
-    error: Option<String>,
-    continues: Option<bool>,
-}
-
 struct Channel {
     stream: UnixStream,
-    frames: Frames,
+    protocol: Protocol,
 }
 impl Channel {
     fn connect(path: &str, uid: u32) -> io::Result<Self> {
@@ -78,32 +60,47 @@ impl Channel {
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
         Ok(Self {
             stream,
-            frames: Frames::default(),
+            protocol: Protocol::new(),
         })
     }
     fn send<P: Serialize>(&mut self, method: &str, parameters: &P, more: bool) -> io::Result<()> {
-        // Borrow typed messages directly so serialization never clones SA keys
-        // into a JSON value tree. Wipe the encoded frame after sending it.
-        let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_FRAME));
-        serde_json::to_writer(
-            &mut *bytes,
-            &Request {
-                method: format!("io.ranet.Kernel.{method}"),
-                parameters,
-                more: more.then_some(true),
-            },
-        )
-        .map_err(io::Error::other)?;
-        bytes.push(0);
-        if bytes.len() > MAX_FRAME {
-            return Err(io::ErrorKind::InvalidInput.into());
+        let method = format!("io.ranet.Kernel.{method}");
+        let mut request = varlink::Request::create(
+            method.clone(),
+            Some(serde_json::to_value(parameters).map_err(io::Error::other)?),
+        );
+        request.more = more.then_some(true);
+        self.protocol
+            .send_request(method, request)
+            .map_err(io::Error::other)?;
+        while let Some(transmit) = self.protocol.poll_transmit() {
+            self.stream.write_all(&transmit.payload)?;
         }
-        self.stream.write_all(&bytes)
+        Ok(())
     }
-    fn receive<T: DeserializeOwned>(&mut self, flags: RecvFlags) -> io::Result<Reply<T>> {
-        let frame = self.frames.read_flags(&self.stream, flags)?;
-        serde_json::from_slice(&frame[..frame.len() - 1]).map_err(io::Error::other)
+    fn receive(&mut self, flags: RecvFlags) -> io::Result<varlink::Reply> {
+        loop {
+            match self.protocol.poll_event() {
+                Some(ClientEvent::Reply { reply, .. }) => return Ok(reply),
+                Some(_) => return Err(io::ErrorKind::InvalidData.into()),
+                None => (),
+            }
+            let mut bytes = [0u8; 4096];
+            match recv(&self.stream, &mut bytes[..], flags) {
+                Ok((0, _)) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok((length, _)) => self
+                    .protocol
+                    .handle_input(&bytes[..length])
+                    .map_err(io::Error::other)?,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
+}
+fn decode_reply<T: DeserializeOwned>(reply: varlink::Reply) -> io::Result<T> {
+    serde_json::from_value(reply.parameters.unwrap_or_else(|| serde_json::json!({})))
+        .map_err(io::Error::other)
 }
 
 struct Control {
@@ -125,14 +122,11 @@ impl AsFd for Events {
 }
 impl Events {
     pub fn next_event(&mut self) -> io::Result<api::Event> {
-        let reply: Reply<api::WatchEvents_Reply> = self.channel.receive(RecvFlags::DONTWAIT)?;
+        let reply = self.channel.receive(RecvFlags::DONTWAIT)?;
         if reply.error.is_some() || reply.continues != Some(true) {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
-        reply
-            .parameters
-            .map(|p| p.event)
-            .ok_or_else(|| io::ErrorKind::InvalidData.into())
+        decode_reply::<api::WatchEvents_Reply>(reply).map(|reply| reply.event)
     }
 }
 
@@ -147,9 +141,9 @@ impl Client {
             },
             false,
         )?;
-        let reply: Reply<api::OpenSession_Reply> = control.receive(RecvFlags::empty())?;
+        let reply = control.receive(RecvFlags::empty())?;
         let session = if reply.error.is_none() && reply.continues != Some(true) {
-            reply.parameters
+            decode_reply::<api::OpenSession_Reply>(reply).ok()
         } else {
             None
         }
@@ -167,12 +161,11 @@ impl Client {
                 },
                 true,
             )?;
-            let ready: Reply<api::WatchEvents_Reply> = events.receive(RecvFlags::empty())?;
+            let ready = events.receive(RecvFlags::empty())?;
             if ready.error.is_some()
                 || ready.continues != Some(true)
-                || ready
-                    .parameters
-                    .is_none_or(|p| p.event.kind != api::Event_kind::ready)
+                || decode_reply::<api::WatchEvents_Reply>(ready)?.event.kind
+                    != api::Event_kind::ready
             {
                 return Err(io::ErrorKind::InvalidData.into());
             }
@@ -182,7 +175,7 @@ impl Client {
             Ok(values) => values,
             Err(error) => {
                 let _ = control.send("CloseSession", &Empty {}, false);
-                let _ = control.receive::<Empty>(RecvFlags::empty());
+                let _ = control.receive(RecvFlags::empty());
                 return Err(error);
             }
         };
@@ -220,11 +213,7 @@ impl Client {
         let reply = control
             .channel
             .send(method, parameters, false)
-            .and_then(|()| {
-                control
-                    .channel
-                    .receive::<serde_json::Value>(RecvFlags::empty())
-            });
+            .and_then(|()| control.channel.receive(RecvFlags::empty()));
         match reply {
             Ok(reply) if reply.continues != Some(true) => {
                 if let Some(remote) = reply.error {
@@ -241,8 +230,7 @@ impl Client {
                     };
                     return Err(error("remote error", errno));
                 }
-                serde_json::from_value(reply.parameters.unwrap_or_else(|| serde_json::json!({})))
-                    .map_err(|_| error("invalid reply", None))
+                decode_reply(reply).map_err(|_| error("invalid reply", None))
             }
             _ => {
                 control.failed = true;
@@ -276,7 +264,11 @@ impl Client {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
-    use std::{io::Read, os::unix::net::UnixListener, thread};
+    use std::{
+        io::{BufRead, BufReader, Read},
+        os::unix::net::UnixListener,
+        thread,
+    };
 
     fn fixture() -> (tempfile::TempDir, UnixListener, Config) {
         let directory = tempfile::tempdir().unwrap();
@@ -295,7 +287,8 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let frame = Frames::default().read(stream).unwrap();
+        let mut frame = Vec::new();
+        BufReader::new(stream).read_until(0, &mut frame).unwrap();
         serde_json::from_slice(&frame[..frame.len() - 1]).unwrap()
     }
     fn reply(stream: &mut UnixStream, value: Value) {
@@ -427,6 +420,60 @@ mod tests {
         assert!(
             matches!(Client::connect(&config), Err(error) if error.kind() == io::ErrorKind::PermissionDenied)
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn nonblocking_events_keep_fragmented_and_coalesced_replies() {
+        let (_directory, listener, config) = fixture();
+        let (sent, received) = std::sync::mpsc::channel();
+        let (advance, next) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut control, mut events) = handshake(&listener, ready());
+            let bytes = serde_json::to_vec(&json!({"continues":true,
+                "parameters":{"event":{"kind":"roam","addressChanged":true}}}))
+            .unwrap();
+            let split = bytes.len() / 2;
+            events.write_all(&bytes[..split]).unwrap();
+            sent.send(()).unwrap();
+            next.recv().unwrap();
+            events.write_all(&bytes[split..]).unwrap();
+            events.write_all(b"\0").unwrap();
+            reply(
+                &mut events,
+                json!({"continues":true,
+                "parameters":{"event":{"kind":"roam","addressChanged":false}}}),
+            );
+            events.write_all(&bytes[..split]).unwrap();
+            sent.send(()).unwrap();
+            next.recv().unwrap();
+            events.write_all(&bytes[split..]).unwrap();
+            events.write_all(b"\0").unwrap();
+            sent.send(()).unwrap();
+            assert_eq!(
+                request(&mut control)["method"],
+                "io.ranet.Kernel.CloseSession"
+            );
+            reply(&mut control, json!({}));
+        });
+        let (client, mut events) = Client::connect(&config).unwrap();
+        received.recv().unwrap();
+        assert_eq!(
+            events.next_event().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        advance.send(()).unwrap();
+        received.recv().unwrap();
+        assert_eq!(events.next_event().unwrap().addressChanged, Some(true));
+        assert_eq!(events.next_event().unwrap().addressChanged, Some(false));
+        assert_eq!(
+            events.next_event().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        advance.send(()).unwrap();
+        received.recv().unwrap();
+        assert_eq!(events.next_event().unwrap().addressChanged, Some(true));
+        client.close().unwrap();
         server.join().unwrap();
     }
 }

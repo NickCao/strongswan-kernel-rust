@@ -12,7 +12,6 @@ pub mod model;
 pub mod netlink;
 pub mod network;
 pub mod transport;
-pub mod uapi;
 pub mod xfrm;
 pub use kernel_rust_protocol as rpc_api;
 

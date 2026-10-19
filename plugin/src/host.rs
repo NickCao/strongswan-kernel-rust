@@ -252,15 +252,9 @@ pub unsafe fn algorithm(
         unsafe { string(name) }?
     };
     let bytes = unsafe { chunk_bytes(key) }?;
-    let mut hex = String::with_capacity(key.len * 2);
-    const DIGITS: &[u8] = b"0123456789abcdef";
-    for byte in bytes {
-        hex.push(DIGITS[(byte >> 4) as usize] as char);
-        hex.push(DIGITS[(byte & 15) as usize] as char);
-    }
     Ok(api::Algorithm {
         id: id.into(),
         name,
-        key: hex,
+        key: hex::encode(bytes),
     })
 }

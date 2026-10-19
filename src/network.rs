@@ -4,8 +4,7 @@
 use crate::{
     error::invalid,
     model::*,
-    netlink::{self, attribute, Netlink, NlFamily, NlmF},
-    uapi::{get16, get32},
+    netlink::{self, attribute, get16, get32, Netlink, NlFamily, NlmF},
 };
 use neli::{
     consts::rtnl::{Ifa, Ifla, IflaInfo, RtAddrFamily, Rta, Rtm},
