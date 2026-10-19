@@ -4,15 +4,20 @@
 use crate::{
     error::invalid,
     model::*,
-    netlink::{self, attribute, get16, get32, Netlink, NlFamily, NlmF},
+    netlink::{self, attribute, get32, Netlink, NlFamily, NlmF},
 };
 use neli::{
-    consts::rtnl::{Ifa, Iff, Ifla, IflaInfo, RtAddrFamily, Rta, Rtm},
-    rtnl::{Ifaddrmsg, Ifinfomsg, IfinfomsgBuilder, RtgenmsgBuilder, Rtmsg},
+    consts::rtnl::{
+        Ifa, Iff, Ifla, IflaInfo, RtAddrFamily, RtScope, RtTable, Rta, Rtm, Rtn, Rtprot,
+    },
+    rtnl::{Ifaddrmsg, Ifinfomsg, IfinfomsgBuilder, RtgenmsgBuilder, Rtmsg, RtmsgBuilder},
     types::RtBuffer,
     FromBytesWithInput,
 };
-use std::io::{self, Cursor};
+use std::{
+    io::{self, Cursor},
+    sync::Arc,
+};
 
 #[derive(Clone, Debug)]
 pub struct Link {
@@ -30,19 +35,14 @@ pub struct AddressEntry {
     pub flags: u32,
     pub index: u32,
 }
-struct Candidate {
-    dst: Host,
-    prefix: u8,
-    gateway: Option<Host>,
-    source: Option<Host>,
-    index: u32,
-    table: u32,
-    priority: u32,
-    kind: u8,
+struct Snapshot {
+    links: Vec<Link>,
+    addresses: Vec<AddressEntry>,
 }
 pub struct Network {
     socket: Netlink,
     pub config: Config,
+    snapshot: Option<Arc<Snapshot>>,
 }
 fn absent() -> io::Error {
     io::Error::from_raw_os_error(libc::ENOENT)
@@ -73,7 +73,20 @@ impl Network {
         Ok(Self {
             socket: Netlink::new(NlFamily::Route)?,
             config: Config::default(),
+            snapshot: None,
         })
+    }
+    pub fn invalidate(&mut self) {
+        self.snapshot = None;
+    }
+    fn snapshot(&mut self) -> io::Result<Arc<Snapshot>> {
+        if self.snapshot.is_none() {
+            self.snapshot = Some(Arc::new(Snapshot {
+                links: self.links()?,
+                addresses: self.addresses()?,
+            }));
+        }
+        Ok(self.snapshot.as_ref().unwrap().clone())
     }
     pub fn links(&mut self) -> io::Result<Vec<Link>> {
         let mut links = Vec::new();
@@ -180,12 +193,12 @@ impl Network {
         Ok(out)
     }
     pub fn enumerate(&mut self, which: u32) -> io::Result<Vec<Host>> {
-        let links = self.links()?;
-        let addresses = self.addresses()?;
-        Ok(addresses
-            .into_iter()
+        let snapshot = self.snapshot()?;
+        Ok(snapshot
+            .addresses
+            .iter()
             .filter(|a| {
-                let Some(link) = links.iter().find(|l| l.index == a.index) else {
+                let Some(link) = snapshot.links.iter().find(|l| l.index == a.index) else {
                     return false;
                 };
                 if link.xfrm.is_some() || a.scope >= 254 || a.flags & (0x08 | 0x20 | 0x40) != 0 {
@@ -200,16 +213,16 @@ impl Network {
                 };
                 which & class != 0
             })
-            .map(|a| a.host)
+            .map(|a| a.host.clone())
             .collect())
     }
     pub fn subnets(&mut self) -> io::Result<Vec<(Host, u8, String)>> {
-        let links = self.links()?;
-        let addresses = self.addresses()?;
-        Ok(addresses
-            .into_iter()
+        let snapshot = self.snapshot()?;
+        Ok(snapshot
+            .addresses
+            .iter()
             .filter_map(|a| {
-                let link = links.iter().find(|l| {
+                let link = snapshot.links.iter().find(|l| {
                     l.index == a.index && l.flags & 1 != 0 && self.config.usable(&l.name)
                 })?;
                 if link.xfrm.is_some() || a.scope >= 254 || a.prefix == a.host.bits() {
@@ -220,11 +233,11 @@ impl Network {
             .collect())
     }
     pub fn interface(&mut self, host: &Host) -> io::Result<String> {
-        let addresses = self.addresses()?;
-        let links = self.links()?;
-        for a in addresses {
+        let snapshot = self.snapshot()?;
+        for a in &snapshot.addresses {
             if a.host.ip == host.ip {
-                if let Some(link) = links
+                if let Some(link) = snapshot
+                    .links
                     .iter()
                     .find(|l| l.index == a.index && l.flags & 1 != 0 && self.config.usable(&l.name))
                 {
@@ -233,76 +246,6 @@ impl Network {
             }
         }
         Err(absent())
-    }
-    fn candidates(&mut self, family: u16) -> io::Result<Vec<Candidate>> {
-        let query = RtgenmsgBuilder::default()
-            .rtgen_family(RtAddrFamily::from(family as u8))
-            .build()
-            .map_err(io::Error::other)?;
-        let mut out = Vec::new();
-        for r in self
-            .socket
-            .request_payload(Rtm::Getroute.into(), NlmF::DUMP, query)?
-        {
-            if r.kind != u16::from(Rtm::Newroute) {
-                continue;
-            }
-            let info = Rtmsg::from_bytes_with_input(&mut Cursor::new(&r.payload), r.payload.len())
-                .map_err(io::Error::other)?;
-            if u8::from(*info.rtm_family()) as u16 != family
-                || *info.rtm_dst_len() > if family == 2 { 32 } else { 128 }
-            {
-                continue;
-            }
-            let mut route = Candidate {
-                dst: Host::any(family)?,
-                prefix: *info.rtm_dst_len(),
-                gateway: None,
-                source: None,
-                index: 0,
-                table: u8::from(*info.rtm_table()) as u32,
-                priority: 0,
-                kind: u8::from(*info.rtm_type()),
-            };
-            for attr in info.rtattrs().iter() {
-                let v = attr.rta_payload().as_ref();
-                match attr.rta_type() {
-                    Rta::Dst => route.dst = Host::from_kernel(family, v, 0)?,
-                    Rta::Oif if v.len() == 4 => route.index = get32(v, 0),
-                    Rta::Gateway => route.gateway = Some(Host::from_kernel(family, v, 0)?),
-                    Rta::Priority if v.len() == 4 => route.priority = get32(v, 0),
-                    Rta::Prefsrc => route.source = Some(Host::from_kernel(family, v, 0)?),
-                    Rta::Table if v.len() == 4 => route.table = get32(v, 0),
-                    Rta::Multipath if v.len() >= 8 => {
-                        // First live multipath nexthop
-                        let mut hops = v;
-                        while hops.len() >= 8 {
-                            let len = get16(hops, 0) as usize;
-                            if len < 8 || len > hops.len() {
-                                break;
-                            }
-                            if hops[2] & 1 == 0 {
-                                route.index = get32(hops, 4);
-                                for (k, a) in netlink::attrs(&hops[8..len])?.iter() {
-                                    if k == 5 {
-                                        route.gateway = Some(Host::from_kernel(family, a, 0)?);
-                                    }
-                                }
-                                break;
-                            }
-                            if netlink::align(len) > hops.len() {
-                                break;
-                            }
-                            hops = &hops[netlink::align(len)..];
-                        }
-                    }
-                    _ => (),
-                }
-            }
-            out.push(route);
-        }
-        out.sort_by_key(|r| (std::cmp::Reverse(r.prefix), r.priority));
-        Ok(out)
     }
     pub fn lookup(
         &mut self,
@@ -313,56 +256,94 @@ impl Network {
         if src.is_some_and(|s| s.family() != dest.family()) {
             return Err(invalid());
         }
-        let links = self.links()?;
-        let addresses = self.addresses()?;
-        for r in self.candidates(dest.family())? {
-            if ![1, 2].contains(&r.kind)
-                || (prefix >= 0 && r.prefix > prefix as u8)
-                || network(dest, r.prefix).ip != network(&r.dst, r.prefix).ip
-            {
-                continue;
+        // ranet only needs host lookups. Subnet nexthops are used for route
+        // installation, which belongs to the network configuration instead.
+        if prefix != -1 && prefix != i32::from(dest.bits()) {
+            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        }
+        let src = src.filter(|s| !s.ip.is_unspecified());
+        let family = dest.family();
+        let mut attributes = RtBuffer::new();
+        attributes.push(attribute(Rta::Dst, dest.bytes().as_slice())?);
+        if let Some(src) = src {
+            attributes.push(attribute(Rta::Src, src.bytes().as_slice())?);
+        }
+        let query = RtmsgBuilder::default()
+            .rtm_family(RtAddrFamily::from(family as u8))
+            .rtm_dst_len(dest.bits())
+            .rtm_src_len(if src.is_some() { dest.bits() } else { 0 })
+            .rtm_tos(0)
+            .rtm_table(RtTable::Unspec)
+            .rtm_protocol(Rtprot::Unspec)
+            .rtm_scope(RtScope::Universe)
+            .rtm_type(Rtn::Unspec)
+            .rtattrs(attributes)
+            .build()
+            .map_err(io::Error::other)?;
+        // Use the kernel's FIB and routing rules, without dumping BGP tables
+        // or trying to choose an alternative to an excluded kernel route.
+        let r = self
+            .socket
+            .request_payload(Rtm::Getroute.into(), NlmF::empty(), query)?
+            .into_iter()
+            .find(|r| r.kind == u16::from(Rtm::Newroute))
+            .ok_or_else(absent)?;
+        let info = Rtmsg::from_bytes_with_input(&mut Cursor::new(&r.payload), r.payload.len())
+            .map_err(io::Error::other)?;
+        let unreachable = || io::Error::from_raw_os_error(libc::ENETUNREACH);
+        if !matches!(*info.rtm_type(), Rtn::Unicast | Rtn::Local) {
+            return Err(unreachable());
+        }
+        let (mut index, mut gateway, mut source) = (0, None, None);
+        for attr in info.rtattrs().iter() {
+            let value = attr.rta_payload().as_ref();
+            match attr.rta_type() {
+                Rta::Oif if value.len() == 4 => index = get32(value, 0),
+                Rta::Gateway => gateway = Some(Host::from_kernel(family, value, 0)?),
+                Rta::Prefsrc => source = Some(Host::from_kernel(family, value, 0)?),
+                _ => (),
             }
-            let Some(link) = links.iter().find(|l| {
-                l.index == r.index
+        }
+        let snapshot = self.snapshot()?;
+        let link = snapshot
+            .links
+            .iter()
+            .find(|l| {
+                l.index == index
                     && l.flags & 1 != 0
                     && l.xfrm.is_none()
                     && self.config.usable(&l.name)
-            }) else {
-                continue;
-            };
-            let valid = |a: &&AddressEntry| {
-                a.host.family() == dest.family() && a.flags & (0x08 | 0x20 | 0x40) == 0
-            };
-            let source = if let Some(src) = src.filter(|h| !h.ip.is_unspecified()) {
-                if !addresses.iter().filter(valid).any(|a| a.host.ip == src.ip) {
-                    continue;
-                }
-                src.clone()
-            } else if let Some(h) = r.source {
-                h
-            } else if let Some(a) = addresses
+            })
+            .ok_or_else(unreachable)?;
+        let valid =
+            |a: &&AddressEntry| a.host.family() == family && a.flags & (0x08 | 0x20 | 0x40) == 0;
+        let source = if let Some(src) = src {
+            if !snapshot
+                .addresses
                 .iter()
                 .filter(valid)
-                .filter(|a| a.index == r.index && a.scope < 254)
-                .min_by_key(|a| {
-                    if network(dest, a.prefix).ip == network(&a.host, a.prefix).ip {
-                        0
-                    } else {
-                        1
-                    }
-                })
+                .any(|a| a.host.ip == src.ip)
             {
-                a.host.clone()
-            } else {
-                continue;
-            };
-            return Ok((
-                source,
-                r.gateway.unwrap_or(Host::any(dest.family())?),
-                link.name.clone(),
-            ));
-        }
-        Err(io::Error::from_raw_os_error(libc::ENETUNREACH))
+                return Err(unreachable());
+            }
+            src.clone()
+        } else if let Some(source) = source {
+            source
+        } else {
+            snapshot
+                .addresses
+                .iter()
+                .filter(valid)
+                .find(|a| a.index == index && a.scope < 254)
+                .ok_or_else(unreachable)?
+                .host
+                .clone()
+        };
+        Ok((
+            source,
+            gateway.unwrap_or(Host::any(family)?),
+            link.name.clone(),
+        ))
     }
     pub fn create_xfrmi(
         &mut self,
@@ -411,6 +392,7 @@ impl Network {
             NlmF::ACK | NlmF::CREATE | NlmF::EXCL,
             payload,
         )?;
+        self.invalidate();
         Ok(())
     }
     pub(crate) fn delete_xfrmi(&mut self, index: u32) -> io::Result<()> {
@@ -421,6 +403,7 @@ impl Network {
             .map_err(io::Error::other)?;
         self.socket
             .request_payload(Rtm::Dellink.into(), NlmF::ACK, payload)?;
+        self.invalidate();
         Ok(())
     }
 }

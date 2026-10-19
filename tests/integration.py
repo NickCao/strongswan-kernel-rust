@@ -61,7 +61,18 @@ def client(path):
     print(json.dumps(opened), flush=True)
     for line in sys.stdin:
         req = json.loads(line)
-        if "event" in req:
+        if "collect" in req:
+            collected = []
+            deadline = time.monotonic() + req["collect"]
+            watch.socket.settimeout(0.05)
+            try:
+                while time.monotonic() < deadline:
+                    try: collected.append(watch.receive()["parameters"]["event"])
+                    except socket.timeout: pass
+            finally:
+                watch.socket.settimeout(10)
+            reply = {"parameters": {"events": collected}}
+        elif "event" in req:
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 reply = watch.receive()
@@ -88,6 +99,10 @@ def run(binary):
             time.sleep(.05)
         assert predicate(), "condition timed out"
     ip("link", "set", "lo", "up")
+    ip("link", "add", "underlay", "type", "dummy")
+    ip("link", "set", "underlay", "up")
+    ip("addr", "add", "192.0.2.1/24", "dev", "underlay")
+    ip("-6", "addr", "add", "2001:db8:1::1/64", "dev", "underlay", "nodad")
     ip("link", "add", "foreign", "type", "xfrm", "if_id", 77)
     ip("xfrm", "state", "add", "src", "192.0.2.10", "dst", "192.0.2.11", "proto", "esp", "spi", "0xaaaa", "mode", "tunnel", "aead", "rfc4106(gcm(aes))", "0x"+"00"*20, "128")
     with tempfile.TemporaryDirectory(prefix="kernel-rust-rpc-") as d:
@@ -130,6 +145,41 @@ def run(binary):
                 rpc("BypassPort",family=2,port=13000); rpc("BypassPort",family=10,port=13000)
                 failure("BypassPort",errno.EINVAL,family=2,port=500)
                 assert len(ip("xfrm","policy","list").split("priority 32")) == 5
+                for destination, source, gateway in [
+                    ("203.0.113.2", "192.0.2.1", "192.0.2.254"),
+                    ("2001:db8:2::2", "2001:db8:1::1", "2001:db8:1::fe"),
+                ]:
+                    family = ["-6"] if ":" in destination else []
+                    ip(*family, "route", "add", destination, "via", gateway, "dev", "underlay")
+                    assert rpc("GetSourceAddress", destination=endpoint(destination))["address"]["address"] == source
+                    assert rpc("GetSourceAddress", destination=endpoint(destination), source=endpoint(source))["address"]["address"] == source
+                    route = rpc("GetNextHop", destination=endpoint(destination))
+                    assert route["gateway"]["address"] == gateway and route["interface"] == "underlay", route
+                    replacement = "2001:db8:1::fd" if family else "192.0.2.253"
+                    ip(*family, "route", "replace", destination, "via", replacement, "dev", "underlay")
+                    assert rpc("GetNextHop", destination=endpoint(destination))["gateway"]["address"] == replacement
+                failure("GetNextHop", errno.EOPNOTSUPP, destination=endpoint("203.0.113.2"), prefix=24)
+                ip("link", "set", "foreign", "up")
+                ip("route", "add", "192.0.2.2/32", "dev", "foreign")
+                failure("GetSourceAddress", errno.ENETUNREACH, destination=endpoint("192.0.2.2"))
+                ip("route", "del", "192.0.2.2/32")
+                ip("route", "add", "unreachable", "default", "table", "100")
+                ip("rule", "add", "to", "203.0.113.0/24", "lookup", "100", "priority", "100")
+                failure("GetSourceAddress", errno.EHOSTUNREACH, destination=endpoint("203.0.113.2"))
+                ip("rule", "del", "priority", "100")
+                ip("route", "flush", "table", "100")
+                # A route burst must not flood WatchEvents, lose address
+                # changes, or make its control session unusable.
+                child.stdin.write(json.dumps({"collect": 1}) + "\n"); child.stdin.flush()
+                ip("addr", "add", "192.0.2.3/24", "dev", "underlay")
+                batch = "".join(f"route add 172.17.{i // 256}.{i % 256}/32 dev underlay table 1234\n" for i in range(1000))
+                subprocess.run(["ip", "-batch", "-"], input=batch, text=True, check=True)
+                events = json.loads(child.stdout.readline())["parameters"]["events"]
+                assert 0 < len(events) < 50, len(events)
+                assert any(e["kind"] == "roam" and e["addressChanged"] for e in events), events
+                assert rpc("GetInterface", address=endpoint())["interface"] == "underlay"
+                assert rpc("GetInterface", address=endpoint("192.0.2.3"))["interface"] == "underlay"
+                ip("route", "flush", "table", "1234")
                 failure("InstallSa",errno.EINVAL,id=sa_id(interface=0),config=sa_config())
                 failure("InstallSa",errno.EEXIST,id=sa_id(interface=77),config=sa_config())
                 bad = sa_config(); bad["encryption"]["id"] = 65535
@@ -171,6 +221,10 @@ def run(binary):
                 assert not ip("xfrm","policy").strip()
                 # A clean close releases ownership and permits a new session.
                 again = Varlink(path); assert "error" not in again.call("OpenSession",dict(interfacesUse="",interfacesIgnore="")); assert "error" not in again.call("CloseSession"); again.socket.close()
+                excluded = Varlink(path)
+                assert "error" not in excluded.call("OpenSession",dict(interfacesUse="",interfacesIgnore="underlay"))
+                assert excluded.call("GetSourceAddress",dict(destination=endpoint("203.0.113.2")))["parameters"]["errno"] == errno.ENETUNREACH
+                assert "error" not in excluded.call("CloseSession"); excluded.socket.close()
                 # Losing charon preserves active kernel objects, while the
                 # daemon still cleans an interface when its last SA expires.
                 lost = Varlink(path); assert "error" not in lost.call("OpenSession",dict(interfacesUse="",interfacesIgnore=""))
@@ -181,7 +235,7 @@ def run(binary):
                 assert probe.call("OpenSession",dict(interfacesUse="",interfacesIgnore=""))["error"].endswith("SessionBusy")
                 probe.socket.close()
                 wait(lambda: [l["ifname"] for l in links()] == ["foreign"])
-                print("PASS: socket group authorization and denied nonmember, standard Varlink, capability-free client, SA/interface lifetime, overlapping rekey, rollback, foreign objects, larval SPI, hard expiry, scoped cleanup and disconnected-client expiry")
+                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, rollback, foreign objects, larval SPI, hard expiry, scoped cleanup and disconnected-client expiry")
             except BaseException:
                 log.seek(0); print(log.read(),file=sys.stderr); raise
             finally:

@@ -146,6 +146,7 @@ It checks plugin discovery from the system profile, socket authorization,
 AES-GCM and AES-CBC/HMAC, encrypted IPv4/IPv6 traffic, rekeying without
 interface replacement, final-SA cleanup, configurable interface names/MTUs,
 default and custom VRF masters, multicast flags, VRF-routed IPv4/IPv6 traffic,
+VICI responsiveness with 200 connections and continuous BGP-style route updates,
 VICI access from a separate dynamic controller, coordinated stop/restart,
 startup failure, daemon failure, and runtime directory removal.
 The test requires KVM on the build host. Run it directly with:
@@ -351,6 +352,15 @@ The daemon has a separate lifetime from charon. SA keys travel over the private
 socket and are never returned by query methods. Netlink uses neli's standard
 buffers; these and library serialization copies are not guaranteed to be wiped.
 Core dumps are disabled in the daemon. Avoid tracing RPC or Netlink payloads.
+
+Route/link/address notifications are coalesced over 100 ms, retaining whether
+addresses changed, so routing updates do not queue a roaming job for every
+route. SA expiry, acquisition, and mapping events are delivered immediately.
+Host route lookups query the kernel FIB directly and honor its routing policy.
+A route through an excluded or XFRM interface is rejected. Subnet nexthop
+queries for route installation are unsupported.
+Interface/address discovery is cached until a link or address notification
+invalidates it. Interface ownership checks always query the kernel.
 
 ## Safety boundaries
 

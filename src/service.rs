@@ -10,13 +10,17 @@ use std::{
     io,
     os::unix::net::UnixStream,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc::{self, Receiver, SyncSender},
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+const ROAM_DELAY: Duration = Duration::from_millis(100);
+const ROUTE_CHANGED: u8 = 1;
+const ADDRESS_CHANGED: u8 = 2;
 
 pub struct Server {
     pub active: Mutex<Option<Arc<Session>>>,
@@ -33,6 +37,8 @@ pub struct Session {
     receiver: Mutex<Option<Receiver<Option<Event>>>>,
     connected: AtomicBool,
     closed: AtomicBool,
+    roam: AtomicU8,
+    network_changed: AtomicBool,
     control: UnixStream,
     event_sockets: Mutex<Option<[Netlink; 2]>>,
 }
@@ -70,21 +76,26 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
                 return;
             }
         };
-        let result = if xfrm {
+        if !xfrm {
+            // A routing daemon can send thousands of notifications per second.
+            // Keep one pending roam update, retaining address/link changes,
+            // instead of queueing a separate IKE-wide job for every route.
+            let change = if [16, 17, 20, 21].contains(&r.kind) {
+                session.network_changed.store(true, Ordering::Release);
+                ADDRESS_CHANGED
+            } else {
+                ROUTE_CHANGED
+            };
+            session.roam.fetch_or(change, Ordering::Relaxed);
+            continue;
+        }
+        let result = {
             let mut backend = session.backend.lock().unwrap();
             let result = backend.xfrm.event(&r);
             if let Err(e) = backend.reconcile_interfaces() {
                 eprintln!("kernel-daemon: interface cleanup: {e}");
             }
             result
-        } else {
-            Ok(Some(Event {
-                kind: Event_kind::roam,
-                addressChanged: Some([16, 17, 20, 21].contains(&r.kind)),
-                expiry: None,
-                acquire: None,
-                mapping: None,
-            }))
         };
         match result {
             Ok(Some(event)) if session.connected.load(Ordering::Acquire) => {
@@ -108,6 +119,9 @@ macro_rules! request {
                 let result = {
                     let mut guard = s.backend.lock().unwrap();
                     let $b = &mut *guard;
+                    if s.network_changed.swap(false, Ordering::Acquire) {
+                        $b.net.invalidate();
+                    }
                     {
                         #[allow(clippy::redundant_closure_call)]
                         let result = (|| -> io::Result<_> { $body })();
@@ -143,6 +157,10 @@ impl VarlinkInterface for Service {
             if interfaces_use.len() > 4096 || interfaces_ignore.len() > 4096 {
                 return Err(invalid());
             }
+            // Subscribe before the first discovery snapshot so changes during
+            // startup are retained and invalidate it on the next request.
+            let (route_socket, route) =
+                Netlink::subscribe(NlFamily::Route, 1 | 0x10 | 0x100 | 0x40 | 0x400)?;
             let backend = Backend::new(
                 self.server.prefix.clone(),
                 self.server.master_device.clone(),
@@ -151,8 +169,6 @@ impl VarlinkInterface for Service {
                 interfaces_ignore,
             )?;
             let (xfrm_socket, xfrm) = Netlink::subscribe(NlFamily::Xfrm, 1 | 2 | 128)?;
-            let (route_socket, route) =
-                Netlink::subscribe(NlFamily::Route, 1 | 0x10 | 0x100 | 0x40 | 0x400)?;
             let token = hex::encode(rand::random::<[u8; 32]>());
             let features = backend.xfrm.features().into();
             let (tx, rx) = mpsc::sync_channel(256);
@@ -165,6 +181,8 @@ impl VarlinkInterface for Service {
                 receiver: Mutex::new(Some(rx)),
                 connected: AtomicBool::new(true),
                 closed: AtomicBool::new(false),
+                roam: AtomicU8::new(0),
+                network_changed: AtomicBool::new(false),
                 control: self.socket.try_clone()?,
                 event_sockets: Mutex::new(Some([xfrm_socket, route_socket])),
             });
@@ -234,8 +252,9 @@ impl VarlinkInterface for Service {
             s.fail();
             return Err(e);
         }
+        let mut next_roam = Instant::now() + ROAM_DELAY;
         while s.connected.load(Ordering::Acquire) && !s.closed.load(Ordering::Acquire) {
-            match receiver.recv_timeout(Duration::from_millis(200)) {
+            match receiver.recv_timeout(next_roam.saturating_duration_since(Instant::now())) {
                 Ok(Some(event)) => {
                     if s.closed.load(Ordering::Acquire) {
                         break;
@@ -248,6 +267,22 @@ impl VarlinkInterface for Service {
                 Ok(None) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => (),
                 Err(_) => break,
+            }
+            if Instant::now() >= next_roam {
+                let changes = s.roam.swap(0, Ordering::Relaxed);
+                if changes != 0 {
+                    if let Err(e) = call.reply(Event {
+                        kind: Event_kind::roam,
+                        addressChanged: Some(changes & ADDRESS_CHANGED != 0),
+                        expiry: None,
+                        acquire: None,
+                        mapping: None,
+                    }) {
+                        s.fail();
+                        return Err(e);
+                    }
+                }
+                next_roam = Instant::now() + ROAM_DELAY;
             }
             if transport::disconnected(&self.socket) {
                 s.fail();

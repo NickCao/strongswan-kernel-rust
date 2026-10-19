@@ -249,6 +249,13 @@ in
             )
             assert "kernel-rust" in controller
 
+    with subtest("VICI stays responsive with 200 connections and continuous route updates"):
+        left.succeed(
+            "PYTHONPATH=${pkgs.strongswan.src}/src/libcharon/plugins/vici/python "
+            "timeout 45s python3 ${../tests/vici_churn.py}"
+        )
+        assert not links(left) and not spis(left)
+
     proposals = [
         ("AES-GCM", "${connection 1 "aes128gcm128-esn"}", "${connection 2 "aes128gcm128-esn"}", "rfc4106(gcm(aes))"),
         ("AES-CBC/HMAC", "${connection 1 "aes128-sha256-esn"}", "${connection 2 "aes128-sha256-esn"}", "cbc(aes)"),

@@ -52,6 +52,7 @@ method FlushPolicies() -> ()
 method BypassPort(family: int, port: int) -> ()
 
 method GetSourceAddress(destination: Endpoint, source: ?Endpoint) -> (address: Endpoint)
+# Host lookups only: prefix must be omitted, -1, or the address family's bit width.
 method GetNextHop(destination: Endpoint, source: ?Endpoint, prefix: ?int) -> (gateway: Endpoint, interface: string)
 method GetInterface(address: Endpoint) -> (interface: string)
 method ListAddresses(which: int) -> (addresses: []Endpoint)
