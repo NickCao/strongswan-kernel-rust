@@ -18,7 +18,9 @@ unknown methods and invalid parameter types; io.ranet.Kernel.KernelError
 contains a positive Linux errno for rejected/kernel operations.
 
 OpenSession authenticates ownership of the control connection and returns
-feature flags plus a random token. WatchEvents requires a second connection
+feature flags plus a random token. Its interfacesUse and interfacesIgnore
+arguments carry charon's interface filters; a nonempty allowlist takes
+precedence over the denylist. WatchEvents requires a second connection
 from the same UID/PID and that token, with `more: true`. Its first response
 has `event.kind: ready`, then events use `continues: true`. Events are typed
 expiry, acquire, NAT mapping, or network change notifications. The event
@@ -46,9 +48,14 @@ SAs/policies and then removes bypasses and larval allocations.
 
 BypassPort takes an address family (AF_INET/AF_INET6) and a UDP port at least
 1024. Charon binds and enables UDP encapsulation itself; no descriptors are
-passed. Read-only network discovery uses Netlink dumps, excludes XFRM links
-from underlay route selection, and honors interfaces_use/interfaces_ignore.
-It does not install host routes, routing rules, or virtual IPs.
+passed. Read-only network discovery caches link/address Netlink dumps and
+invalidates them on link/address changes. Source-address and nexthop queries
+use host-only kernel FIB lookups, including policy routing. XFRM links are
+excluded from address/subnet enumeration, address-to-interface queries, and
+underlay route selection. Discovery honors interfaces_use/interfaces_ignore
+and does not install host routes, routing rules, or virtual IPs. Network
+change notifications are coalesced at 100 ms intervals; XFRM events are
+delivered separately without that delay.
 
 A failed transport exchange leaves mutation results uncertain. The client
 does not replay or reconnect automatically. Unexpected disconnects preserve

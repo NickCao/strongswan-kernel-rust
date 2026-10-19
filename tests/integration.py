@@ -104,6 +104,10 @@ def run(binary):
     ip("addr", "add", "192.0.2.1/24", "dev", "underlay")
     ip("-6", "addr", "add", "2001:db8:1::1/64", "dev", "underlay", "nodad")
     ip("link", "add", "foreign", "type", "xfrm", "if_id", 77)
+    ip("link", "set", "foreign", "up")
+    overlay_addresses = ["198.51.100.1", "2001:db8:77::1"]
+    ip("addr", "add", overlay_addresses[0] + "/24", "dev", "foreign")
+    ip("-6", "addr", "add", overlay_addresses[1] + "/64", "dev", "foreign", "nodad")
     ip("xfrm", "state", "add", "src", "192.0.2.10", "dst", "192.0.2.11", "proto", "esp", "spi", "0xaaaa", "mode", "tunnel", "aead", "rfc4106(gcm(aes))", "0x"+"00"*20, "128")
     with tempfile.TemporaryDirectory(prefix="kernel-rust-rpc-") as d:
         directory = Path(d); directory.chmod(0o755); path = str(directory / "kernel.sock")
@@ -159,7 +163,12 @@ def run(binary):
                     ip(*family, "route", "replace", destination, "via", replacement, "dev", "underlay")
                     assert rpc("GetNextHop", destination=endpoint(destination))["gateway"]["address"] == replacement
                 failure("GetNextHop", errno.EOPNOTSUPP, destination=endpoint("203.0.113.2"), prefix=24)
-                ip("link", "set", "foreign", "up")
+                for address in overlay_addresses:
+                    failure("GetInterface", errno.ENOENT, address=endpoint(address))
+                addresses = {a["address"] for a in rpc("ListAddresses", which=1)["addresses"]}
+                assert {"192.0.2.1", "2001:db8:1::1"} <= addresses, addresses
+                assert addresses.isdisjoint(overlay_addresses), addresses
+                assert all(s["interface"] != "foreign" for s in rpc("ListSubnets")["subnets"])
                 ip("route", "add", "192.0.2.2/32", "dev", "foreign")
                 failure("GetSourceAddress", errno.ENETUNREACH, destination=endpoint("192.0.2.2"))
                 ip("route", "del", "192.0.2.2/32")

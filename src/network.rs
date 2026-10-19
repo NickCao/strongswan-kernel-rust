@@ -236,11 +236,12 @@ impl Network {
         let snapshot = self.snapshot()?;
         for a in &snapshot.addresses {
             if a.host.ip == host.ip {
-                if let Some(link) = snapshot
-                    .links
-                    .iter()
-                    .find(|l| l.index == a.index && l.flags & 1 != 0 && self.config.usable(&l.name))
-                {
+                if let Some(link) = snapshot.links.iter().find(|l| {
+                    l.index == a.index
+                        && l.flags & 1 != 0
+                        && l.xfrm.is_none()
+                        && self.config.usable(&l.name)
+                }) {
                     return Ok(link.name.clone());
                 }
             }
