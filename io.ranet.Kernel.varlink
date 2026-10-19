@@ -1,0 +1,64 @@
+# Privileged Linux kernel backend for ranet's unprivileged charon.
+# Only tunnel-mode ESP with nonzero XFRM interface IDs is supported.
+# Interfaces are created for the first installed SA and removed after the last
+# SA using the ID disappears. The service never installs host routes or VIPs.
+interface io.ranet.Kernel
+
+type Endpoint (address: string, port: int)
+type Mark (value: int, mask: int)
+type Selector (from: string, to: string, protocol: int, fromPort: int, toPort: int)
+type SaId (src: Endpoint, dst: Endpoint, spi: int, mark: Mark, interfaceId: int)
+# Keys are hex-encoded octets. They are accepted only as input, never returned.
+type Algorithm (id: int, name: string, key: string)
+# Byte/packet limits are decimal strings to preserve the entire uint64 range.
+type Lifetime (timeLife: int, timeRekey: int, byteLife: string, byteRekey: string,
+               packetLife: string, packetRekey: string)
+type SaConfig (reqid: int, acquireSequence: int, encryption: Algorithm,
+               integrity: Algorithm, lifetime: Lifetime, replayWindow: int,
+               esn: bool, udpEncapsulation: bool, outputMark: Mark, tfc: int,
+               copyDf: bool, copyEcn: bool, copyDscp: int, inbound: bool,
+               update: bool)
+type PolicyId (direction: int, src: Selector, dst: Selector, mark: Mark,
+               interfaceId: int)
+type PolicyConfig (kind: int, priority: int, manualPriority: int,
+                   src: Endpoint, dst: Endpoint, reqid: int, policyCount: int,
+                   espSpi: ?int)
+type Subnet (address: Endpoint, prefix: int, interface: string)
+type Expiry (protocol: int, spi: int, destination: Endpoint, hard: bool)
+type Acquire (reqid: int, src: Selector, dst: Selector, sequence: int)
+type Mapping (spi: int, destination: Endpoint, remote: Endpoint)
+type Event (kind: (ready, expire, acquire, mapping, roam), expiry: ?Expiry,
+            acquire: ?Acquire, mapping: ?Mapping, addressChanged: ?bool)
+
+# Create one control session, tied to this authenticated connection. The token
+# authorizes a second connection from the same process for WatchEvents.
+method OpenSession(interfacesUse: string, interfacesIgnore: string) -> (token: string, features: int)
+# Release an empty session and remove its IKE port bypass policies.
+method CloseSession() -> ()
+# Requires the Varlink 'more' flag. First reply is ready, then kernel events.
+method WatchEvents(token: string) -> (event: Event)
+
+method AllocateSpi(src: Endpoint, dst: Endpoint, minimum: int, maximum: int) -> (spi: int)
+method InstallSa(id: SaId, config: SaConfig) -> ()
+method QuerySa(id: SaId) -> (bytes: string, packets: string, lastUse: int)
+method RemoveSa(id: SaId) -> ()
+# Flushes only objects owned by this daemon session.
+method FlushSas() -> ()
+method InstallPolicy(id: PolicyId, config: PolicyConfig) -> ()
+method QueryPolicy(id: PolicyId) -> (lastUse: int)
+method RemovePolicy(id: PolicyId, config: PolicyConfig) -> ()
+method FlushPolicies() -> ()
+# Install port-based IKE bypass policies. Only unprivileged UDP ports accepted.
+method BypassPort(family: int, port: int) -> ()
+
+method GetSourceAddress(destination: Endpoint, source: ?Endpoint) -> (address: Endpoint)
+method GetNextHop(destination: Endpoint, source: ?Endpoint, prefix: ?int) -> (gateway: Endpoint, interface: string)
+method GetInterface(address: Endpoint) -> (interface: string)
+method ListAddresses(which: int) -> (addresses: []Endpoint)
+method ListSubnets() -> (subnets: []Subnet)
+
+# A failed or unsupported semantic operation; errno is a positive Linux errno.
+error KernelError(errno: int)
+error AccessDenied()
+error SessionBusy()
+error InvalidSession()

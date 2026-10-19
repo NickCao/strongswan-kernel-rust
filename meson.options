@@ -1,0 +1,12 @@
+option('plugin', type: 'boolean', value: true,
+       description: 'Build the strongSwan kernel-rust plugin')
+option('daemon', type: 'boolean', value: true,
+       description: 'Build the Rust kernel daemon with Cargo')
+option('strongswan_source', type: 'string', value: '',
+       description: 'Absolute path to source matching the installed strongSwan')
+option('strongswan_build', type: 'string', value: '',
+       description: 'Absolute path to matching strongSwan build/config.h (defaults to source)')
+option('plugin_dir', type: 'string', value: '',
+       description: 'Plugin installation directory (defaults to libdir/ipsec/plugins)')
+option('piddir', type: 'string', value: '/run',
+       description: 'Runtime directory for the default Varlink socket')
