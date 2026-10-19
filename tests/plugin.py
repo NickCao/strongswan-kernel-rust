@@ -142,7 +142,7 @@ def run(prefix):
         script = root / "plugin.py"
         script.write_text(Path(__file__).read_text())
         with subprocess.Popen([str(prefix / "bin/charon-kernel-daemon"), "--socket", str(socket),
-                               "--uid", "65534", "--gid", "65534"], stdout=subprocess.DEVNULL) as daemon:
+                               "--group", "65534"], stdout=subprocess.DEVNULL) as daemon:
             try:
                 for _ in range(500):
                     if socket.exists():

@@ -43,7 +43,7 @@ impl Session {
 pub struct Service {
     pub server: Arc<Server>,
     pub socket: UnixStream,
-    pub peer: libc::ucred,
+    pub peer: transport::Peer,
     pub control: Mutex<Option<Arc<Session>>>,
 }
 impl Drop for Service {
@@ -58,12 +58,12 @@ impl Drop for Service {
 }
 fn event_loop(session: Arc<Session>, xfrm: bool, socket: Netlink) {
     while !session.closed.load(Ordering::Acquire) {
-        let mut fd = libc::pollfd {
-            fd: socket.raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut fd, 1, 200) } <= 0 {
+        let mut fds = [rustix::event::PollFd::new(
+            &socket,
+            rustix::event::PollFlags::IN,
+        )];
+        if !matches!(rustix::event::poll(&mut fds, Some(&rustix::event::Timespec { tv_sec: 0, tv_nsec: 200_000_000 })), Ok(n) if n > 0)
+        {
             continue;
         }
         let replies = match socket.receive() {

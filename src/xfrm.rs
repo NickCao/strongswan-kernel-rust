@@ -45,18 +45,6 @@ fn missing() -> io::Error {
 fn unsupported() -> io::Error {
     io::Error::from_raw_os_error(libc::EOPNOTSUPP)
 }
-fn if_index(name: &str) -> io::Result<u32> {
-    if name.is_empty() {
-        return Ok(0);
-    }
-    let n = std::ffi::CString::new(name).map_err(|_| invalid())?;
-    let index = unsafe { libc::if_nametoindex(n.as_ptr()) };
-    if index == 0 {
-        Err(io::Error::from_raw_os_error(libc::ENODEV))
-    } else {
-        Ok(index)
-    }
-}
 pub fn selector(src: &Ts, dst: &Ts, interface: &str) -> io::Result<Vec<u8>> {
     if src.from.family() != dst.from.family() {
         return Err(invalid());
@@ -87,7 +75,11 @@ pub fn selector(src: &Ts, dst: &Ts, interface: &str) -> io::Result<Vec<u8>> {
     ] {
         b[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
     }
-    put32(&mut b, off!(Selector, ifindex), if_index(interface)?);
+    put32(
+        &mut b,
+        off!(Selector, ifindex),
+        crate::network::index(interface)?,
+    );
     Ok(b)
 }
 fn selector_ts(b: &[u8], src: bool) -> io::Result<Ts> {
@@ -638,10 +630,7 @@ impl Xfrm {
         if time == 0 {
             return Ok(0);
         }
-        let mut monotonic: libc::timespec = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut monotonic);
-        }
+        let monotonic = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
         let wall = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| invalid())?

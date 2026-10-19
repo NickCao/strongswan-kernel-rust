@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 use crate::{
-    client::{Client, Empty},
-    ffi, host, status_t, status_t_FAILED, status_t_NOT_SUPPORTED, status_t_SUCCESS, Result,
+    ffi, host, status_t, status_t_FAILED, status_t_NOT_SUPPORTED, status_t_SUCCESS, ClientExt,
+    Result,
 };
-use kernel_rust_protocol as api;
-use std::{mem, ptr, sync::Arc};
+use kernel_rust_protocol::{
+    self as api,
+    client::{Client, Empty},
+};
+use std::{mem, os::fd::BorrowedFd, ptr, sync::Arc};
 
 #[repr(C)]
 struct Ipsec {
@@ -12,8 +15,8 @@ struct Ipsec {
     client: Arc<Client>,
 }
 
-pub unsafe extern "C" fn create() -> *mut ffi::kernel_ipsec_t {
-    let Some(client) = (unsafe { Client::from_registry() }) else {
+pub extern "C" fn create() -> *mut ffi::kernel_ipsec_t {
+    let Some(client) = crate::plugin::current_client() else {
         return ptr::null_mut();
     };
     Box::into_raw(Box::new(Ipsec {
@@ -39,29 +42,25 @@ pub unsafe extern "C" fn create() -> *mut ffi::kernel_ipsec_t {
     .cast()
 }
 
-// Each kernel callback borrows valid C arguments for its duration. The object
-// itself is shared by charon workers; mutation is confined to Client's mutexes.
-unsafe fn client<'a>(this: *mut ffi::kernel_ipsec_t) -> &'a Client {
-    unsafe { &(*this.cast::<Ipsec>()).client }
-}
-
+// C callbacks borrow live objects and output slots at entry. RPC and value
+// validation run outside unsafe; no raw pointer is retained by the RPC client.
 unsafe fn sa_id(id: &ffi::kernel_ipsec_sa_id_t) -> Result<api::SaId> {
     if id.proto != libc::IPPROTO_ESP as u8 || id.if_id == 0 {
         return Err(status_t_NOT_SUPPORTED);
     }
-    unsafe {
-        Ok(api::SaId {
-            src: host::endpoint(id.src)?,
-            dst: host::endpoint(id.dst)?,
-            spi: u32::from_be(id.spi).into(),
-            mark: host::mark(id.mark),
-            interfaceId: id.if_id.into(),
-        })
-    }
+    let (src, dst) = unsafe { (host::endpoint(id.src)?, host::endpoint(id.dst)?) };
+    Ok(api::SaId {
+        src,
+        dst,
+        spi: u32::from_be(id.spi).into(),
+        mark: host::mark(id.mark),
+        interfaceId: id.if_id.into(),
+    })
 }
 
 unsafe extern "C" fn get_features(this: *mut ffi::kernel_ipsec_t) -> ffi::kernel_feature_t {
-    unsafe { client(this).features }
+    let this = unsafe { &*this.cast::<Ipsec>() };
+    this.client.features()
 }
 
 unsafe extern "C" fn get_spi(
@@ -74,30 +73,29 @@ unsafe extern "C" fn get_spi(
     if protocol != libc::IPPROTO_ESP as u8 {
         return status_t_NOT_SUPPORTED;
     }
+    let this = unsafe { &*this.cast::<Ipsec>() };
     let operation = || -> Result<()> {
-        unsafe {
-            let reply: api::AllocateSpi_Reply = client(this).call(
-                "AllocateSpi",
-                &api::AllocateSpi_Args {
-                    src: host::endpoint(src)?,
-                    dst: host::endpoint(dst)?,
-                    minimum: (host::setting_int(c"%s.spi_min", 0xc0000000u32 as i32) as u32).into(),
-                    maximum: (host::setting_int(c"%s.spi_max", 0xcfffffff_u32 as i32) as u32)
-                        .into(),
-                },
-            )?;
-            let value = u32::try_from(reply.spi).map_err(|_| status_t_FAILED)?;
-            if value < 256 {
-                return Err(status_t_FAILED);
+        let parameters = unsafe {
+            api::AllocateSpi_Args {
+                src: host::endpoint(src)?,
+                dst: host::endpoint(dst)?,
+                minimum: (host::setting_int(c"%s.spi_min", 0xc0000000u32 as i32) as u32).into(),
+                maximum: (host::setting_int(c"%s.spi_max", 0xcfffffff_u32 as i32) as u32).into(),
             }
-            *spi = value.to_be();
-            Ok(())
+        };
+        let reply: api::AllocateSpi_Reply = this.client.call("AllocateSpi", &parameters)?;
+        let spi = unsafe { spi.as_mut() }.ok_or(status_t_FAILED)?;
+        let value = u32::try_from(reply.spi).map_err(|_| status_t_FAILED)?;
+        if value < 256 {
+            return Err(status_t_FAILED);
         }
+        *spi = value.to_be();
+        Ok(())
     };
     status(operation())
 }
 
-unsafe extern "C" fn get_cpi(
+extern "C" fn get_cpi(
     _this: *mut ffi::kernel_ipsec_t,
     _src: *mut ffi::host_t,
     _dst: *mut ffi::host_t,
@@ -111,66 +109,71 @@ unsafe extern "C" fn add_sa(
     id: *mut ffi::kernel_ipsec_sa_id_t,
     data: *mut ffi::kernel_ipsec_add_sa_t,
 ) -> status_t {
+    let this = unsafe { &*this.cast::<Ipsec>() };
     let operation = || -> Result<()> {
-        unsafe {
-            let d = &*data;
-            let id = sa_id(&*id)?;
-            if d.mode != ffi::ipsec_mode_t_MODE_TUNNEL
-                || d.ipcomp != 0
-                || d.cpi != 0
-                || !d.label.is_null()
-                || d.hw_offload != ffi::hw_offload_t_HW_OFFLOAD_NO
-                || d.cpu != ffi::CPU_ID_MAX
-                || d.forward_icmp
-                || d.enc_key.len > 8192
-                || d.int_key.len > 8192
-                || !host::unrestricted_interface(d.interface)
-            {
-                return Err(status_t_NOT_SUPPORTED);
-            }
-            let lifetime = d.lifetime.as_ref().ok_or(status_t_FAILED)?;
-            let config = api::SaConfig {
-                reqid: d.reqid.into(),
-                acquireSequence: d.seq.into(),
-                encryption: host::algorithm(
-                    d.enc_alg,
-                    d.enc_key,
-                    ffi::transform_type_t_ENCRYPTION_ALGORITHM,
-                )?,
-                integrity: host::algorithm(
-                    d.int_alg,
-                    d.int_key,
-                    ffi::transform_type_t_INTEGRITY_ALGORITHM,
-                )?,
-                lifetime: api::Lifetime {
-                    timeLife: i64::try_from(lifetime.time.life)
-                        .map_err(|_| status_t_NOT_SUPPORTED)?,
-                    timeRekey: i64::try_from(lifetime.time.rekey)
-                        .map_err(|_| status_t_NOT_SUPPORTED)?,
-                    byteLife: lifetime.bytes.life.to_string(),
-                    byteRekey: lifetime.bytes.rekey.to_string(),
-                    packetLife: lifetime.packets.life.to_string(),
-                    packetRekey: lifetime.packets.rekey.to_string(),
-                },
-                replayWindow: d.replay_window.into(),
-                esn: d.esn,
-                udpEncapsulation: d.encap,
-                outputMark: host::mark(d.mark),
-                tfc: d.tfc.into(),
-                copyDf: d.copy_df,
-                copyEcn: d.copy_ecn,
-                copyDscp: d.copy_dscp.into(),
-                inbound: d.inbound,
-                update: d.update,
-            };
-            client(this).call::<_, Empty>("InstallSa", &api::InstallSa_Args { id, config })?;
-            Ok(())
+        let d = unsafe { &*data };
+        let id = unsafe { sa_id(&*id) }?;
+        if d.mode != ffi::ipsec_mode_t_MODE_TUNNEL
+            || d.ipcomp != 0
+            || d.cpi != 0
+            || !d.label.is_null()
+            || d.hw_offload != ffi::hw_offload_t_HW_OFFLOAD_NO
+            || d.cpu != ffi::CPU_ID_MAX
+            || d.forward_icmp
+            || d.enc_key.len > 8192
+            || d.int_key.len > 8192
+            || !unsafe { host::unrestricted_interface(d.interface) }
+        {
+            return Err(status_t_NOT_SUPPORTED);
         }
+        let lifetime = unsafe { d.lifetime.as_ref() }.ok_or(status_t_FAILED)?;
+        let encryption = unsafe {
+            host::algorithm(
+                d.enc_alg,
+                d.enc_key,
+                ffi::transform_type_t_ENCRYPTION_ALGORITHM,
+            )
+        }?;
+        let integrity = unsafe {
+            host::algorithm(
+                d.int_alg,
+                d.int_key,
+                ffi::transform_type_t_INTEGRITY_ALGORITHM,
+            )
+        }?;
+        let config = api::SaConfig {
+            reqid: d.reqid.into(),
+            acquireSequence: d.seq.into(),
+            encryption,
+            integrity,
+            lifetime: api::Lifetime {
+                timeLife: i64::try_from(lifetime.time.life).map_err(|_| status_t_NOT_SUPPORTED)?,
+                timeRekey: i64::try_from(lifetime.time.rekey)
+                    .map_err(|_| status_t_NOT_SUPPORTED)?,
+                byteLife: lifetime.bytes.life.to_string(),
+                byteRekey: lifetime.bytes.rekey.to_string(),
+                packetLife: lifetime.packets.life.to_string(),
+                packetRekey: lifetime.packets.rekey.to_string(),
+            },
+            replayWindow: d.replay_window.into(),
+            esn: d.esn,
+            udpEncapsulation: d.encap,
+            outputMark: host::mark(d.mark),
+            tfc: d.tfc.into(),
+            copyDf: d.copy_df,
+            copyEcn: d.copy_ecn,
+            copyDscp: d.copy_dscp.into(),
+            inbound: d.inbound,
+            update: d.update,
+        };
+        this.client
+            .call::<_, Empty>("InstallSa", &api::InstallSa_Args { id, config })?;
+        Ok(())
     };
     status(operation())
 }
 
-unsafe extern "C" fn update_sa(
+extern "C" fn update_sa(
     _this: *mut ffi::kernel_ipsec_t,
     _id: *mut ffi::kernel_ipsec_sa_id_t,
     _data: *mut ffi::kernel_ipsec_update_sa_t,
@@ -186,27 +189,30 @@ unsafe extern "C" fn query_sa(
     packets: *mut u64,
     time: *mut ffi::time_t,
 ) -> status_t {
+    let this = unsafe { &*this.cast::<Ipsec>() };
     let operation = || -> Result<()> {
-        unsafe {
-            if (*data).cpi != 0 {
-                return Err(status_t_NOT_SUPPORTED);
-            }
-            let reply: api::QuerySa_Reply =
-                client(this).call("QuerySa", &api::QuerySa_Args { id: sa_id(&*id)? })?;
-            let b = decimal(&reply.bytes)?;
-            let p = decimal(&reply.packets)?;
-            let last = last_use(reply.lastUse)?;
-            if !bytes.is_null() {
-                *bytes = b;
-            }
-            if !packets.is_null() {
-                *packets = p;
-            }
-            if !time.is_null() {
-                *time = last;
-            }
-            Ok(())
+        if unsafe { (*data).cpi } != 0 {
+            return Err(status_t_NOT_SUPPORTED);
         }
+        let reply: api::QuerySa_Reply = this.client.call(
+            "QuerySa",
+            &api::QuerySa_Args {
+                id: unsafe { sa_id(&*id) }?,
+            },
+        )?;
+        let b = decimal(&reply.bytes)?;
+        let p = decimal(&reply.packets)?;
+        let last = last_use(reply.lastUse)?;
+        if let Some(output) = unsafe { bytes.as_mut() } {
+            *output = b;
+        }
+        if let Some(output) = unsafe { packets.as_mut() } {
+            *output = p;
+        }
+        if let Some(output) = unsafe { time.as_mut() } {
+            *output = last;
+        }
+        Ok(())
     };
     status(operation())
 }
@@ -216,60 +222,66 @@ unsafe extern "C" fn del_sa(
     id: *mut ffi::kernel_ipsec_sa_id_t,
     data: *mut ffi::kernel_ipsec_del_sa_t,
 ) -> status_t {
+    let this = unsafe { &*this.cast::<Ipsec>() };
     let operation = || -> Result<()> {
-        unsafe {
-            if (*data).cpi != 0 {
-                return Err(status_t_NOT_SUPPORTED);
-            }
-            client(this).call::<_, Empty>("RemoveSa", &api::RemoveSa_Args { id: sa_id(&*id)? })?;
-            Ok(())
+        if unsafe { (*data).cpi } != 0 {
+            return Err(status_t_NOT_SUPPORTED);
         }
+        this.client.call::<_, Empty>(
+            "RemoveSa",
+            &api::RemoveSa_Args {
+                id: unsafe { sa_id(&*id) }?,
+            },
+        )?;
+        Ok(())
     };
     status(operation())
 }
 
 unsafe extern "C" fn flush_sas(this: *mut ffi::kernel_ipsec_t) -> status_t {
-    unsafe { client(this).empty("FlushSas", &Empty {}) }
+    let this = unsafe { &*this.cast::<Ipsec>() };
+    this.client.empty("FlushSas", &Empty {})
 }
 
 unsafe fn policy_id(id: &ffi::kernel_ipsec_policy_id_t) -> Result<api::PolicyId> {
-    unsafe {
-        if id.if_id == 0 || !id.label.is_null() || !host::unrestricted_interface(id.interface) {
-            return Err(status_t_NOT_SUPPORTED);
-        }
-        Ok(api::PolicyId {
-            direction: id.dir.into(),
-            src: host::selector(id.src_ts)?,
-            dst: host::selector(id.dst_ts)?,
-            mark: host::mark(id.mark),
-            interfaceId: id.if_id.into(),
-        })
+    if id.if_id == 0
+        || !id.label.is_null()
+        || !unsafe { host::unrestricted_interface(id.interface) }
+    {
+        return Err(status_t_NOT_SUPPORTED);
     }
+    let (src, dst) = unsafe { (host::selector(id.src_ts)?, host::selector(id.dst_ts)?) };
+    Ok(api::PolicyId {
+        direction: id.dir.into(),
+        src,
+        dst,
+        mark: host::mark(id.mark),
+        interfaceId: id.if_id.into(),
+    })
 }
 
 unsafe fn policy_config(d: &ffi::kernel_ipsec_manage_policy_t) -> Result<api::PolicyConfig> {
-    unsafe {
-        let sa = d.sa.as_ref().ok_or(status_t_NOT_SUPPORTED)?;
-        if sa.mode != ffi::ipsec_mode_t_MODE_TUNNEL
-            || sa.ah.use_
-            || sa.ipcomp.transform != 0
-            || d.hw_offload != ffi::hw_offload_t_HW_OFFLOAD_NO
-            || d.pcpu_acquires
-            || d.forward_icmp
-        {
-            return Err(status_t_NOT_SUPPORTED);
-        }
-        Ok(api::PolicyConfig {
-            kind: d.type_.into(),
-            priority: d.prio.into(),
-            manualPriority: d.manual_prio.into(),
-            src: host::endpoint(d.src)?,
-            dst: host::endpoint(d.dst)?,
-            reqid: sa.reqid.into(),
-            policyCount: sa.policy_count.into(),
-            espSpi: sa.esp.use_.then_some(u32::from_be(sa.esp.spi).into()),
-        })
+    let sa = unsafe { d.sa.as_ref() }.ok_or(status_t_NOT_SUPPORTED)?;
+    if sa.mode != ffi::ipsec_mode_t_MODE_TUNNEL
+        || sa.ah.use_
+        || sa.ipcomp.transform != 0
+        || d.hw_offload != ffi::hw_offload_t_HW_OFFLOAD_NO
+        || d.pcpu_acquires
+        || d.forward_icmp
+    {
+        return Err(status_t_NOT_SUPPORTED);
     }
+    let (src, dst) = unsafe { (host::endpoint(d.src)?, host::endpoint(d.dst)?) };
+    Ok(api::PolicyConfig {
+        kind: d.type_.into(),
+        priority: d.prio.into(),
+        manualPriority: d.manual_prio.into(),
+        src,
+        dst,
+        reqid: sa.reqid.into(),
+        policyCount: sa.policy_count.into(),
+        espSpi: sa.esp.use_.then_some(u32::from_be(sa.esp.spi).into()),
+    })
 }
 
 unsafe extern "C" fn add_policy(
@@ -277,17 +289,16 @@ unsafe extern "C" fn add_policy(
     id: *mut ffi::kernel_ipsec_policy_id_t,
     data: *mut ffi::kernel_ipsec_manage_policy_t,
 ) -> status_t {
+    let this = unsafe { &*this.cast::<Ipsec>() };
     let operation = || -> Result<()> {
-        unsafe {
-            client(this).call::<_, Empty>(
-                "InstallPolicy",
-                &api::InstallPolicy_Args {
-                    id: policy_id(&*id)?,
-                    config: policy_config(&*data)?,
-                },
-            )?;
-            Ok(())
-        }
+        this.client.call::<_, Empty>(
+            "InstallPolicy",
+            &api::InstallPolicy_Args {
+                id: unsafe { policy_id(&*id) }?,
+                config: unsafe { policy_config(&*data) }?,
+            },
+        )?;
+        Ok(())
     };
     status(operation())
 }
@@ -297,17 +308,16 @@ unsafe extern "C" fn del_policy(
     id: *mut ffi::kernel_ipsec_policy_id_t,
     data: *mut ffi::kernel_ipsec_manage_policy_t,
 ) -> status_t {
+    let this = unsafe { &*this.cast::<Ipsec>() };
     let operation = || -> Result<()> {
-        unsafe {
-            client(this).call::<_, Empty>(
-                "RemovePolicy",
-                &api::RemovePolicy_Args {
-                    id: policy_id(&*id)?,
-                    config: policy_config(&*data)?,
-                },
-            )?;
-            Ok(())
-        }
+        this.client.call::<_, Empty>(
+            "RemovePolicy",
+            &api::RemovePolicy_Args {
+                id: unsafe { policy_id(&*id) }?,
+                config: unsafe { policy_config(&*data) }?,
+            },
+        )?;
+        Ok(())
     };
     status(operation())
 }
@@ -318,59 +328,52 @@ unsafe extern "C" fn query_policy(
     _data: *mut ffi::kernel_ipsec_query_policy_t,
     time: *mut ffi::time_t,
 ) -> status_t {
+    let this = unsafe { &*this.cast::<Ipsec>() };
     let operation = || -> Result<()> {
-        unsafe {
-            let reply: api::QueryPolicy_Reply = client(this).call(
-                "QueryPolicy",
-                &api::QueryPolicy_Args {
-                    id: policy_id(&*id)?,
-                },
-            )?;
-            let last = last_use(reply.lastUse)?;
-            if !time.is_null() {
-                *time = last;
-            }
-            Ok(())
+        let reply: api::QueryPolicy_Reply = this.client.call(
+            "QueryPolicy",
+            &api::QueryPolicy_Args {
+                id: unsafe { policy_id(&*id) }?,
+            },
+        )?;
+        let last = last_use(reply.lastUse)?;
+        if let Some(output) = unsafe { time.as_mut() } {
+            *output = last;
         }
+        Ok(())
     };
     status(operation())
 }
 
 unsafe extern "C" fn flush_policies(this: *mut ffi::kernel_ipsec_t) -> status_t {
-    unsafe { client(this).empty("FlushPolicies", &Empty {}) }
+    let this = unsafe { &*this.cast::<Ipsec>() };
+    this.client.empty("FlushPolicies", &Empty {})
 }
 
 unsafe extern "C" fn bypass_socket(this: *mut ffi::kernel_ipsec_t, fd: i32, family: i32) -> bool {
-    unsafe {
-        let mut address: libc::sockaddr_storage = mem::zeroed();
-        let mut len = mem::size_of_val(&address) as libc::socklen_t;
-        if libc::getsockname(
-            fd,
-            (&mut address as *mut libc::sockaddr_storage).cast(),
-            &mut len,
-        ) < 0
-            || i32::from(address.ss_family) != family
-        {
-            return false;
-        }
-        let port = match family {
-            libc::AF_INET => {
-                u16::from_be((*ptr::addr_of!(address).cast::<libc::sockaddr_in>()).sin_port)
-            }
-            libc::AF_INET6 => {
-                u16::from_be((*ptr::addr_of!(address).cast::<libc::sockaddr_in6>()).sin6_port)
-            }
-            _ => return false,
-        };
-        port >= 1024
-            && client(this).empty(
-                "BypassPort",
-                &api::BypassPort_Args {
-                    family: family.into(),
-                    port: port.into(),
-                },
-            ) == status_t_SUCCESS
+    let this = unsafe { &*this.cast::<Ipsec>() };
+    if fd < 0 {
+        return false;
     }
+    // SAFETY: the C socket plugin lends this open fd for the callback only.
+    let socket = unsafe { BorrowedFd::borrow_raw(fd) };
+    let Ok(address) = rustix::net::getsockname(socket) else {
+        return false;
+    };
+    let port = match family {
+        libc::AF_INET => rustix::net::SocketAddrV4::try_from(address).map(|a| a.port()),
+        libc::AF_INET6 => rustix::net::SocketAddrV6::try_from(address).map(|a| a.port()),
+        _ => return false,
+    };
+    let Ok(port) = port else { return false };
+    port >= 1024
+        && this.client.empty(
+            "BypassPort",
+            &api::BypassPort_Args {
+                family: family.into(),
+                port: port.into(),
+            },
+        ) == status_t_SUCCESS
 }
 
 unsafe extern "C" fn enable_udp_decap(

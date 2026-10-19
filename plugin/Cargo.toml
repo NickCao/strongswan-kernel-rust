@@ -33,8 +33,7 @@ versioning = false
 kernel-rust-protocol = { path = "../protocol" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-zeroize = "1.8"
+rustix = { version = "1.1", features = ["net"] }
 
 [build-dependencies]
 bindgen = "0.72"

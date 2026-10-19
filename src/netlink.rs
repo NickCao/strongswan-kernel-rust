@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 use crate::{error::invalid, uapi::*};
-use std::{
-    io, mem,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+use rustix::{
+    fd::{AsFd, BorrowedFd, OwnedFd},
+    net::{
+        self, netlink::SocketAddrNetlink, sockopt, AddressFamily, Protocol, RecvFlags, SendFlags,
+        SocketFlags, SocketType,
+    },
 };
+use std::{io, time::Duration};
 use zeroize::Zeroizing;
 
 pub const REQUEST: u16 = 1;
@@ -127,144 +131,55 @@ pub struct Netlink {
 }
 impl Netlink {
     pub fn new(protocol: i32, groups: u32) -> io::Result<Self> {
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_NETLINK,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                protocol,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let mut addr: libc::sockaddr_nl = unsafe { mem::zeroed() };
-        addr.nl_family = libc::AF_NETLINK as _;
-        addr.nl_groups = groups;
-        if unsafe {
-            libc::bind(
-                fd.as_raw_fd(),
-                &addr as *const _ as _,
-                mem::size_of_val(&addr) as _,
-            )
-        } < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let on: i32 = 1;
-        unsafe {
-            libc::setsockopt(
-                fd.as_raw_fd(),
-                libc::SOL_NETLINK,
-                libc::NETLINK_EXT_ACK,
-                &on as *const _ as _,
-                4,
-            );
-        }
-        let rcv: i32 = 4 * 1024 * 1024;
-        unsafe {
-            libc::setsockopt(
-                fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &rcv as *const _ as _,
-                4,
-            );
-        }
-        let timeout = libc::timeval {
-            tv_sec: 5,
-            tv_usec: 0,
-        };
-        if unsafe {
-            libc::setsockopt(
-                fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &timeout as *const _ as _,
-                mem::size_of_val(&timeout) as _,
-            )
-        } < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        let fd = net::socket_with(
+            AddressFamily::NETLINK,
+            SocketType::RAW,
+            SocketFlags::CLOEXEC,
+            std::num::NonZeroU32::new(protocol as u32).map(Protocol::from_raw),
+        )?;
+        net::bind(&fd, &SocketAddrNetlink::new(0, groups))?;
+        let _ = sockopt::set_socket_recv_buffer_size(&fd, 4 * 1024 * 1024);
+        sockopt::set_socket_timeout(&fd, sockopt::Timeout::Recv, Some(Duration::from_secs(5)))?;
         Ok(Self { fd, seq: 0 })
     }
-    pub fn raw_fd(&self) -> i32 {
-        self.fd.as_raw_fd()
-    }
     pub fn receive(&self) -> io::Result<Vec<Reply>> {
-        // Peek size instead of silently truncating large dumps or replay maps.
-        let mut one = 0u8;
+        // The second return value is the full datagram length with MSG_TRUNC,
+        // not the number of bytes copied into the one-byte peek buffer.
+        let mut one = [0u8];
         let len = loop {
-            let n = unsafe {
-                libc::recv(
-                    self.fd.as_raw_fd(),
-                    &mut one as *mut _ as _,
-                    1,
-                    libc::MSG_PEEK | libc::MSG_TRUNC,
-                )
-            };
-            if n >= 0 {
-                break n as usize;
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
+            match net::recv(&self.fd, &mut one[..], RecvFlags::PEEK | RecvFlags::TRUNC) {
+                Ok((_, len)) => break len,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
             }
         };
         if len == 0 || len > 4 * 1024 * 1024 {
             return Err(invalid());
         }
-        let mut b = Zeroizing::new(vec![0; len]);
-        let mut sender: libc::sockaddr_nl = unsafe { mem::zeroed() };
-        let mut sender_len = mem::size_of_val(&sender) as libc::socklen_t;
-        let n = unsafe {
-            libc::recvfrom(
-                self.fd.as_raw_fd(),
-                b.as_mut_ptr() as _,
-                b.len(),
-                0,
-                &mut sender as *mut _ as _,
-                &mut sender_len,
-            )
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if sender.nl_pid != 0 {
+        let mut bytes = Zeroizing::new(vec![0; len]);
+        let (copied, received, sender) =
+            net::recvfrom(&self.fd, &mut bytes[..], RecvFlags::empty())?;
+        let sender = sender.ok_or_else(invalid)?;
+        let sender = SocketAddrNetlink::try_from(sender)?;
+        if sender.pid() != 0 {
             return Err(io::Error::from_raw_os_error(libc::EPERM));
         }
-        if n as usize != len {
+        if copied != len || received != len {
             return Err(invalid());
         }
-        messages(&b)
+        messages(&bytes)
     }
     pub fn request(&mut self, msg: &Message) -> io::Result<Vec<Reply>> {
         self.seq = self.seq.wrapping_add(1).max(1);
         let seq = self.seq;
-        let b = msg.encode(seq);
-        let mut dest: libc::sockaddr_nl = unsafe { mem::zeroed() };
-        dest.nl_family = libc::AF_NETLINK as _;
+        let bytes = msg.encode(seq);
+        let dest = SocketAddrNetlink::new(0, 0);
         loop {
-            let n = unsafe {
-                libc::sendto(
-                    self.fd.as_raw_fd(),
-                    b.as_ptr() as _,
-                    b.len(),
-                    0,
-                    &dest as *const _ as _,
-                    mem::size_of_val(&dest) as _,
-                )
-            };
-            if n >= 0 {
-                if n as usize != b.len() {
-                    return Err(invalid());
-                }
-                break;
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
+            match net::sendto(&self.fd, &bytes, SendFlags::empty(), &dest) {
+                Ok(n) if n == bytes.len() => break,
+                Ok(_) => return Err(invalid()),
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
             }
         }
         let mut result = Vec::new();
@@ -313,6 +228,12 @@ impl Netlink {
     }
     pub fn ack(&mut self, msg: &Message) -> io::Result<()> {
         self.request(msg).map(|_| ())
+    }
+}
+
+impl AsFd for Netlink {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 

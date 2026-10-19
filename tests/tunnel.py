@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 
-def run(prefix, cbc=False, vici_python=None):
+def run(prefix, cbc=False, vici_python=None, dynamic_user=False):
     assert os.geteuid() == 0
     assert os.stat("/proc/self/ns/net").st_ino != os.stat("/proc/1/ns/net").st_ino, "use unshare --net"
     prefix = Path(prefix).resolve()
@@ -36,6 +36,7 @@ def run(prefix, cbc=False, vici_python=None):
     procs = []
     namespaces = []
     logs = []
+    units = []
     def cmd(args, **kwargs):
         kwargs.setdefault("env", runtime_env)
         return subprocess.check_output([str(a) for a in args], text=True, stderr=subprocess.STDOUT, **kwargs)
@@ -68,9 +69,14 @@ def run(prefix, cbc=False, vici_python=None):
             peers = {}
             for peer in [1, 2]:
                 pdir = root / str(peer); pdir.mkdir(mode=0o755)
-                runtime = pdir / "run"; runtime.mkdir(); os.chown(runtime, 65534, 65534)
+                unit = f"kernel-rust-{os.getpid()}-{peer}"
+                if dynamic_user:
+                    # systemd owns this directory and removes it with the unit.
+                    runtime = Path("/run") / unit
+                else:
+                    runtime = pdir / "run"; runtime.mkdir(); os.chown(runtime, 65534, 65534)
                 kernel_socket = pdir / "kernel.sock"
-                daemon = start(peer, [prefix / "bin/charon-kernel-daemon", "--socket", kernel_socket, "--uid", "65534", "--gid", "65534"], pdir / "kernel.log")
+                daemon = start(peer, [prefix / "bin/charon-kernel-daemon", "--socket", kernel_socket, "--group", "nogroup" if dynamic_user else "65534"], pdir / "kernel.log")
                 wait_file(kernel_socket, [daemon])
                 config = pdir / "strongswan.conf"
                 config.write_text(f"""charon {{
@@ -83,7 +89,7 @@ def run(prefix, cbc=False, vici_python=None):
             socket = {kernel_socket}
         }}
         vici {{
-            socket = unix://{runtime}/charon.vici
+            socket = unix://{Path('/run') if dynamic_user else runtime}/charon.vici
         }}
     }}
     filelog {{
@@ -97,17 +103,40 @@ def run(prefix, cbc=False, vici_python=None):
 }}
 """)
                 config.chmod(0o644)
-                # PID files are isolated too. /run is private to this mount
-                # namespace; the outer VM's runtime directory is untouched.
-                script = pdir / "start.sh"
-                script.write_text("""#!/bin/sh
+                if dynamic_user:
+                    units.append(unit)
+                    charon = start(peer, [
+                        "systemd-run", "--quiet", "--wait", "--pipe", "--collect",
+                        f"--unit={unit}", "--service-type=exec",
+                        "--property=DynamicUser=yes",
+                        "--property=SupplementaryGroups=nogroup",
+                        "--property=CapabilityBoundingSet=",
+                        "--property=AmbientCapabilities=",
+                        f"--property=NetworkNamespacePath=/run/netns/{namespaces[peer-1]}",
+                        f"--property=RuntimeDirectory={unit}",
+                        "--property=RuntimeDirectoryMode=0755",
+                        f"--property=BindPaths={runtime}:/run",
+                        # DynamicUser isolates /tmp. Expose only the root-owned
+                        # disposable prefix and configuration, read-only.
+                        f"--property=BindReadOnlyPaths={prefix} {root}",
+                        f"--setenv=STRONGSWAN_CONF={config}",
+                        f"--setenv=LD_LIBRARY_PATH={runtime_env['LD_LIBRARY_PATH']}",
+                        "--", prefix / "libexec/ipsec/charon", "--debug-knl", "2", "--debug-cfg", "2",
+                    ], pdir / "charon.log")
+                else:
+                    # PID files are isolated too. /run is private to this mount
+                    # namespace; the outer VM's runtime directory is untouched.
+                    # From this child PID namespace SO_PEERCRED reports pid 0 for
+                    # the external daemon; only its UID is required by the client.
+                    script = pdir / "start.sh"
+                    script.write_text("""#!/bin/sh
 set -eu
 mount --make-rprivate /
 mount --bind "$1" /run
 export STRONGSWAN_CONF="$2"
 exec setpriv --reuid=65534 --regid=65534 --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all "$3" --debug-knl 2 --debug-cfg 2
 """)
-                charon = start(peer, ["unshare", "--mount", "--pid", "--fork", "--mount-proc", "/bin/sh", script, runtime, config, prefix / "libexec/ipsec/charon"], pdir / "charon.log")
+                    charon = start(peer, ["unshare", "--mount", "--pid", "--fork", "--mount-proc", "/bin/sh", script, runtime, config, prefix / "libexec/ipsec/charon"], pdir / "charon.log")
                 vici = runtime / "charon.vici"
                 wait_file(vici, [daemon, charon])
                 other = 3-peer
@@ -151,7 +180,7 @@ exec setpriv --reuid=65534 --regid=65534 --clear-groups --bounding-set=-all --in
     }}
 }}
 """)
-                peers[peer] = {"dir": pdir, "vici": vici, "config": config, "swanctl": swanctl}
+                peers[peer] = {"dir": pdir, "runtime": runtime, "unit": unit, "vici": vici, "config": config, "swanctl": swanctl}
                 env = {**runtime_env, "STRONGSWAN_CONF": str(config)}
                 vsock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); vsock.connect(str(vici))
                 session = vici_module.Session(vsock)
@@ -162,20 +191,33 @@ exec setpriv --reuid=65534 --regid=65534 --clear-groups --bounding-set=-all --in
                 return cmd([prefix / "sbin/swanctl", *args, "--uri", f"unix://{peers[peer]['vici']}"], env={**runtime_env, "STRONGSWAN_CONF": str(peers[peer]["config"])}, timeout=30)
             initiated = ctl(1, "--initiate", "--child", "net")
             assert "established" in initiated, initiated
+            client_uids = set()
             for peer in [1, 2]:
                 # Confirm the actual IKE process, independently of the wrapper,
-                # has UID 65534 and no capabilities in any set.
-                pid = int((peers[peer]["dir"] / "run/charon.pid").read_text())
-                # PID is relative to its namespace. Locate it by namespace and
-                # executable through the VM's /proc.
-                candidates = []
-                for entry in Path("/proc").iterdir():
-                    if not entry.name.isdigit(): continue
-                    try:
-                        if entry.joinpath("exe").resolve() != prefix / "libexec/ipsec/charon": continue
-                        status = entry.joinpath("status").read_text()
-                        if f"NSpid:\t{entry.name}\t{pid}" in status and f"Uid:\t65534\t65534\t65534\t65534" in status: candidates.append(status)
-                    except (OSError, PermissionError): pass
+                # has its expected UID and no capabilities in any set.
+                pid = int((peers[peer]["runtime"] / "charon.pid").read_text())
+                if dynamic_user:
+                    status = Path(f"/proc/{pid}/status").read_text()
+                    uid = int(re.search(r"^Uid:\s+(\d+)", status, re.M)[1])
+                    assert 61184 <= uid <= 65519, status
+                    assert uid not in client_uids, "units must have distinct dynamic users"
+                    client_uids.add(uid)
+                    assert re.search(r"^Uid:\s+(.*)", status, re.M)[1].split() == [str(uid)] * 4
+                    assert re.search(r"^Gid:\s+(.*)", status, re.M)[1].split() == [str(uid)] * 4
+                    assert "65534" in re.search(r"^Groups:\s*(.*)", status, re.M)[1].split(), status
+                    assert Path(f"/proc/{pid}/exe").resolve() == prefix / "libexec/ipsec/charon"
+                    candidates = [status]
+                else:
+                    # PID is relative to its namespace. Locate it by namespace
+                    # and executable through the VM's /proc.
+                    candidates = []
+                    for entry in Path("/proc").iterdir():
+                        if not entry.name.isdigit(): continue
+                        try:
+                            if entry.joinpath("exe").resolve() != prefix / "libexec/ipsec/charon": continue
+                            status = entry.joinpath("status").read_text()
+                            if f"NSpid:\t{entry.name}\t{pid}" in status and f"Uid:\t65534\t65534\t65534\t65534" in status: candidates.append(status)
+                        except (OSError, PermissionError): pass
                 assert candidates, "could not inspect unprivileged charon"
                 for status in candidates:
                     for cap in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"]: assert f"{cap}:\t0000000000000000" in status, status
@@ -222,11 +264,15 @@ exec setpriv --reuid=65534 --regid=65534 --clear-groups --bounding-set=-all --in
                 policies = ns(peer,"ip","xfrm","policy","list","nosock")
                 assert "if_id" not in policies and "priority 32" in policies, policies
             print("PASS: Ed25519 raw public key authentication, two capability-free charons on high UDP ports, wildcard IPv4/IPv6 tunnel selectors, daemon-created XFRM interfaces, encrypted traffic/counters, rekey without interface churn, automatic final-SA cleanup")
+            if dynamic_user:
+                print(f"PASS: systemd DynamicUser charons with distinct UIDs {sorted(client_uids)}, dynamic primary groups, and socket access through a supplementary group")
         finally:
             if isinstance(sys.exc_info()[1], subprocess.CalledProcessError): print(sys.exc_info()[1].output, file=sys.stderr)
             if sys.exc_info()[0]:
                 for log in logs:
                     log.seek(0); print(f"{log.name}:\n{log.read()[-18000:]}", file=sys.stderr)
+            for unit in reversed(units):
+                subprocess.run(["systemctl", "stop", unit], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             for p in reversed(procs):
                 if p.poll() is None:
                     try: os.killpg(p.pid, signal.SIGTERM)
@@ -245,5 +291,6 @@ if __name__ == "__main__":
     parser.add_argument("prefix", type=Path)
     parser.add_argument("--cbc", action="store_true")
     parser.add_argument("--vici-python", type=Path)
+    parser.add_argument("--dynamic-user", action="store_true", help="run charons as actual systemd DynamicUser services (needs systemd and group nogroup)")
     args = parser.parse_args()
-    run(args.prefix, args.cbc, args.vici_python)
+    run(args.prefix, args.cbc, args.vici_python, args.dynamic_user)

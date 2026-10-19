@@ -7,7 +7,7 @@ use crate::{
     netlink::{self, Message, Netlink, ACK, CREATE, DUMP, EXCL},
     uapi::{get16, get32, put32},
 };
-use std::{ffi::CString, io};
+use std::io;
 
 #[derive(Clone, Debug)]
 pub struct Link {
@@ -52,13 +52,16 @@ pub fn index(name: &str) -> io::Result<u32> {
     if name.is_empty() {
         return Ok(0);
     }
-    let name = CString::new(name).map_err(|_| invalid())?;
-    let i = unsafe { libc::if_nametoindex(name.as_ptr()) };
-    if i == 0 {
-        Err(io::Error::from_raw_os_error(libc::ENODEV))
-    } else {
-        Ok(i)
+    if name.contains('\0') {
+        return Err(invalid());
     }
+    let socket = rustix::net::socket_with(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::DGRAM,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )?;
+    rustix::net::netdevice::name_to_index(&socket, name).map_err(io::Error::from)
 }
 impl Network {
     pub fn new() -> io::Result<Self> {

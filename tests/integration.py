@@ -93,11 +93,23 @@ def run(binary):
     with tempfile.TemporaryDirectory(prefix="kernel-rust-rpc-") as d:
         directory = Path(d); directory.chmod(0o755); path = str(directory / "kernel.sock")
         with open(directory/"daemon.log", "w+") as log:
-            daemon = subprocess.Popen([binary,"--socket",path,"--uid","65534","--gid","65534"], stdout=log, stderr=log)
+            daemon = subprocess.Popen([binary,"--socket",path,"--group","65534"], stdout=log, stderr=log)
             child = None
             try:
                 wait(lambda: Path(path).exists() or daemon.poll() is not None)
                 assert daemon.poll() is None
+                info = os.stat(path)
+                assert info.st_uid == 0 and info.st_gid == 65534 and info.st_mode & 0o777 == 0o660
+                # No UID or primary/supplementary group matching the socket:
+                # Linux must reject the connection before any RPC is sent.
+                subprocess.run([
+                    "setpriv", "--reuid=65533", "--regid=65533", "--clear-groups",
+                    "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
+                    sys.executable, "-c", "import socket, sys\n"
+                    "try:\n socket.socket(socket.AF_UNIX).connect(sys.argv[1])\n"
+                    "except PermissionError:\n pass\n"
+                    "else:\n raise AssertionError('unauthorized client connected')\n", path,
+                ], check=True)
                 if shutil.which("varlinkctl"):
                     desc = subprocess.check_output(["varlinkctl","introspect",path,"io.ranet.Kernel"],text=True)
                     assert "InstallSa" in desc and "WatchEvents" in desc
@@ -169,7 +181,7 @@ def run(binary):
                 assert probe.call("OpenSession",dict(interfacesUse="",interfacesIgnore=""))["error"].endswith("SessionBusy")
                 probe.socket.close()
                 wait(lambda: [l["ifname"] for l in links()] == ["foreign"])
-                print("PASS: standard Varlink, capability-free client, SA/interface lifetime, overlapping rekey, rollback, foreign objects, larval SPI, hard expiry, scoped cleanup and disconnected-client expiry")
+                print("PASS: socket group authorization and denied nonmember, standard Varlink, capability-free client, SA/interface lifetime, overlapping rekey, rollback, foreign objects, larval SPI, hard expiry, scoped cleanup and disconnected-client expiry")
             except BaseException:
                 log.seek(0); print(log.read(),file=sys.stderr); raise
             finally:

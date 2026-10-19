@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#![forbid(unsafe_code)]
 use charon_kernel_daemon::{
     error::invalid,
     rpc_api,
@@ -17,7 +18,11 @@ use std::{
     time::Duration,
 };
 use varlink::ConnectionHandler;
-fn connection(mut socket: UnixStream, peer: libc::ucred, server: Arc<Server>) -> io::Result<()> {
+fn connection(
+    mut socket: UnixStream,
+    peer: transport::Peer,
+    server: Arc<Server>,
+) -> io::Result<()> {
     socket.set_read_timeout(Some(Duration::from_secs(1)))?;
     socket.set_write_timeout(Some(Duration::from_secs(10)))?;
     let service = Service {
@@ -62,25 +67,21 @@ fn connection(mut socket: UnixStream, peer: libc::ucred, server: Arc<Server>) ->
 }
 fn run() -> io::Result<()> {
     let mut path = PathBuf::from("/run/charon-kernel.sock");
-    let (mut uid, mut gid, mut mtu) = (0, 0, 1400);
+    let (mut gid, mut mtu) = (0, 1400);
     let mut prefix = "ranet".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => path = args.next().ok_or_else(invalid)?.into(),
-            "--uid" => {
-                uid = args
-                    .next()
-                    .ok_or_else(invalid)?
-                    .parse()
-                    .map_err(|_| invalid())?
-            }
-            "--gid" => {
-                gid = args
-                    .next()
-                    .ok_or_else(invalid)?
-                    .parse()
-                    .map_err(|_| invalid())?
+            "--group" => {
+                let group = args.next().ok_or_else(invalid)?;
+                gid = match group.parse() {
+                    Ok(gid) => gid,
+                    Err(_) => nix::unistd::Group::from_name(&group)?
+                        .ok_or_else(invalid)?
+                        .gid
+                        .as_raw(),
+                };
             }
             "--mtu" => {
                 mtu = args
@@ -91,7 +92,7 @@ fn run() -> io::Result<()> {
             }
             "--ifname-prefix" => prefix = args.next().ok_or_else(invalid)?,
             "--help" => {
-                println!("charon-kernel-daemon [--socket PATH] [--uid UID] [--gid GID] [--ifname-prefix ranet] [--mtu 1400]");
+                println!("charon-kernel-daemon [--socket PATH] [--group NAME|GID] [--ifname-prefix ranet] [--mtu 1400]");
                 return Ok(());
             }
             _ => return Err(invalid()),
@@ -106,13 +107,11 @@ fn run() -> io::Result<()> {
     {
         return Err(invalid());
     }
-    unsafe {
-        libc::umask(0o077);
-        libc::prctl(libc::PR_SET_DUMPABLE, 0);
-    }
-    let listener = transport::listen(&path, uid, gid)?;
+    rustix::process::umask(rustix::fs::Mode::from_bits_retain(0o077));
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)?;
+    let listener = transport::listen(&path, gid)?;
     eprintln!(
-        "kernel-daemon: Varlink listening on {} for uid {uid}",
+        "kernel-daemon: Varlink listening on {} with socket group {gid}",
         path.display()
     );
     let server = Arc::new(Server {
@@ -124,9 +123,10 @@ fn run() -> io::Result<()> {
     for socket in listener.incoming() {
         let socket = socket?;
         let peer = transport::peer(&socket)?;
-        if peer.uid != uid && peer.uid != 0 {
-            continue;
-        }
+        // The filesystem socket's 0660 mode authorizes the connecting process,
+        // including its supplementary groups. SO_PEERCRED only reports its
+        // primary GID, so checking that here would break DynamicUser clients.
+        // Bind the control and event connections to their actual PID/UID below.
         if pending.fetch_add(1, Ordering::AcqRel) >= 8 {
             pending.fetch_sub(1, Ordering::AcqRel);
             continue;

@@ -117,18 +117,24 @@ privileged bind operation. Do not configure `socket-default.fwmark`, which
 would require SO_MARK on charon's sockets; ranet's `set_mark_out` applies to
 SAs and is supported by the daemon.
 
-For charon UID/GID 1000, run the daemon in the same network namespace:
+Create a dedicated static group, grant the charon service membership, and run
+the daemon in the same network namespace:
 
 ```sh
-charon-kernel-daemon --socket /run/charon-kernel.sock --uid 1000 --gid 1000
+groupadd --system ipsec
+charon-kernel-daemon --socket /run/charon-kernel.sock --group ipsec
 ```
 
 The socket's parent directory must permit the charon user to traverse it and
 must prevent untrusted users replacing its entries. The daemon refuses to
-unlink an existing socket path. It defaults to root as the permitted client;
-`--uid` selects the charon user. Root is also accepted. `--gid` sets the
-socket group. The plugin verifies the daemon's UID (root by default); set
-`daemon_uid` if the daemon runs as another user with CAP_NET_ADMIN.
+unlink an existing socket path. The socket remains owned by the daemon, has
+mode **0660**, and uses the group selected by `--group NAME|GID` (default GID
+0). Linux authorizes connections using filesystem permissions, including
+supplementary groups. There is no configured charon UID. `SO_PEERCRED` binds
+the two connections of a session to the same actual PID/UID; its primary GID
+alone cannot authorize supplementary-group membership. The plugin separately
+verifies the daemon's UID (root by default); set `daemon_uid` if the daemon
+runs as another user with CAP_NET_ADMIN.
 
 Example strongswan.conf excerpt, with ranet's endpoint port set to 13000:
 
@@ -155,11 +161,53 @@ Keep socket-default and the normal authentication/crypto/VICI plugins loaded.
 If you use an explicit `charon.load` list instead of modular loading, add
 `kernel-rust` to that list and remove `kernel-netlink`.
 Start charon as its unprivileged user with all capability sets removed; the
-integration test below includes an executable example. The daemon has a
-separate lifetime from charon. SA keys travel over the private socket and
-are never returned by query methods. Binary key buffers and Netlink buffers
+integration test below includes an executable example.
+
+For a systemd-managed strongSwan service, `DynamicUser=yes` works with a
+[static supplementary group](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#SupplementaryGroups=).
+For example, add this to the `charon-systemd`
+service, alongside its existing executable and configuration:
+
+```ini
+[Service]
+DynamicUser=yes
+SupplementaryGroups=ipsec
+CapabilityBoundingSet=
+AmbientCapabilities=
+RuntimeDirectory=strongswan
+```
+
+Keep the kernel daemon in a separate service. Its root-owned socket and group
+remain stable while systemd allocates and recycles charon's UID and primary
+GID. Configure VICI under the service's runtime directory, for example
+`unix:///run/strongswan/charon.vici`, and deliver keys through VICI or systemd
+credentials. With the plain `charon` executable, also provide a writable,
+isolated location for its compile-time PID file; the dynamic-user tunnel test
+does this with a systemd-managed runtime directory mounted at `/run`.
+
+The daemon has a separate lifetime from charon. SA keys travel over the private
+socket and are never returned by query methods. Binary key buffers and Netlink buffers
 are wiped on release; JSON libraries may make transient copies. Core dumps
 are disabled in the daemon. Avoid tracing RPC payloads.
+
+## Safety boundaries
+
+The daemon and shared protocol crate use `#![forbid(unsafe_code)]`, including
+the RPC client and socket framing. Linux calls use safe Rustix APIs, and peer
+credentials use Nix's raw PID representation, which also handles a peer PID of
+zero across PID namespaces. Netlink messages are encoded and decoded as bounded
+byte slices. The daemon uses errno replies and does not request unused extended
+acknowledgment text.
+
+The plugin still implements strongSwan's C interfaces. Its remaining unsafe
+code borrows C callback arguments, invokes host functions, manages the exported
+C function tables and variadic enumerators, and configures UDP socket options.
+Validation, RPC calls, counters, and snapshot construction run in safe Rust.
+Privately owned `NonNull` handles pair C object construction with destruction;
+the shared client registry uses `Weak`/`Arc` instead of untyped C pointers.
+The watcher owns its callback state and event socket and waits for active
+callbacks before releasing them. No pointers or descriptors cross the RPC
+connection.
 
 ## Session and recovery behavior
 
@@ -196,10 +244,14 @@ unshare --net -- python3 tests/tunnel.py /tmp/strongswan-install \
     --vici-python /path/to/strongswan/src/libcharon/plugins/vici/python
 unshare --net -- python3 tests/tunnel.py /tmp/strongswan-install --cbc \
     --vici-python /path/to/strongswan/src/libcharon/plugins/vici/python
+# On a VM running systemd, exercise actual DynamicUser services too:
+unshare --net -- python3 tests/tunnel.py /tmp/strongswan-install --dynamic-user \
+    --vici-python /path/to/strongswan/src/libcharon/plugins/vici/python
 ```
 
-The RPC test checks standard introspection (also with varlinkctl when
-installed), a capability-free client, validation, interface rollback,
+The RPC test checks socket group permissions and a rejected nonmember,
+standard introspection (also with varlinkctl when installed), a
+capability-free client, validation, interface rollback,
 foreign objects, overlapping SAs, scoped flushes, larval allocation, hard
 expiry, and expiry after losing the client. The tunnel tests use
 capability-free charons, Ed25519 raw public keys, ranet's wildcard IPv4/IPv6
@@ -210,6 +262,11 @@ and C `va_list` forwarding to Rust's `venumerate`, with IPv4/IPv6 addresses and
 subnets, plus repeated clean sessions and descriptor cleanup. The default tunnel run
 negotiates default ESP proposals; the second forces AES-CBC/HMAC-SHA256
 with ESN.
+The `--dynamic-user` variant needs a system systemd instance and the existing
+`nogroup` test group. It verifies distinct dynamically allocated UIDs/primary
+GIDs, socket access through a supplementary group, and empty capability sets
+in the actual charon processes. Its transient units and runtime directories
+are removed on exit.
 
 ## License and origin
 

@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 use crate::{
-    client::{Client, Empty},
     ffi,
     host::{self, Host},
-    status_t, status_t_FAILED, status_t_NOT_SUPPORTED, Result,
+    status_t, status_t_FAILED, status_t_NOT_SUPPORTED, ClientExt, Result,
 };
-use kernel_rust_protocol as api;
+use kernel_rust_protocol::{
+    self as api,
+    client::{Client, Empty},
+};
 use std::{
     ffi::{CString, VaList},
     mem::ManuallyDrop,
@@ -19,8 +21,8 @@ struct Net {
     client: Arc<Client>,
 }
 
-pub unsafe extern "C" fn create() -> *mut ffi::kernel_net_t {
-    let Some(client) = (unsafe { Client::from_registry() }) else {
+pub extern "C" fn create() -> *mut ffi::kernel_net_t {
+    let Some(client) = crate::plugin::current_client() else {
         return ptr::null_mut();
     };
     Box::into_raw(Box::new(Net {
@@ -42,30 +44,28 @@ pub unsafe extern "C" fn create() -> *mut ffi::kernel_net_t {
     .cast()
 }
 
-unsafe fn client<'a>(this: *mut ffi::kernel_net_t) -> &'a Client {
-    unsafe { &(*this.cast::<Net>()).client }
-}
-
-unsafe extern "C" fn get_features(_this: *mut ffi::kernel_net_t) -> ffi::kernel_feature_t {
+extern "C" fn get_features(_this: *mut ffi::kernel_net_t) -> ffi::kernel_feature_t {
     0
 }
 
+// These callbacks borrow their C arguments once at entry. RPC, response
+// validation, and owned results are ordinary safe Rust after that conversion.
 unsafe extern "C" fn get_source_addr(
     this: *mut ffi::kernel_net_t,
     destination: *mut ffi::host_t,
     source: *mut ffi::host_t,
 ) -> *mut ffi::host_t {
+    let this = unsafe { &*this.cast::<Net>() };
     let operation = || -> Result<Host> {
-        unsafe {
-            let reply: api::GetSourceAddress_Reply = client(this).call(
-                "GetSourceAddress",
-                &api::GetSourceAddress_Args {
-                    destination: host::endpoint(destination)?,
-                    source: host::optional_endpoint(source)?,
-                },
-            )?;
-            Host::parse(&reply.address)
-        }
+        let parameters = unsafe {
+            api::GetSourceAddress_Args {
+                destination: host::endpoint(destination)?,
+                source: host::optional_endpoint(source)?,
+            }
+        };
+        let reply: api::GetSourceAddress_Reply =
+            this.client.call("GetSourceAddress", &parameters)?;
+        Host::parse(&reply.address)
     };
     operation().map_or(ptr::null_mut(), Host::into_raw)
 }
@@ -77,27 +77,25 @@ unsafe extern "C" fn get_nexthop(
     source: *mut ffi::host_t,
     interface: *mut *mut libc::c_char,
 ) -> *mut ffi::host_t {
-    if !interface.is_null() {
-        unsafe {
-            *interface = ptr::null_mut();
-        }
+    let this = unsafe { &*this.cast::<Net>() };
+    let mut interface = unsafe { interface.as_mut() };
+    if let Some(output) = interface.as_mut() {
+        **output = ptr::null_mut();
     }
     let operation = || -> Result<Host> {
-        unsafe {
-            let reply: api::GetNextHop_Reply = client(this).call(
-                "GetNextHop",
-                &api::GetNextHop_Args {
-                    destination: host::endpoint(destination)?,
-                    source: host::optional_endpoint(source)?,
-                    prefix: Some(prefix.into()),
-                },
-            )?;
-            let host = Host::parse(&reply.gateway)?;
-            if !interface.is_null() {
-                *interface = host::duplicate(&reply.interface)?;
+        let parameters = unsafe {
+            api::GetNextHop_Args {
+                destination: host::endpoint(destination)?,
+                source: host::optional_endpoint(source)?,
+                prefix: Some(prefix.into()),
             }
-            Ok(host)
+        };
+        let reply: api::GetNextHop_Reply = this.client.call("GetNextHop", &parameters)?;
+        let host = Host::parse(&reply.gateway)?;
+        if let Some(output) = interface {
+            *output = host::duplicate(&reply.interface)?;
         }
+        Ok(host)
     };
     operation().map_or(ptr::null_mut(), Host::into_raw)
 }
@@ -107,24 +105,20 @@ unsafe extern "C" fn get_interface(
     address: *mut ffi::host_t,
     name: *mut *mut libc::c_char,
 ) -> bool {
-    if !name.is_null() {
-        unsafe {
-            *name = ptr::null_mut();
-        }
+    let this = unsafe { &*this.cast::<Net>() };
+    let mut name = unsafe { name.as_mut() };
+    if let Some(output) = name.as_mut() {
+        **output = ptr::null_mut();
     }
     let operation = || -> Result<()> {
-        unsafe {
-            let reply: api::GetInterface_Reply = client(this).call(
-                "GetInterface",
-                &api::GetInterface_Args {
-                    address: host::endpoint(address)?,
-                },
-            )?;
-            if !name.is_null() {
-                *name = host::duplicate(&reply.interface)?;
-            }
-            Ok(())
+        let parameters = api::GetInterface_Args {
+            address: unsafe { host::endpoint(address) }?,
+        };
+        let reply: api::GetInterface_Reply = this.client.call("GetInterface", &parameters)?;
+        if let Some(output) = name {
+            *output = host::duplicate(&reply.interface)?;
         }
+        Ok(())
     };
     operation().is_ok()
 }
@@ -179,30 +173,25 @@ unsafe extern "C" fn venumerate(this: *mut ffi::enumerator_t, args: VaList<'_>) 
 }
 
 unsafe fn advance(this: *mut ffi::enumerator_t, args: &mut VaList<'_>) -> bool {
-    // Enumerator callers serialize iteration and supply the documented output
-    // pointer types: host_t**, and for subnets also uint8_t* and char**.
-    unsafe {
-        let snapshot = &mut *this.cast::<Snapshot>();
-        let Some(item) = snapshot.items.get(snapshot.next) else {
-            return false;
-        };
-        snapshot.next += 1;
-        let host = args.next_arg::<*mut *mut ffi::host_t>();
-        if !host.is_null() {
-            *host = item.host.0;
-        }
-        if snapshot.subnets {
-            let prefix = args.next_arg::<*mut u8>();
-            let name = args.next_arg::<*mut *mut libc::c_char>();
-            if !prefix.is_null() {
-                *prefix = item.prefix;
-            }
-            if !name.is_null() {
-                *name = item.name.as_ptr().cast_mut();
-            }
-        }
-        true
+    // The C caller serializes iteration and supplies host_t**, and for subnets
+    // uint8_t* and char**. Borrow output slots only for their individual write.
+    let snapshot = unsafe { &mut *this.cast::<Snapshot>() };
+    let Some(item) = snapshot.items.get(snapshot.next) else {
+        return false;
+    };
+    snapshot.next += 1;
+    if let Some(output) = unsafe { args.next_arg::<*mut *mut ffi::host_t>().as_mut() } {
+        *output = item.host.as_raw();
     }
+    if snapshot.subnets {
+        if let Some(output) = unsafe { args.next_arg::<*mut u8>().as_mut() } {
+            *output = item.prefix;
+        }
+        if let Some(output) = unsafe { args.next_arg::<*mut *mut libc::c_char>().as_mut() } {
+            *output = item.name.as_ptr().cast_mut();
+        }
+    }
+    true
 }
 
 unsafe extern "C" fn destroy_snapshot(this: *mut ffi::enumerator_t) {
@@ -215,29 +204,28 @@ unsafe extern "C" fn create_address_enumerator(
     this: *mut ffi::kernel_net_t,
     which: ffi::kernel_address_type_t,
 ) -> *mut ffi::enumerator_t {
+    let this = unsafe { &*this.cast::<Net>() };
     let operation = || -> Result<Vec<Item>> {
-        unsafe {
-            let reply: api::ListAddresses_Reply = client(this).call(
-                "ListAddresses",
-                &api::ListAddresses_Args {
-                    which: which.into(),
-                },
-            )?;
-            if reply.addresses.len() > 4096 {
-                return Err(status_t_FAILED);
-            }
-            reply
-                .addresses
-                .iter()
-                .map(|a| {
-                    Ok(Item {
-                        host: Host::parse(a)?,
-                        prefix: 0,
-                        name: CString::default(),
-                    })
-                })
-                .collect()
+        let reply: api::ListAddresses_Reply = this.client.call(
+            "ListAddresses",
+            &api::ListAddresses_Args {
+                which: which.into(),
+            },
+        )?;
+        if reply.addresses.len() > 4096 {
+            return Err(status_t_FAILED);
         }
+        reply
+            .addresses
+            .iter()
+            .map(|a| {
+                Ok(Item {
+                    host: Host::parse(a)?,
+                    prefix: 0,
+                    name: CString::default(),
+                })
+            })
+            .collect()
     };
     snapshot(operation().unwrap_or_default(), false)
 }
@@ -245,39 +233,38 @@ unsafe extern "C" fn create_address_enumerator(
 unsafe extern "C" fn create_local_subnet_enumerator(
     this: *mut ffi::kernel_net_t,
 ) -> *mut ffi::enumerator_t {
+    let this = unsafe { &*this.cast::<Net>() };
     let operation = || -> Result<Vec<Item>> {
-        unsafe {
-            let reply: api::ListSubnets_Reply = client(this).call("ListSubnets", &Empty {})?;
-            if reply.subnets.len() > 4096 {
-                return Err(status_t_FAILED);
-            }
-            reply
-                .subnets
-                .iter()
-                .map(|s| {
-                    let host = Host::parse(&s.address)?;
-                    let prefix = u8::try_from(s.prefix).map_err(|_| status_t_FAILED)?;
-                    let max = if (*host.0).get_family.unwrap()(host.0) == libc::AF_INET {
-                        32
-                    } else {
-                        128
-                    };
-                    if prefix > max {
-                        return Err(status_t_FAILED);
-                    }
-                    Ok(Item {
-                        host,
-                        prefix,
-                        name: CString::new(s.interface.as_str()).map_err(|_| status_t_FAILED)?,
-                    })
-                })
-                .collect()
+        let reply: api::ListSubnets_Reply = this.client.call("ListSubnets", &Empty {})?;
+        if reply.subnets.len() > 4096 {
+            return Err(status_t_FAILED);
         }
+        reply
+            .subnets
+            .iter()
+            .map(|s| {
+                let host = Host::parse(&s.address)?;
+                let prefix = u8::try_from(s.prefix).map_err(|_| status_t_FAILED)?;
+                let max = if host.family() == libc::AF_INET {
+                    32
+                } else {
+                    128
+                };
+                if prefix > max {
+                    return Err(status_t_FAILED);
+                }
+                Ok(Item {
+                    host,
+                    prefix,
+                    name: CString::new(s.interface.as_str()).map_err(|_| status_t_FAILED)?,
+                })
+            })
+            .collect()
     };
     snapshot(operation().unwrap_or_default(), true)
 }
 
-unsafe extern "C" fn add_ip(
+extern "C" fn add_ip(
     _this: *mut ffi::kernel_net_t,
     _vip: *mut ffi::host_t,
     _prefix: i32,
@@ -285,7 +272,7 @@ unsafe extern "C" fn add_ip(
 ) -> status_t {
     status_t_NOT_SUPPORTED
 }
-unsafe extern "C" fn del_ip(
+extern "C" fn del_ip(
     _this: *mut ffi::kernel_net_t,
     _vip: *mut ffi::host_t,
     _prefix: i32,
@@ -293,7 +280,7 @@ unsafe extern "C" fn del_ip(
 ) -> status_t {
     status_t_NOT_SUPPORTED
 }
-unsafe extern "C" fn route(
+extern "C" fn route(
     _this: *mut ffi::kernel_net_t,
     _dst: ffi::chunk_t,
     _prefix: u8,

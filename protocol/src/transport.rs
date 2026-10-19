@@ -1,45 +1,39 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Bounded, standard Varlink frames shared by the client and server.
-use std::{
-    io,
-    os::{fd::AsRawFd, unix::net::UnixStream},
-};
+use rustix::net::{recv, RecvFlags};
+use std::{io, os::unix::net::UnixStream};
 use zeroize::{Zeroize, Zeroizing};
 pub const MAX_FRAME: usize = 131072;
 fn invalid() -> io::Error {
     io::Error::from_raw_os_error(libc::EINVAL)
 }
-pub fn peer(stream: &UnixStream) -> io::Result<libc::ucred> {
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut _ as _,
-            &mut len,
-        )
-    } < 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    if len as usize != std::mem::size_of_val(&cred) {
-        return Err(invalid());
-    }
-    Ok(cred)
+#[derive(Clone, Copy, Debug)]
+pub struct Peer {
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: i32,
+}
+pub fn peer(stream: &UnixStream) -> io::Result<Peer> {
+    // Across PID namespaces SO_PEERCRED may return pid 0. Keep the raw pid_t:
+    // a NonZero/Pid credential representation would have an invalid invariant.
+    let cred = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)?;
+    Ok(Peer {
+        uid: cred.uid(),
+        gid: cred.gid(),
+        pid: cred.pid(),
+    })
 }
 pub struct Frames {
     pending: Zeroizing<Vec<u8>>,
 }
 impl Frames {
     pub fn read(&mut self, stream: &mut UnixStream) -> io::Result<Zeroizing<Vec<u8>>> {
-        self.read_flags(stream, 0)
+        self.read_flags(stream, RecvFlags::empty())
     }
     pub fn read_flags(
         &mut self,
         stream: &UnixStream,
-        flags: i32,
+        flags: RecvFlags,
     ) -> io::Result<Zeroizing<Vec<u8>>> {
         loop {
             if let Some(end) = self.pending.iter().position(|b| *b == 0) {
@@ -55,13 +49,9 @@ impl Frames {
             }
             let mut bytes = Zeroizing::new([0u8; 4096]);
             let room = bytes.len().min(MAX_FRAME - self.pending.len());
-            let count =
-                unsafe { libc::recv(stream.as_raw_fd(), bytes.as_mut_ptr().cast(), room, flags) };
-            let result = if count < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(count as usize)
-            };
+            let result = recv(stream, &mut bytes[..room], flags)
+                .map(|(n, _)| n)
+                .map_err(io::Error::from);
             match result {
                 Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
                 Ok(n) => self.pending.extend_from_slice(&bytes[..n]),
@@ -132,30 +122,30 @@ mod tests {
         writer.write_all(b"{\"event\":").unwrap();
         assert_eq!(
             frames
-                .read_flags(&reader, libc::MSG_DONTWAIT)
+                .read_flags(&reader, RecvFlags::DONTWAIT)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
         );
         writer.write_all(b"1}\0{\"event\":2}\0{\"event\":").unwrap();
         assert_eq!(
-            &*frames.read_flags(&reader, libc::MSG_DONTWAIT).unwrap(),
+            &*frames.read_flags(&reader, RecvFlags::DONTWAIT).unwrap(),
             b"{\"event\":1}\0"
         );
         assert_eq!(
-            &*frames.read_flags(&reader, libc::MSG_DONTWAIT).unwrap(),
+            &*frames.read_flags(&reader, RecvFlags::DONTWAIT).unwrap(),
             b"{\"event\":2}\0"
         );
         assert_eq!(
             frames
-                .read_flags(&reader, libc::MSG_DONTWAIT)
+                .read_flags(&reader, RecvFlags::DONTWAIT)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
         );
         writer.write_all(b"3}\0").unwrap();
         assert_eq!(
-            &*frames.read_flags(&reader, libc::MSG_DONTWAIT).unwrap(),
+            &*frames.read_flags(&reader, RecvFlags::DONTWAIT).unwrap(),
             b"{\"event\":3}\0"
         );
     }

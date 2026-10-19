@@ -4,6 +4,8 @@
 //! RPC messages contain semantic operations, never caller-supplied Netlink
 //! messages. Linux UAPI structures are encoded in zero-initialized buffers;
 //! no Rust padding or pointers are transmitted to the kernel or the client.
+#![forbid(unsafe_code)]
+
 pub mod backend;
 pub mod error;
 pub mod model;
