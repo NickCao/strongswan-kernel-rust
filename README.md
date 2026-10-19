@@ -370,10 +370,10 @@ The daemon and shared protocol crate use `#![forbid(unsafe_code)]`, including
 the RPC client and socket framing. Linux calls use safe library APIs, and peer
 credentials use Nix's raw PID representation, which also handles a peer PID of
 zero across PID namespaces. [neli](https://docs.rs/neli/0.7.4/neli/)
-handles Netlink sockets, message and attribute serialization, multipart replies,
-ACKs, sequence/PID checks, and multicast notifications. Network discovery and
-XFRM interface operations use its routing types. XFRM payload records,
-attributes, and byte order use
+handles Netlink sockets and headers, multipart replies, ACKs, sequence/PID
+checks, and multicast notifications. Network discovery and XFRM interface
+operations use [netlink-packet-route](https://docs.rs/netlink-packet-route/0.33.0/netlink_packet_route/).
+XFRM requests, SA/policy replies, acquire messages, attributes, and byte order use
 [netlink-packet-xfrm](https://docs.rs/netlink-packet-xfrm/0.5.0/netlink_packet_xfrm/).
 `SA_DIR` uses its generic attribute extension; expiry parsing retains trailing
 interface ID/mark attributes that its high-level expiry message omits.
@@ -391,8 +391,9 @@ The plugin still implements strongSwan's C interfaces. Its remaining unsafe
 code borrows C callback arguments, invokes host functions, manages the exported
 C function tables and variadic enumerators, and configures UDP socket options.
 Validation, RPC calls, counters, and snapshot construction run in safe Rust.
-Privately owned `NonNull` handles pair C object construction with destruction;
-the shared client registry uses `Weak`/`Arc` instead of untyped C pointers.
+Owned and borrowed C objects use [foreign-types](https://docs.rs/foreign-types/0.5.0/foreign_types/)
+to pair construction with the matching strongSwan destructor. The shared
+client registry uses `Weak`/`Arc` instead of untyped C pointers.
 The watcher owns its callback state and event socket and waits for active
 callbacks before releasing them. No pointers or descriptors cross the RPC
 connection.

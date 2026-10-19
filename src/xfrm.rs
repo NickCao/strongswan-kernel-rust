@@ -9,8 +9,9 @@ use crate::{
     netlink::{Message, Netlink, NlFamily, NlmF, Reply},
     rpc_api as rpc,
 };
+use ipnet::IpNet;
 use netlink_packet_core::{DefaultNla, Emitable, NlasIterator, Parseable};
-use netlink_packet_xfrm::{self as packet, XfrmAttrs as Attr};
+use netlink_packet_xfrm::{self as packet, XfrmAttrs as Attr, XfrmMessage};
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -28,18 +29,16 @@ fn missing() -> io::Error {
 fn unsupported() -> io::Error {
     io::Error::from_raw_os_error(libc::EOPNOTSUPP)
 }
-fn encode(value: &impl Emitable) -> Vec<u8> {
-    let mut bytes = vec![0; value.buffer_len()];
-    value.emit(&mut bytes);
-    bytes
+fn message(flags: NlmF, value: &XfrmMessage) -> Message {
+    Message::new(value.message_type(), flags, value)
 }
-fn message(kind: u16, flags: NlmF, value: &impl Emitable) -> Message {
-    Message::new(kind, flags, value)
-}
-fn attributes(bytes: &[u8]) -> io::Result<Vec<Attr>> {
-    NlasIterator::new(bytes)
-        .map(|nla| Attr::parse(&nla.map_err(io::Error::other)?).map_err(io::Error::other))
-        .collect()
+fn host(family: u16, address: packet::Address, port: u16) -> io::Result<Host> {
+    let ip = match family as i32 {
+        libc::AF_INET => address.to_ipv4().into(),
+        libc::AF_INET6 => address.to_ipv6().into(),
+        _ => return Err(invalid()),
+    };
+    Ok(Host { ip, port })
 }
 fn id_attrs(mark: Mark, if_id: u32) -> Vec<Attr> {
     let mut attrs = Vec::new();
@@ -65,10 +64,8 @@ fn sa_id(id: &SaId) -> packet::UserSaId {
         proto: id.proto,
     }
 }
-fn sa_reply(reply: &Reply) -> io::Result<(packet::UserSaInfo, Vec<Attr>)> {
-    let sa = packet::UserSaInfo::parse(&reply.payload).map_err(io::Error::other)?;
-    let attrs = attributes(&reply.payload[sa.buffer_len()..])?;
-    Ok((sa, attrs))
+fn sa_reply(reply: &Reply) -> io::Result<packet::state::ModifyMessage> {
+    packet::state::ModifyMessage::parse(reply.payload.as_slice()).map_err(io::Error::other)
 }
 pub fn selector(src: &Ts, dst: &Ts, interface: &str) -> io::Result<packet::Selector> {
     if src.from.family() != dst.from.family() {
@@ -130,18 +127,18 @@ fn selector_ts(selector: &packet::Selector, source: bool) -> io::Result<Ts> {
         (port, mask)
     };
     Ts::from_subnet(
-        Host::from_kernel(selector.family, &address.addr, 0)?,
+        host(selector.family, *address, 0)?,
         prefix,
         selector.proto,
         port & mask,
         (port & mask) | !mask,
     )
 }
-fn algorithm(name: &str) -> io::Result<[u8; 64]> {
-    if name.is_empty() || name.len() >= 64 || !name.is_ascii() {
+fn algorithm(name: &str) -> io::Result<[u8; packet::XFRM_ALG_NAME_LEN]> {
+    if name.is_empty() || name.len() >= packet::XFRM_ALG_NAME_LEN || !name.is_ascii() {
         return Err(unsupported());
     }
-    let mut bytes = [0; 64];
+    let mut bytes = [0; packet::XFRM_ALG_NAME_LEN];
     bytes[..name.len()].copy_from_slice(name.as_bytes());
     Ok(bytes)
 }
@@ -184,7 +181,18 @@ fn int_algorithm(id: u16) -> Option<(&'static str, Option<u32>)> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PolicyKey(pub Vec<u8>);
+pub struct PolicyKey {
+    src: IpNet,
+    dst: IpNet,
+    src_port: u16,
+    src_port_mask: u16,
+    dst_port: u16,
+    dst_port_mask: u16,
+    protocol: u8,
+    dir: u8,
+    mark: Mark,
+    if_id: u32,
+}
 pub struct PolicyState {
     pub id: PolicyId,
     pub used_by: Vec<PolicyData>,
@@ -230,7 +238,7 @@ impl Xfrm {
         if src.family() != dst.family() || proto != 50 || min == 0 || min > max {
             return Err(invalid());
         }
-        let request = packet::state::AllocSpiMessage {
+        let request = XfrmMessage::AllocSpi(packet::state::AllocSpiMessage {
             spi_info: packet::UserSpiInfo {
                 info: packet::UserSaInfo {
                     saddr: packet::Address::from_ip(&src.ip),
@@ -251,14 +259,11 @@ impl Xfrm {
             } else {
                 Vec::new()
             },
-        };
-        for reply in
-            self.socket
-                .request(&message(packet::XFRM_MSG_ALLOCSPI, NlmF::empty(), &request))?
-        {
+        });
+        for reply in self.socket.request(&message(NlmF::empty(), &request))? {
             if reply.kind == NEWSA {
-                let (sa, _) = sa_reply(&reply)?;
-                let spi = sa.id.spi;
+                let sa = sa_reply(&reply)?;
+                let spi = sa.user_sa_info.id.spi;
                 if spi == 0 {
                     return Err(invalid());
                 }
@@ -274,7 +279,7 @@ impl Xfrm {
                 .allocations
                 .contains(&(id.src.ip, id.dst.ip, id.spi, id.proto))
     }
-    fn sa_message(&self, id: &SaId, data: &AddSa<'_>) -> io::Result<Message> {
+    fn sa_message(&self, id: &SaId, data: &AddSa<'_>) -> io::Result<XfrmMessage> {
         let mut flags = packet::XFRM_STATE_AF_UNSPEC;
         if !data.copy_ecn {
             flags |= packet::XFRM_STATE_NOECN;
@@ -398,18 +403,15 @@ impl Xfrm {
         if self.sa_dir {
             nlas.push(direction(data.inbound));
         }
-        Ok(message(
-            if data.update {
-                packet::XFRM_MSG_UPDSA
-            } else {
-                NEWSA
-            },
-            NlmF::ACK,
-            &packet::state::ModifyMessage {
-                user_sa_info: info,
-                nlas,
-            },
-        ))
+        let request = packet::state::ModifyMessage {
+            user_sa_info: info,
+            nlas,
+        };
+        Ok(if data.update {
+            XfrmMessage::UpdateSa(request)
+        } else {
+            XfrmMessage::AddSa(request)
+        })
     }
 
     pub fn add_sa(&mut self, id: &crate::model::SaId, data: &AddSa<'_>) -> io::Result<()> {
@@ -419,62 +421,61 @@ impl Xfrm {
         if data.update && !self.owned(id) {
             return Err(missing());
         }
-        let mut msg = self.sa_message(id, data)?;
-        let mut result = self.socket.ack(&msg);
-        if matches!(
-            result.as_ref().err().and_then(io::Error::raw_os_error),
-            Some(libc::ENOENT | libc::ESRCH)
-        ) && data.update
-        {
-            msg.kind = NEWSA;
-            result = self.socket.ack(&msg);
+        let request = self.sa_message(id, data)?;
+        let result = self.socket.ack(&message(NlmF::ACK, &request));
+        match (result, request) {
+            (Err(error), XfrmMessage::UpdateSa(sa))
+                if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) =>
+            {
+                self.socket
+                    .ack(&message(NlmF::ACK, &XfrmMessage::AddSa(sa)))?
+            }
+            (result, _) => result?,
         }
-        result?;
         self.sas.insert(id.key());
         self.allocations
             .remove(&(id.src.ip, id.dst.ip, id.spi, id.proto));
         Ok(())
     }
-    fn read_sa(&mut self, id: &SaId) -> io::Result<Reply> {
+    fn read_sa(&mut self, id: &SaId) -> io::Result<packet::state::ModifyMessage> {
         if !self.owned(id) {
             return Err(missing());
         }
         self.socket
             .request(&message(
-                packet::XFRM_MSG_GETSA,
                 NlmF::empty(),
-                &packet::state::DelGetMessage {
+                &XfrmMessage::GetSa(packet::state::DelGetMessage {
                     user_sa_id: sa_id(id),
                     nlas: id_attrs(id.mark, id.if_id),
-                },
+                }),
             ))?
             .into_iter()
             .find(|reply| reply.kind == NEWSA)
             .ok_or_else(missing)
+            .and_then(|reply| sa_reply(&reply))
     }
     pub fn query_sa(&mut self, id: &SaId) -> io::Result<(u64, u64, u64)> {
-        let (sa, attrs) = sa_reply(&self.read_sa(id)?)?;
-        let last = attrs
+        let sa = self.read_sa(id)?;
+        let last = sa
+            .nlas
             .iter()
             .find_map(|attr| match attr {
                 Attr::LastUsed(time) => Some(*time),
                 _ => None,
             })
             .unwrap_or(0);
-        Ok((sa.lifetime_cur.bytes, sa.lifetime_cur.packets, last))
+        let lifetime = sa.user_sa_info.lifetime_cur;
+        Ok((lifetime.bytes, lifetime.packets, last))
     }
     fn delete_one(&mut self, id: &SaId) -> io::Result<()> {
         if !self.owned(id) {
             return Err(missing());
         }
-        let request = packet::state::DelGetMessage {
+        let request = XfrmMessage::DeleteSa(packet::state::DelGetMessage {
             user_sa_id: sa_id(id),
             nlas: id_attrs(id.mark, id.if_id),
-        };
-        match self
-            .socket
-            .ack(&message(packet::XFRM_MSG_DELSA, NlmF::ACK, &request))
-        {
+        });
+        match self.socket.ack(&message(NlmF::ACK, &request)) {
             Ok(()) => (),
             Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => (),
             Err(error) => return Err(error),
@@ -522,12 +523,26 @@ fn nonzero(v: u64) -> u64 {
 
 impl Xfrm {
     pub fn policy_key(id: &PolicyId) -> io::Result<PolicyKey> {
-        let mut b = encode(&selector(&id.src, &id.dst, "")?);
-        b.push(id.dir);
-        b.extend_from_slice(&(id.mark.value & id.mark.mask).to_be_bytes());
-        b.extend_from_slice(&id.mark.mask.to_be_bytes());
-        b.extend_from_slice(&id.if_id.to_be_bytes());
-        Ok(PolicyKey(b))
+        // Use the same canonical networks, protocol and port masks as the
+        // kernel request, without serializing a packet to identify a policy.
+        let sel = selector(&id.src, &id.dst, "")?;
+        Ok(PolicyKey {
+            src: IpNet::new(host(sel.family, sel.saddr, 0)?.ip, sel.prefixlen_s)
+                .map_err(|_| invalid())?,
+            dst: IpNet::new(host(sel.family, sel.daddr, 0)?.ip, sel.prefixlen_d)
+                .map_err(|_| invalid())?,
+            src_port: sel.sport,
+            src_port_mask: sel.sport_mask,
+            dst_port: sel.dport,
+            dst_port_mask: sel.dport_mask,
+            protocol: sel.proto,
+            dir: id.dir,
+            mark: Mark {
+                value: id.mark.value & id.mark.mask,
+                mask: id.mark.mask,
+            },
+            if_id: id.if_id,
+        })
     }
     fn priorities(id: &PolicyId, data: &PolicyData) -> (u32, u32) {
         let (_, sp) = id.src.subnet();
@@ -589,18 +604,16 @@ impl Xfrm {
             }]));
         }
         nlas.extend(id_attrs(id.mark, id.if_id));
-        Ok(message(
-            if update {
-                packet::XFRM_MSG_UPDPOLICY
-            } else {
-                packet::XFRM_MSG_NEWPOLICY
-            },
-            NlmF::ACK,
-            &packet::policy::ModifyMessage {
-                user_policy_info: info,
-                nlas,
-            },
-        ))
+        let request = packet::policy::ModifyMessage {
+            user_policy_info: info,
+            nlas,
+        };
+        let request = if update {
+            XfrmMessage::UpdatePolicy(request)
+        } else {
+            XfrmMessage::AddPolicy(request)
+        };
+        Ok(message(NlmF::ACK, &request))
     }
     pub fn add_policy(&mut self, id: PolicyId, data: PolicyData) -> io::Result<()> {
         let key = Self::policy_key(&id)?;
@@ -622,16 +635,21 @@ impl Xfrm {
         self.policies.insert(key, PolicyState { id, used_by: uses });
         Ok(())
     }
-    fn delete_policy_message(id: &PolicyId) -> io::Result<Message> {
-        let request = packet::policy::DelGetMessage {
+    fn policy_id(id: &PolicyId) -> io::Result<packet::policy::DelGetMessage> {
+        Ok(packet::policy::DelGetMessage {
             user_policy_id: packet::UserPolicyId {
                 selector: selector(&id.src, &id.dst, "")?,
                 direction: id.dir,
                 ..Default::default()
             },
             nlas: id_attrs(id.mark, id.if_id),
-        };
-        Ok(message(packet::XFRM_MSG_DELPOLICY, NlmF::ACK, &request))
+        })
+    }
+    fn delete_policy_message(id: &PolicyId) -> io::Result<Message> {
+        Ok(message(
+            NlmF::ACK,
+            &XfrmMessage::DeletePolicy(Self::policy_id(id)?),
+        ))
     }
     pub fn delete_policy(&mut self, id: &PolicyId, data: &PolicyData) -> io::Result<()> {
         let key = Self::policy_key(id)?;
@@ -659,17 +677,16 @@ impl Xfrm {
         if !self.policies.contains_key(&Self::policy_key(id)?) {
             return Err(missing());
         }
-        let mut request = Self::delete_policy_message(id)?;
-        request.kind = packet::XFRM_MSG_GETPOLICY;
-        request.flags = NlmF::empty();
+        let request = XfrmMessage::GetPolicy(Self::policy_id(id)?);
         let reply = self
             .socket
-            .request(&request)?
+            .request(&message(NlmF::empty(), &request))?
             .into_iter()
             .find(|reply| reply.kind == packet::XFRM_MSG_NEWPOLICY)
             .ok_or_else(missing)?;
-        let info = packet::UserPolicyInfo::parse(&reply.payload).map_err(io::Error::other)?;
-        let time = info.lifetime_cur.use_time;
+        let policy = packet::policy::ModifyMessage::parse(reply.payload.as_slice())
+            .map_err(io::Error::other)?;
+        let time = policy.user_policy_info.lifetime_cur.use_time;
         if time == 0 {
             return Ok(0);
         }
@@ -753,9 +770,9 @@ impl Xfrm {
         };
         match message.kind {
             packet::XFRM_MSG_ACQUIRE => {
-                let acquire = packet::UserAcquire::parse(bytes).map_err(io::Error::other)?;
-                let attrs = attributes(&bytes[acquire.buffer_len()..])?;
-                let reqid = attrs
+                let packet::AcquireMessage { acquire, nlas } =
+                    packet::AcquireMessage::parse(bytes.as_slice()).map_err(io::Error::other)?;
+                let reqid = nlas
                     .iter()
                     .find_map(|attr| match attr {
                         Attr::Template(templates) => {
@@ -764,7 +781,7 @@ impl Xfrm {
                         _ => None,
                     })
                     .unwrap_or(0);
-                let if_id = attrs
+                let if_id = nlas
                     .iter()
                     .find_map(|attr| match attr {
                         Attr::IfId(id) => Some(*id),
@@ -790,13 +807,14 @@ impl Xfrm {
                 // Parse its typed fixed record and use the crate's NLA parser
                 // for the interface ID and mark needed to identify our SA.
                 let expire = packet::UserExpire::parse(bytes).map_err(io::Error::other)?;
-                let attrs = attributes(&bytes[expire.buffer_len()..])?;
                 let sa = expire.state;
-                let dst = Host::from_kernel(sa.family, &sa.id.daddr.addr, 0)?;
-                let src = Host::from_kernel(sa.family, &sa.saddr.addr, 0)?;
+                let dst = host(sa.family, sa.id.daddr, 0)?;
+                let src = host(sa.family, sa.saddr, 0)?;
                 let mut mark = Mark::default();
                 let mut if_id = 0;
-                for attr in attrs {
+                for nla in NlasIterator::new(&bytes[expire.buffer_len()..]) {
+                    let attr =
+                        Attr::parse(&nla.map_err(io::Error::other)?).map_err(io::Error::other)?;
                     match attr {
                         Attr::IfId(id) => if_id = id,
                         Attr::Mark(value) => {
@@ -836,7 +854,7 @@ impl Xfrm {
                 let mapping = packet::UserMapping::parse(bytes).map_err(io::Error::other)?;
                 let spi = mapping.id.spi;
                 let family = mapping.id.family;
-                let dst = Host::from_kernel(family, &mapping.id.daddr.addr, 0)?;
+                let dst = host(family, mapping.id.daddr, 0)?;
                 if mapping.id.proto != 50
                     || !self
                         .sas
@@ -845,7 +863,7 @@ impl Xfrm {
                 {
                     return Ok(None);
                 }
-                let remote = Host::from_kernel(family, &mapping.new_saddr.addr, mapping.new_sport)?;
+                let remote = host(family, mapping.new_saddr, mapping.new_sport)?;
                 event.kind = rpc::Event_kind::mapping;
                 event.mapping = Some(rpc::Mapping {
                     spi: spi.into(),
@@ -862,19 +880,95 @@ impl Xfrm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_keys_follow_canonical_kernel_selectors() {
+        for (network, first, last, prefix) in [
+            ("10.1.0.0", "10.1.0.1", "10.1.0.254", 24),
+            ("2001:db8::", "2001:db8::1", "2001:db8::fffe", 112),
+        ] {
+            let host = Host {
+                ip: network.parse().unwrap(),
+                port: 0,
+            };
+            let id = PolicyId {
+                src: Ts::from_subnet(host.clone(), prefix, 6, 1024, 2047).unwrap(),
+                dst: Ts::from_subnet(host, prefix, 0, 0, u16::MAX).unwrap(),
+                dir: 1,
+                mark: Mark {
+                    value: 0x42,
+                    mask: 0xff,
+                },
+                if_id: 41,
+            };
+            let keys = HashSet::from([Xfrm::policy_key(&id).unwrap()]);
+            // The kernel sees the same prefixes, aligned port range and
+            // protocol even though the caller's traffic selectors differ.
+            let mut equivalent = id.clone();
+            equivalent.src.from.ip = first.parse().unwrap();
+            equivalent.src.to.ip = last.parse().unwrap();
+            equivalent.src.from.port = 123;
+            equivalent.src.from_port = 1025;
+            equivalent.src.to_port = 2046;
+            equivalent.src.proto = 0;
+            equivalent.dst.proto = 6;
+            equivalent.mark.value = 0x1000042;
+            assert!(keys.contains(&Xfrm::policy_key(&equivalent).unwrap()));
+
+            let mut different = id.clone();
+            different.src.to_port = 4095;
+            assert!(!keys.contains(&Xfrm::policy_key(&different).unwrap()));
+            different = id.clone();
+            different.dir = 2;
+            assert!(!keys.contains(&Xfrm::policy_key(&different).unwrap()));
+            different = id.clone();
+            different.if_id += 1;
+            assert!(!keys.contains(&Xfrm::policy_key(&different).unwrap()));
+            different = id.clone();
+            different.mark.mask = 0xffff;
+            assert!(!keys.contains(&Xfrm::policy_key(&different).unwrap()));
+        }
+    }
+
     #[test]
     fn icmp_selectors_use_packet_byte_order() {
-        let host = Host {
-            ip: "10.1.0.0".parse().unwrap(),
-            port: 0,
-        };
-        let src = Ts::from_subnet(host.clone(), 24, 1, 0x0800, 0x0800).unwrap();
-        let dst = Ts::from_subnet(host, 24, 0, 0, 65535).unwrap();
-        let selector = selector(&src, &dst, "").unwrap();
-        assert_eq!(selector.sport, 8);
-        assert_eq!(selector.dport, 0);
-        let bytes = encode(&selector);
-        let parsed = packet::Selector::parse(&bytes).unwrap();
-        assert_eq!(selector_ts(&parsed, true).unwrap().from_port, 0x0800);
+        for (address, prefix, protocol, type_code) in
+            [("10.1.0.0", 24, 1, 0x0800), ("2001:db8::", 64, 58, 0x8001)]
+        {
+            let host = Host {
+                ip: address.parse().unwrap(),
+                port: 0,
+            };
+            let src =
+                Ts::from_subnet(host.clone(), prefix, protocol, type_code, type_code).unwrap();
+            let dst = Ts::from_subnet(host, prefix, 0, 0, u16::MAX).unwrap();
+            let selector = selector(&src, &dst, "").unwrap();
+            assert_eq!(selector.sport, type_code >> 8);
+            assert_eq!(selector.dport, type_code & 0xff);
+            let mut bytes = vec![0; selector.buffer_len()];
+            selector.emit(&mut bytes);
+            let parsed = packet::Selector::parse(&bytes).unwrap();
+            for source in [false, true] {
+                let decoded = selector_ts(&parsed, source).unwrap();
+                assert_eq!(decoded.from.ip, src.from.ip);
+                assert_eq!(decoded.from_port, type_code);
+                assert_eq!(decoded.to_port, type_code);
+            }
+
+            let mut id = PolicyId {
+                src,
+                dst,
+                dir: 1,
+                mark: Mark::default(),
+                if_id: 41,
+            };
+            let keys = HashSet::from([Xfrm::policy_key(&id).unwrap()]);
+            // strongSwan may put the same ICMP type/code on either selector.
+            std::mem::swap(&mut id.src, &mut id.dst);
+            assert!(keys.contains(&Xfrm::policy_key(&id).unwrap()));
+            id.dst.from_port += 1;
+            id.dst.to_port += 1;
+            assert!(!keys.contains(&Xfrm::policy_key(&id).unwrap()));
+        }
     }
 }

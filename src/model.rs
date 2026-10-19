@@ -12,12 +12,6 @@ pub struct Host {
     pub port: u16,
 }
 impl Host {
-    pub fn bytes(&self) -> Vec<u8> {
-        match self.ip {
-            IpAddr::V4(a) => a.octets().to_vec(),
-            IpAddr::V6(a) => a.octets().to_vec(),
-        }
-    }
     pub fn family(&self) -> u16 {
         match self.ip {
             IpAddr::V4(_) => libc::AF_INET as _,
@@ -32,19 +26,12 @@ impl Host {
         }
     }
     pub fn any(family: u16) -> io::Result<Self> {
-        Self::from_kernel(family, &[0; 16], 0)
-    }
-    pub fn from_kernel(family: u16, data: &[u8], port: u16) -> io::Result<Self> {
         let ip = match family as i32 {
-            libc::AF_INET if data.len() >= 4 => {
-                IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&data[..4]).unwrap()))
-            }
-            libc::AF_INET6 if data.len() >= 16 => {
-                IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&data[..16]).unwrap()))
-            }
+            libc::AF_INET => Ipv4Addr::UNSPECIFIED.into(),
+            libc::AF_INET6 => Ipv6Addr::UNSPECIFIED.into(),
             _ => return Err(invalid()),
         };
-        Ok(Self { ip, port })
+        Ok(Self { ip, port: 0 })
     }
     pub fn without_port(&self) -> Self {
         Self {

@@ -202,6 +202,34 @@ def run(binary):
                 rpc("InstallSa",id=b,config=sa_config())
                 rpc("RemoveSa",id=a)
                 assert next(l for l in links() if l["ifname"] == "ranet00000029")["ifindex"] == index
+                # A tracked SA that vanished in the kernel can be installed
+                # again through the update-to-add retry without losing xfrmi.
+                ip("xfrm", "state", "delete", "src", b["src"]["address"], "dst", b["dst"]["address"],
+                   "proto", "esp", "spi", b["spi"])
+                rpc("InstallSa",id=b,config=sa_config(update=True))
+                assert next(l for l in links() if l["ifname"] == "ranet00000029")["ifindex"] == index
+                # Trap policies must forward kernel acquire attributes and
+                # selectors through Varlink for both inner address families.
+                for family, source, destination in [
+                    (socket.AF_INET, "192.0.2.1", "198.18.0.1"),
+                    (socket.AF_INET6, "2001:db8:1::1", "2001:db8:3::1"),
+                ]:
+                    trap = policy(v6=family == socket.AF_INET6)
+                    config = policy_config(spi=0); config["reqid"] = 44 if family == socket.AF_INET6 else 43
+                    rpc("InstallPolicy",id=trap,config=config)
+                    flags = ["-6"] if family == socket.AF_INET6 else []
+                    ip(*flags, "route", "add", destination, "dev", "ranet00000029", "src", source)
+                    with socket.socket(family, socket.SOCK_DGRAM) as udp:
+                        udp.bind((source, 0)); source_port = udp.getsockname()[1]
+                        try: udp.sendto(b"acquire", (destination, 32123))
+                        except BlockingIOError: pass  # No SA exists for this reqid yet.
+                        acquire = raw(event="acquire")["parameters"]["event"]["acquire"]
+                    assert acquire["reqid"] == config["reqid"] and acquire["sequence"] > 0, acquire
+                    for selector, address, port in [(acquire["src"], source, source_port), (acquire["dst"], destination, 32123)]:
+                        assert selector["from"] == selector["to"] == address, acquire
+                        assert selector["protocol"] == 17 and selector["fromPort"] == selector["toPort"] == port, acquire
+                    ip(*flags, "route", "del", destination)
+                    rpc("RemovePolicy",id=trap,config=config)
                 for v6 in [False, True]:
                     for direction in [0,1,2]: rpc("InstallPolicy",id=policy(v6=v6,direction=direction),config=policy_config(spi=b["spi"]))
                 assert rpc("QuerySa",id=b)["bytes"] == "0"
@@ -244,7 +272,7 @@ def run(binary):
                 assert probe.call("OpenSession",dict(interfacesUse="",interfacesIgnore=""))["error"].endswith("SessionBusy")
                 probe.socket.close()
                 wait(lambda: [l["ifname"] for l in links()] == ["foreign"])
-                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, rollback, foreign objects, larval SPI, hard expiry, scoped cleanup and disconnected-client expiry")
+                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, update-to-add retry, IPv4/IPv6 acquire events, rollback, foreign objects, larval SPI, hard expiry, scoped cleanup and disconnected-client expiry")
             except BaseException:
                 log.seek(0); print(log.read(),file=sys.stderr); raise
             finally:
