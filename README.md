@@ -50,17 +50,22 @@ rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
 cargo install cargo-c --version '0.10.26+cargo-0.100.0' --locked
 ```
 
-The plugin must use the **source headers and generated config.h matching the
-installed strongSwan**, including its version, build options, and distribution
-patches. It uses charon's C interfaces, so it is not a version-independent
-binary. StrongSwan's installed development headers only cover libstrongswan;
-they do not supply the libcharon kernel interfaces. Obtain both trees from
-the package's matching source/build artifacts, or from your own strongSwan
-build. Bindgen reads them without modifying or building strongSwan.
+The plugin takes two absolute paths: `STRONGSWAN_SOURCE` points to the full
+strongSwan source tree, and `CONFIG_H_DIR` points to a directory containing
+its generated `config.h`. That directory may contain just `config.h`, copied
+from a matching configured strongSwan tree. Bindgen reads the headers and
+configuration directly; no compiled strongSwan artifacts are needed.
+
+Both inputs must match the **installed strongSwan**, including its version,
+build options, and distribution patches. The plugin uses charon's C interfaces,
+so it is not a version-independent binary. StrongSwan's installed development
+headers only cover libstrongswan; they do not supply the libcharon kernel
+interfaces. Obtain the full source and `config.h` from the package's matching
+artifacts, or from your own configured strongSwan tree.
 
 ```sh
 export STRONGSWAN_SOURCE=/absolute/path/to/strongswan-source
-export STRONGSWAN_BUILD=/absolute/path/to/strongswan-build
+export CONFIG_H_DIR=/absolute/path/to/config-directory
 cargo cbuild -p strongswan-kernel-rust --release --locked --library-type=cdylib
 cargo build -p charon-kernel-daemon --release --locked
 cargo test --locked -p charon-kernel-daemon -p kernel-rust-protocol
@@ -72,9 +77,11 @@ cargo cinstall -p strongswan-kernel-rust --release --locked \
 cargo install --locked --path . --root /usr
 ```
 
-For an in-source strongSwan build, omit `STRONGSWAN_BUILD`; it defaults to
-`STRONGSWAN_SOURCE`. `IPSEC_PIDDIR` defaults to `/run` and controls the plugin's
-default socket location independently of the installation prefix.
+If `config.h` is in the source tree's root, omit `CONFIG_H_DIR`; it defaults to
+`STRONGSWAN_SOURCE`. Changes to `config.h` automatically regenerate the bindings.
+The plugin's default socket is `/run/charon-kernel/charon-kernel.sock`; change
+it at runtime with `charon.plugins.kernel-rust.socket` and the daemon's
+`--socket` option.
 
 cargo-c installs `libstrongswan-kernel-rust.so` under
 `<prefix>/<libdir>/ipsec/plugins`, with the same unversioned SONAME. Select
@@ -117,17 +124,26 @@ privileged bind operation. Do not configure `socket-default.fwmark`, which
 would require SO_MARK on charon's sockets; ranet's `set_mark_out` applies to
 SAs and is supported by the daemon.
 
-Create a dedicated static group, grant the charon service membership, and run
-the daemon in the same network namespace:
+Create a dedicated static group and grant the charon service membership:
 
 ```sh
 groupadd --system ipsec
-charon-kernel-daemon --socket /run/charon-kernel.sock --group ipsec
 ```
 
-The socket's parent directory must permit the charon user to traverse it and
-must prevent untrusted users replacing its entries. The daemon refuses to
-unlink an existing socket path. The socket remains owned by the daemon, has
+Run the daemon in the same network namespace as charon, with systemd managing
+its runtime directory. For example, the daemon service can use:
+
+```ini
+[Service]
+ExecStart=/usr/bin/charon-kernel-daemon --group ipsec
+RuntimeDirectory=charon-kernel
+RuntimeDirectoryMode=0755
+```
+
+The daemon does not create directories. The socket's parent directory must
+permit the charon user to traverse it and prevent untrusted users replacing
+its entries. The daemon refuses to unlink an existing socket path.
+The socket remains owned by the daemon, has
 mode **0660**, and uses the group selected by `--group NAME|GID` (default GID
 0). Linux authorizes connections using filesystem permissions, including
 supplementary groups. There is no configured charon UID. `SO_PEERCRED` binds
@@ -150,7 +166,7 @@ charon {
         }
         kernel-rust {
             load = yes
-            socket = /run/charon-kernel.sock
+            socket = /run/charon-kernel/charon-kernel.sock
             daemon_uid = 0
         }
     }

@@ -8,7 +8,7 @@ The service supports org.varlink.service.GetInfo and
 GetInterfaceDescription. For example:
 
 ```sh
-varlinkctl introspect /run/charon-kernel.sock io.ranet.Kernel
+varlinkctl introspect /run/charon-kernel/charon-kernel.sock io.ranet.Kernel
 ```
 
 Connections are Unix SOCK_STREAM sockets. Each JSON message ends with NUL.

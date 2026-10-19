@@ -43,10 +43,12 @@ pub unsafe fn setting_int(key: &CStr, default: i32) -> i32 {
 /// # Safety
 /// The host library and its settings must be initialized for this call.
 pub unsafe fn config() -> Result<kernel_rust_protocol::client::Config> {
-    let default = CString::new(env!("KERNEL_RUST_SOCKET")).map_err(|_| status_t_FAILED)?;
     unsafe {
         Ok(kernel_rust_protocol::client::Config {
-            path: setting_str(c"%s.plugins.kernel-rust.socket", &default)?,
+            path: setting_str(
+                c"%s.plugins.kernel-rust.socket",
+                c"/run/charon-kernel/charon-kernel.sock",
+            )?,
             daemon_uid: setting_int(c"%s.plugins.kernel-rust.daemon_uid", 0) as u32,
             interfaces_use: setting_str(c"%s.interfaces_use", c"")?,
             interfaces_ignore: setting_str(c"%s.interfaces_ignore", c"")?,

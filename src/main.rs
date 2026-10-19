@@ -24,7 +24,7 @@ use varlink::ConnectionHandler;
 #[command(version, about)]
 struct Args {
     /// Filesystem path for the Varlink socket.
-    #[arg(long, default_value = "/run/charon-kernel.sock")]
+    #[arg(long, default_value = "/run/charon-kernel/charon-kernel.sock")]
     socket: PathBuf,
     /// Socket access group, specified by name or numeric GID.
     #[arg(long, default_value = "0", value_name = "NAME|GID", value_parser = group_id)]
