@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The C watcher boundary; the RPC client and event stream are safe Rust.
 use crate::{ffi, host};
+use foreign_types::ForeignType;
 use kernel_rust_protocol::{
     self as api,
     client::{Client, Events},
@@ -100,7 +101,7 @@ fn dispatch(event: api::Event) {
                             kernel,
                             protocol,
                             spi.to_be(),
-                            dst.as_raw(),
+                            dst.as_ptr(),
                             e.hard,
                         );
                     }
@@ -120,8 +121,8 @@ fn dispatch(event: api::Event) {
                             kernel,
                             libc::IPPROTO_ESP as u8,
                             spi.to_be(),
-                            dst.as_raw(),
-                            remote.as_raw(),
+                            dst.as_ptr(),
+                            remote.as_ptr(),
                         );
                     }
                 }
@@ -136,8 +137,8 @@ fn dispatch(event: api::Event) {
                     u32::try_from(e.sequence),
                 ) {
                     let mut data = ffi::kernel_acquire_data_t {
-                        src: src.as_raw(),
-                        dst: dst.as_raw(),
+                        src: src.as_ptr(),
+                        dst: dst.as_ptr(),
                         label: ptr::null_mut(),
                         cpu: ffi::CPU_ID_MAX,
                         seq,

@@ -4,6 +4,7 @@ use crate::{
     host::{self, Host},
     status_t, status_t_FAILED, status_t_NOT_SUPPORTED, ClientExt, Result,
 };
+use foreign_types::ForeignType;
 use kernel_rust_protocol::{
     self as api,
     client::{Client, Empty},
@@ -67,7 +68,7 @@ unsafe extern "C" fn get_source_addr(
             this.client.call("GetSourceAddress", &parameters)?;
         Host::parse(&reply.address)
     };
-    operation().map_or(ptr::null_mut(), Host::into_raw)
+    operation().map_or(ptr::null_mut(), Host::into_ptr)
 }
 
 unsafe extern "C" fn get_nexthop(
@@ -97,7 +98,7 @@ unsafe extern "C" fn get_nexthop(
         }
         Ok(host)
     };
-    operation().map_or(ptr::null_mut(), Host::into_raw)
+    operation().map_or(ptr::null_mut(), Host::into_ptr)
 }
 
 unsafe extern "C" fn get_interface(
@@ -181,7 +182,7 @@ unsafe fn advance(this: *mut ffi::enumerator_t, args: &mut VaList<'_>) -> bool {
     };
     snapshot.next += 1;
     if let Some(output) = unsafe { args.next_arg::<*mut *mut ffi::host_t>().as_mut() } {
-        *output = item.host.as_raw();
+        *output = item.host.as_ptr();
     }
     if snapshot.subnets {
         if let Some(output) = unsafe { args.next_arg::<*mut u8>().as_mut() } {

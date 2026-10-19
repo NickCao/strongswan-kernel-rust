@@ -59,6 +59,8 @@ def child(prefix, config):
     charon = c.CDLL(str(prefix / "lib/ipsec/libcharon.so"), mode=c.RTLD_GLOBAL)
     library.library_init.argtypes = [c.c_char_p, c.c_char_p]
     library.library_init.restype = c.c_bool
+    library.host_create_from_string.argtypes = [c.c_char_p, c.c_uint16]
+    library.host_create_from_string.restype = c.c_void_p
     charon.libcharon_init.restype = c.c_bool
     assert library.library_init(os.fsencode(config), b"charon")
     assert charon.libcharon_init()
@@ -79,6 +81,23 @@ def child(prefix, config):
             net = c.CFUNCTYPE(c.c_void_p)(features[2].data)()
             assert net
             try:
+                # Source-address callbacks transfer an owned C host to their
+                # caller. Destroy it here, while the input remains borrowed.
+                for destination, expected in [(b"192.0.2.1", "192.0.2.99"),
+                                              (b"2001:db8::1", "2001:db8::63")]:
+                    destination = library.host_create_from_string(destination, 0)
+                    assert destination
+                    try:
+                        source = method(net, Net, "get_source_addr", c.c_void_p,
+                                        c.c_void_p, c.c_void_p)(net, destination, None)
+                        assert source
+                        try:
+                            chunk = method(source, Host, "get_address", Chunk)(source)
+                            assert c.string_at(chunk.ptr, chunk.len) == ipaddress.ip_address(expected).packed
+                        finally:
+                            method(source, Host, "destroy", None)(source)
+                    finally:
+                        method(destination, Host, "destroy", None)(destination)
                 for subnets in (False, True):
                     for forwarded in (False, True):
                         if subnets:
@@ -168,7 +187,7 @@ def run(prefix):
             finally:
                 daemon.terminate()
                 daemon.wait(timeout=10)
-    print("PASS: Rust enumerate/venumerate C ABI, IPv4/IPv6 addresses/subnets, eight clean capability-free sessions without client/daemon descriptor or daemon worker leaks")
+    print("PASS: owned/borrowed C hosts, Rust enumerate/venumerate C ABI, IPv4/IPv6 addresses/subnets, eight clean capability-free sessions without client/daemon descriptor or daemon worker leaks")
 
 
 if __name__ == "__main__":

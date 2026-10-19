@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Ownership and value conversion at charon's C boundary.
 use crate::{ffi, status_t_FAILED, Result};
+use foreign_types::{foreign_type, ForeignType, ForeignTypeRef};
 use kernel_rust_protocol as api;
 use std::{
     ffi::{CStr, CString},
     net::IpAddr,
-    ptr::{self, NonNull},
-    slice,
+    ptr, slice,
 };
 
 // SAFETY throughout this module: pointers are borrowed valid objects supplied
@@ -83,16 +83,8 @@ pub unsafe fn endpoint(host: *mut ffi::host_t) -> Result<api::Endpoint> {
     if host.is_null() {
         return Err(status_t_FAILED);
     }
-    let (address, port) = unsafe {
-        (
-            address((*host).get_address.unwrap()(host))?,
-            (*host).get_port.unwrap()(host),
-        )
-    };
-    Ok(api::Endpoint {
-        address: address.to_string(),
-        port: port.into(),
-    })
+    // SAFETY: borrow the caller's live host for this conversion only.
+    unsafe { HostRef::from_ptr(host) }.to_endpoint()
 }
 
 pub unsafe fn optional_endpoint(host: *mut ffi::host_t) -> Result<Option<api::Endpoint>> {
@@ -103,9 +95,30 @@ pub unsafe fn optional_endpoint(host: *mut ffi::host_t) -> Result<Option<api::En
     }
 }
 
-// Private handles prevent safe Rust from constructing an invalid owning object
-// or changing its pointer. Each successful C constructor has exactly one owner.
-pub struct Host(NonNull<ffi::host_t>);
+foreign_type! {
+    // SAFETY: successful C constructors transfer ownership to these wrappers.
+    // Their destructors match those constructors; borrowed refs never own them.
+    pub unsafe type Host {
+        type CType = ffi::host_t;
+        fn drop = destroy_host;
+    }
+
+    pub unsafe type Selector {
+        type CType = ffi::traffic_selector_t;
+        fn drop = destroy_selector;
+    }
+}
+
+unsafe fn destroy_host(host: *mut ffi::host_t) {
+    // SAFETY: called once by the owning wrapper while the host library is live.
+    unsafe { (*host).destroy.unwrap()(host) }
+}
+
+unsafe fn destroy_selector(selector: *mut ffi::traffic_selector_t) {
+    // SAFETY: called once by the owning wrapper while the host library is live.
+    unsafe { (*selector).destroy.unwrap()(selector) }
+}
+
 impl Host {
     pub fn parse(value: &api::Endpoint) -> Result<Self> {
         // Numeric addresses only: never pass a remote string to the resolver.
@@ -113,25 +126,32 @@ impl Host {
         let port = u16::try_from(value.port).map_err(|_| status_t_FAILED)?;
         let text = CString::new(address.to_string()).map_err(|_| status_t_FAILED)?;
         let host = unsafe { ffi::host_create_from_string(text.as_ptr().cast_mut(), port) };
-        NonNull::new(host).map(Self).ok_or(status_t_FAILED)
-    }
-    pub fn as_raw(&self) -> *mut ffi::host_t {
-        self.0.as_ptr()
-    }
-    pub fn family(&self) -> i32 {
-        // SAFETY: this handle owns a live host made by its C constructor.
-        unsafe { (*self.as_raw()).get_family.unwrap()(self.as_raw()) }
-    }
-    pub fn into_raw(self) -> *mut ffi::host_t {
-        let raw = self.as_raw();
-        std::mem::forget(self);
-        raw
+        if host.is_null() {
+            return Err(status_t_FAILED);
+        }
+        // SAFETY: the constructor returned a live, uniquely owned host.
+        Ok(unsafe { Self::from_ptr(host) })
     }
 }
-impl Drop for Host {
-    fn drop(&mut self) {
-        // SAFETY: only parse() can construct this owning handle.
-        unsafe { (*self.as_raw()).destroy.unwrap()(self.as_raw()) }
+
+impl HostRef {
+    pub fn family(&self) -> i32 {
+        let host = self.as_ptr();
+        // SAFETY: owned and borrowed wrappers both refer to live C hosts.
+        unsafe { (*host).get_family.unwrap()(host) }
+    }
+    fn to_endpoint(&self) -> Result<api::Endpoint> {
+        let host = self.as_ptr();
+        let (address, port) = unsafe {
+            (
+                address((*host).get_address.unwrap()(host))?,
+                (*host).get_port.unwrap()(host),
+            )
+        };
+        Ok(api::Endpoint {
+            address: address.to_string(),
+            port: port.into(),
+        })
     }
 }
 
@@ -139,32 +159,11 @@ pub unsafe fn selector(ts: *mut ffi::traffic_selector_t) -> Result<api::Selector
     if ts.is_null() {
         return Err(status_t_FAILED);
     }
-    let (from, to, protocol, first, last) = unsafe {
-        (
-            address((*ts).get_from_address.unwrap()(ts))?,
-            address((*ts).get_to_address.unwrap()(ts))?,
-            (*ts).get_protocol.unwrap()(ts),
-            (*ts).get_from_port.unwrap()(ts),
-            (*ts).get_to_port.unwrap()(ts),
-        )
-    };
-    if from.is_ipv4() != to.is_ipv4() {
-        return Err(status_t_FAILED);
-    }
-    Ok(api::Selector {
-        from: from.to_string(),
-        to: to.to_string(),
-        protocol: protocol.into(),
-        fromPort: first.into(),
-        toPort: last.into(),
-    })
+    // SAFETY: borrow the caller's live selector for this conversion only.
+    unsafe { SelectorRef::from_ptr(ts) }.to_selector()
 }
 
-pub struct Selector(NonNull<ffi::traffic_selector_t>);
 impl Selector {
-    pub fn as_raw(&self) -> *mut ffi::traffic_selector_t {
-        self.0.as_ptr()
-    }
     pub fn parse(value: &api::Selector) -> Result<Self> {
         let from = Host::parse(&api::Endpoint {
             address: value.from.clone(),
@@ -191,23 +190,46 @@ impl Selector {
         };
         // SAFETY: both hosts are private owning handles that stay alive for
         // this call. The C selector constructor copies their address chunks.
-        unsafe {
-            let ts = ffi::traffic_selector_create_from_bytes(
+        let ts = unsafe {
+            ffi::traffic_selector_create_from_bytes(
                 protocol,
                 kind,
-                (*from.as_raw()).get_address.unwrap()(from.as_raw()),
+                (*from.as_ptr()).get_address.unwrap()(from.as_ptr()),
                 first,
-                (*to.as_raw()).get_address.unwrap()(to.as_raw()),
+                (*to.as_ptr()).get_address.unwrap()(to.as_ptr()),
                 last,
-            );
-            NonNull::new(ts).map(Self).ok_or(status_t_FAILED)
+            )
+        };
+        if ts.is_null() {
+            return Err(status_t_FAILED);
         }
+        // SAFETY: the constructor returned a live, uniquely owned selector.
+        Ok(unsafe { Self::from_ptr(ts) })
     }
 }
-impl Drop for Selector {
-    fn drop(&mut self) {
-        // SAFETY: only parse() can construct this owning handle.
-        unsafe { (*self.as_raw()).destroy.unwrap()(self.as_raw()) }
+
+impl SelectorRef {
+    fn to_selector(&self) -> Result<api::Selector> {
+        let ts = self.as_ptr();
+        let (from, to, protocol, first, last) = unsafe {
+            (
+                address((*ts).get_from_address.unwrap()(ts))?,
+                address((*ts).get_to_address.unwrap()(ts))?,
+                (*ts).get_protocol.unwrap()(ts),
+                (*ts).get_from_port.unwrap()(ts),
+                (*ts).get_to_port.unwrap()(ts),
+            )
+        };
+        if from.is_ipv4() != to.is_ipv4() {
+            return Err(status_t_FAILED);
+        }
+        Ok(api::Selector {
+            from: from.to_string(),
+            to: to.to_string(),
+            protocol: protocol.into(),
+            fromPort: first.into(),
+            toPort: last.into(),
+        })
     }
 }
 
