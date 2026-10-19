@@ -208,7 +208,9 @@ pub struct Xfrm {
 }
 impl Xfrm {
     pub fn new() -> io::Result<Self> {
-        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;
+        // The service's ProcSubset=pid sandbox hides global /proc files.
+        let uname = rustix::system::uname();
+        let release = uname.release().to_str().map_err(io::Error::other)?;
         let mut parts = release
             .trim()
             .split('.')

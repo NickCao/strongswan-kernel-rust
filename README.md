@@ -105,8 +105,15 @@ capabilities. The kernel daemon runs as a
 separate dynamic user with only `CAP_NET_ADMIN`. Both services use the static
 `ipsec` group for their sockets; change it with `services.charon-kernel.group`.
 Systemd manages their runtime directories.
-The service restricts filesystems, namespaces, syscalls, and socket families;
-only `AF_UNIX` and `AF_NETLINK` are allowed in the kernel daemon.
+
+The module applies a shared systemd sandbox to both services: a read-only
+filesystem with private temporary directories and devices, private IPC,
+hidden foreign processes and global `/proc` files, no writable executable
+memory, and a native syscall allow list excluding kernel keyring operations.
+Realtime scheduling is blocked and core dump limits are zero. Runtime
+directories use mode 0750 and the static access group. Charon permits Unix,
+IPv4, IPv6 and Netlink sockets; the kernel daemon permits only Unix and
+Netlink sockets.
 
 StrongSwan pulls in the kernel service with `BindsTo` and `After` and waits
 for its readiness notification after the socket is ready. `PartOf` propagates
@@ -288,7 +295,7 @@ CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=yes
 RuntimeDirectory=charon-kernel
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=0750
 ```
 
 The daemon does not create directories. The socket's parent directory must
@@ -329,17 +336,18 @@ Start charon as its unprivileged user with all capability sets removed; the
 integration test below includes an executable example.
 
 For a systemd-managed strongSwan service, `DynamicUser=yes` works with a
-[static supplementary group](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#SupplementaryGroups=).
+[static socket access group](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#User=).
 For example, add this to the `charon-systemd`
 service, alongside its existing executable and configuration:
 
 ```ini
 [Service]
 DynamicUser=yes
-SupplementaryGroups=ipsec
+Group=ipsec
 CapabilityBoundingSet=
 AmbientCapabilities=
 RuntimeDirectory=strongswan
+RuntimeDirectoryMode=0750
 ```
 
 Keep the kernel daemon in a separate service. Its protected socket directory

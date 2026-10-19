@@ -7,6 +7,36 @@ self:
 }:
 let
   cfg = config.services.charon-kernel;
+  hardening = {
+    NoNewPrivileges = true;
+    ProtectSystem = "strict";
+    ProtectHome = true;
+    PrivateTmp = "disconnected";
+    PrivateDevices = true;
+    PrivateIPC = true;
+    ProtectKernelTunables = true;
+    ProtectKernelModules = true;
+    ProtectKernelLogs = true;
+    ProtectControlGroups = true;
+    ProtectClock = true;
+    ProtectHostname = true;
+    ProtectProc = "invisible";
+    ProcSubset = "pid";
+    RestrictNamespaces = true;
+    RestrictRealtime = true;
+    RestrictSUIDSGID = true;
+    LockPersonality = true;
+    MemoryDenyWriteExecute = true;
+    SystemCallArchitectures = "native";
+    SystemCallFilter = [
+      "@system-service"
+      "~@keyring"
+    ];
+    SystemCallErrorNumber = "EPERM";
+    UMask = "0077";
+    LimitCORE = 0;
+    RuntimeDirectoryMode = "0750";
+  };
 in
 {
   options.services.charon-kernel = {
@@ -57,12 +87,19 @@ in
     systemd.services.strongswan-swanctl = {
       bindsTo = [ "charon-kernel.service" ];
       after = [ "charon-kernel.service" ];
-      serviceConfig = {
+      serviceConfig = hardening // {
         DynamicUser = lib.mkDefault true;
         Group = lib.mkDefault cfg.group;
         CapabilityBoundingSet = lib.mkDefault "";
         AmbientCapabilities = lib.mkDefault "";
         RuntimeDirectory = "strongswan";
+        RestrictAddressFamilies = [
+          "AF_UNIX"
+          "AF_INET"
+          "AF_INET6"
+          # glibc address-family discovery during hostname resolution.
+          "AF_NETLINK"
+        ];
       };
     };
 
@@ -70,7 +107,7 @@ in
       description = "strongSwan Rust kernel backend";
       partOf = [ "strongswan-swanctl.service" ];
       unitConfig.StopWhenUnneeded = true;
-      serviceConfig = {
+      serviceConfig = hardening // {
         Type = "notify";
         ExecStart = lib.escapeShellArgs [
           "${cfg.package}/bin/charon-kernel-daemon"
@@ -84,36 +121,15 @@ in
           cfg.masterDevice
         ];
         RuntimeDirectory = "charon-kernel";
-        RuntimeDirectoryMode = "0755";
         DynamicUser = true;
         User = "charon-kernel";
         Group = cfg.group;
         CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
         AmbientCapabilities = [ "CAP_NET_ADMIN" ];
-        NoNewPrivileges = true;
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        PrivateTmp = true;
-        PrivateDevices = true;
-        ProtectKernelTunables = true;
-        ProtectKernelModules = true;
-        ProtectKernelLogs = true;
-        ProtectControlGroups = true;
-        ProtectClock = true;
-        ProtectHostname = true;
-        ProtectProc = "invisible";
         RestrictAddressFamilies = [
           "AF_UNIX"
           "AF_NETLINK"
         ];
-        RestrictNamespaces = true;
-        RestrictSUIDSGID = true;
-        LockPersonality = true;
-        MemoryDenyWriteExecute = true;
-        SystemCallArchitectures = "native";
-        SystemCallFilter = [ "@system-service" ];
-        SystemCallErrorNumber = "EPERM";
-        UMask = "0077";
       };
     };
   };

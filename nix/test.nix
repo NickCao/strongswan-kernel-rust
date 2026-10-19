@@ -92,6 +92,12 @@ let
         pkgs.python3
         pkgs.util-linux
       ];
+      systemd.services = lib.genAttrs [ "strongswan-swanctl" "charon-kernel" ] (name: {
+        postStart =
+          "${pkgs.python3}/bin/python3 ${../tests/hardening.py} "
+          + (if name == "strongswan-swanctl" then "strongswan" else name)
+          + " ${pkgs.keyutils}/bin/keyctl";
+      });
       systemd.network = {
         enable = true;
         netdevs = {
@@ -238,6 +244,18 @@ in
             assert 61184 <= ike_uid <= 65519 and ike_uid != backend_uid
             for field in capability_fields:
                 assert int(ike[field], 16) == 0, ike
+            host_ipc = machine.succeed("readlink /proc/1/ns/ipc").strip()
+            service_ipc = []
+            for unit, runtime in [("charon-kernel.service", "charon-kernel"),
+                                  ("strongswan-swanctl.service", "strongswan")]:
+                pid = property(machine, unit, "MainPID")
+                service_ipc.append(machine.succeed(f"readlink /proc/{pid}/ns/ipc").strip())
+                machine.succeed(f"journalctl -u {unit} --no-pager | grep -F 'sandbox probe passed'")
+                assert machine.succeed(f"stat -c %a /run/{runtime}").strip() == "750"
+            assert host_ipc not in service_ipc and len(set(service_ipc)) == 2
+            assert set(property(machine, "strongswan-swanctl.service", "RestrictAddressFamilies").split()) == {
+                "AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"
+            }
             statistics = ctl(machine, "--stats")
             assert "kernel-rust" in statistics and "kernel-netlink" not in statistics
             assert not links(machine) and not spis(machine)
