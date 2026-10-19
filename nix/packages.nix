@@ -71,6 +71,7 @@ let
   cargoDeps = rustPlatform.importCargoLock { lockFile = ../Cargo.lock; };
   common = {
     inherit version src cargoDeps;
+    buildInputs = [ pkgs.libcap ];
     meta = {
       description = "Rust kernel backend for strongSwan over Varlink";
       license = lib.licenses.gpl2Plus;
