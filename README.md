@@ -467,6 +467,28 @@ is an experimental backend with a coordinated restart requirement: stop
 protected traffic before removing leftover objects and restarting the pair.
 Routes through deleted interfaces disappear with the links.
 
+Crash recovery is deferred. Proposed follow-up work is:
+
+- If charon crashes while the daemon survives, retire the failed session,
+  stop its policy repairs, and remove its owned SAs, policies, larval SPI
+  reservations, IKE bypasses and interfaces. Accept a replacement session
+  only after cleanup succeeds. Graceful daemon shutdown must wait for this
+  cleanup, including when systemd stops the daemon after charon exits.
+- If the daemon crashes, systemd already stops charon, but the kernel objects
+  can outlive both processes. Recovery needs ownership information that
+  survives a daemon restart, such as a journal of object identities and
+  pending mutations, without encryption keys. Its storage must survive
+  service cleanup and DynamicUser changes. Startup would resolve interrupted
+  operations and remove recorded leftovers before accepting a new session;
+  ambiguous ownership must not cause unrelated objects to be deleted.
+- Reload connection configuration and negotiate fresh IKE/CHILD_SAs after
+  cleanup. Preserving established SAs across crashes is outside this proposal.
+
+Verification should kill charon and the daemon separately with active tunnels,
+then check cleanup, successful tunnel reestablishment, and preservation of
+unrelated kernel objects. Interrupted cleanup and journal operations also need
+coverage before automatic daemon-crash recovery is enabled.
+
 ## Verification
 
 Tested with an unmodified strongSwan 6.1.0 checkout, with the plugin and
