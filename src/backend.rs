@@ -3,8 +3,9 @@ use crate::{
     error::invalid,
     model::*,
     network::{self, Network},
+    policy::Policies,
     rpc_api as rpc,
-    xfrm::Xfrm,
+    xfrm::{LinuxPolicies, Xfrm},
 };
 use std::{collections::HashMap, io};
 use zeroize::Zeroizing;
@@ -16,6 +17,7 @@ struct Interface {
 pub struct Backend {
     pub xfrm: Xfrm,
     pub net: Network,
+    pub policies: Policies<LinuxPolicies>,
     interfaces: HashMap<u32, Interface>,
     prefix: String,
     master_device: Option<String>,
@@ -47,6 +49,7 @@ impl Backend {
         Ok(Self {
             xfrm: Xfrm::new()?,
             net,
+            policies: Policies::new(LinuxPolicies::new()?),
             interfaces: HashMap::new(),
             prefix,
             master_device,
@@ -168,11 +171,11 @@ impl Backend {
     }
     pub fn close(&mut self) -> io::Result<()> {
         // Remove bypasses only after all tunnel objects are gone.
-        if !self.xfrm.sas.is_empty() || self.xfrm.has_tunnel_policies() {
+        if !self.xfrm.sas.is_empty() || self.policies.has_tunnel_policies() {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
         self.flush_sas()?;
-        self.xfrm.remove_bypasses()
+        self.policies.remove_bypasses()
     }
 }
 pub fn number<T: TryFrom<i64>>(n: i64) -> io::Result<T> {

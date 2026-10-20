@@ -431,20 +431,32 @@ reservations and IKE bypass policies, and permits a new session. Flushes are
 restricted to session-owned objects; flushing tunnel policies preserves IKE
 port bypasses until close.
 
-External changes to kernel SAs, policies, or XFRM interfaces are not
-automatically reconciled. The daemon tracks ownership in memory without
-periodically comparing it with kernel state, and does not handle external
-SA/policy deletion or flush notifications. Commands such as
-`ip xfrm state flush` or `ip xfrm policy flush` can leave those records out
-of sync with the kernel. Missing SAs produce query errors without triggering
-recovery, and interface cleanup still follows the recorded SA ownership.
-An externally deleted XFRM interface is not automatically recreated.
+While the session is connected, missing or changed owned policies are repaired
+from the current desired policy records, including IKE port bypasses. Policy
+notifications are coalesced over 100 ms, and an audit runs every five seconds
+to catch missed notifications. An external `ip xfrm policy flush` is therefore
+recoverable without replacing SAs or interfaces. Unchanged policies are not
+rewritten; kernel-assigned indices, usage counters, timestamps, attribute order
+and omitted default attributes are excluded from configuration comparisons.
+Inventory and repairs hold the same backend lock as policy installation and
+deletion, so a pending repair cannot restore an obsolete rekey template or a
+policy that strongSwan has removed. Unrelated policies are left alone.
 
-A successful rekey may replace missing SAs or refresh related policies, and
-teardown can clear stale ownership records. These lifecycle operations do
-not guarantee eventual reconciliation; mismatches can persist indefinitely.
-For missing SAs or policies, tear down and reestablish the affected CHILD_SAs
-through strongSwan.
+The policy controller in `src/policy.rs` owns desired policies and shared
+references. Its `PolicyKernel` trait abstracts inventory, configuration
+comparison, writes, deletion and usage queries. `LinuxPolicies` implements
+that trait using typed XFRM messages; another device backend can reuse the
+controller with its own inventory and policy keys. SA handling, interface
+management and network discovery remain in their existing Linux implementations.
+
+External changes to kernel SAs or XFRM interfaces are not automatically
+reconciled. An external `ip xfrm state flush` can leave SA ownership records
+out of sync with the kernel. Missing SAs produce query errors without
+triggering recovery, and interface cleanup still follows recorded SA
+ownership. An externally deleted XFRM interface is not automatically recreated.
+A successful rekey or teardown may clear some drift, but there is no guarantee
+of eventual reconciliation for these objects. Reestablish the affected
+CHILD_SAs through strongSwan to recover missing SAs.
 
 If charon or its event connection disappears unexpectedly, installed tunnel
 objects are preserved and replacement sessions are rejected. Hard expiry
@@ -480,7 +492,8 @@ unshare --net -- python3 tests/tunnel.py /tmp/strongswan-install --dynamic-user 
 The RPC test checks socket group permissions and a rejected nonmember,
 standard introspection (also with varlinkctl when installed), a
 capability-free client, address scope/type filtering, multihomed source
-selection and egress-interface exclusions, ICMP policy priorities, validation,
+selection and egress-interface exclusions, ICMP policy priorities, policy
+deletion/modification/flush repair, rekey references and teardown, validation,
 interface rollback, foreign objects, overlapping SAs, scoped flushes (including missing policies),
 larval allocation, hard expiry, and expiry after losing the client. The tunnel tests use
 capability-free charons, Ed25519 raw public keys, ranet's wildcard IPv4/IPv6

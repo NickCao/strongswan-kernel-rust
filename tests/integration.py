@@ -276,6 +276,49 @@ def run(binary):
                     assert priorities[1] < priorities[0], priorities
                 for v6 in [False, True]:
                     for direction in [0,1,2]: rpc("InstallPolicy",id=policy(v6=v6,direction=direction),config=policy_config(spi=b["spi"]))
+                # Reconciliation repairs only desired policies. Exercise the
+                # real kernel inventory, including normalized bypass defaults.
+                foreign_policy = ["src", "203.0.113.0/24", "dst", "203.0.114.0/24",
+                                  "dir", "out", "if_id", "77"]
+                ip("xfrm", "policy", "add", *foreign_policy, "priority", "1234", "action", "block")
+                def policy_specs():
+                    return set(re.split(r"(?=^src )", ip("xfrm", "policy"), flags=re.M)[1:])
+                def outbound_policy():
+                    return subprocess.run(["ip", "-s", "xfrm", "policy", "get",
+                        "src", "0.0.0.0/0", "dst", "0.0.0.0/0", "dir", "out", "if_id", "41"],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False).stdout
+                expected = policy_specs()
+                assert len(expected) == 11, expected
+                # Suppress background traffic before XFRM, so an SA's replay
+                # counters cannot advance during comparison.
+                subprocess.run(["tc", "qdisc", "add", "dev", "ranet00000029", "clsact"], check=True)
+                subprocess.run(["tc", "filter", "add", "dev", "ranet00000029", "egress",
+                                "matchall", "action", "drop"], check=True)
+                original_states = states()
+                original_add_time = re.search(r"\badd (.+) use ", outbound_policy())[1]
+                time.sleep(5.3)  # At least one periodic audit, without changes.
+                assert re.search(r"\badd (.+) use ", outbound_policy())[1] == original_add_time
+                assert policy_specs() == expected
+                ip("xfrm", "policy", "delete", "src", "0.0.0.0/0", "dst", "0.0.0.0/0", "dir", "out", "if_id", "41")
+                wait(lambda: policy_specs() == expected)
+                ip("xfrm", "policy", "update", "src", "0.0.0.0/0", "dst", "0.0.0.0/0",
+                   "dir", "out", "if_id", "41", "priority", "7", "action", "block")
+                wait(lambda: policy_specs() == expected)
+                # A newer reference takes precedence. After it is removed,
+                # pending repair must use the surviving reference's SPI.
+                for attempt in range(20):
+                    replacement = policy_config(spi=0x20000 + attempt)
+                    rpc("InstallPolicy",id=policy(),config=replacement)
+                    ip("xfrm", "policy", "delete", "src", "0.0.0.0/0", "dst", "0.0.0.0/0", "dir", "out", "if_id", "41")
+                    rpc("RemovePolicy",id=policy(),config=replacement)
+                wait(lambda: policy_specs() == expected)
+                ip("xfrm", "policy", "flush")
+                # The admin also flushed the foreign policy; it is not ours
+                # to recreate. Restore all six tunnel and four bypass policies.
+                expected = {spec for spec in expected if "if_id 0x4d" not in spec}
+                wait(lambda: policy_specs() == expected)
+                assert len(expected) == 10
+                assert states() == original_states, "policy repair must not modify SAs"
                 unused = rpc("QuerySa",id=b)
                 assert (unused["bytes"], unused["packets"], unused["lastUse"]) == ("0", "0", 0), unused
                 assert rpc("QueryPolicy",id=policy())["lastUse"] == 0
@@ -286,6 +329,9 @@ def run(binary):
                 rpc("FlushPolicies")
                 # Flush only session tunnel policies: port bypass must survive.
                 assert "priority 32" in ip("xfrm","policy")
+                after_flush = policy_specs()
+                time.sleep(5.3)
+                assert policy_specs() == after_flush and len(after_flush) == 4, "deleted policies must not return"
                 # Inbound larval SPI allocation and conversion to an interface SA.
                 spi = rpc("AllocateSpi",src=endpoint(),dst=endpoint("192.0.2.2"),minimum=0xc0000000,maximum=0xcfffffff)["spi"]
                 inbound = sa_id(spi=spi,interface=43)
@@ -342,7 +388,7 @@ def run(binary):
                 assert probe.call("OpenSession",dict(interfacesUse="",interfacesIgnore=""))["error"].endswith("SessionBusy")
                 probe.socket.close()
                 wait(lambda: [l["ifname"] for l in links()] == ["foreign"])
-                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, address scope/type filtering, multihomed sources and egress-interface exclusions, ICMP policy priorities, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, update-to-add retry, IPv4/IPv6 acquire events, rollback, foreign objects, larval SPI, hard expiry, scoped cleanup including missing policies, and disconnected-client expiry")
+                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, address scope/type filtering, multihomed sources and egress-interface exclusions, ICMP policy priorities, policy deletion/modification/flush repair without SA changes, rekey references and teardown, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, update-to-add retry, IPv4/IPv6 acquire events, rollback, foreign objects, larval SPI, hard expiry, scoped cleanup including missing policies, and disconnected-client expiry")
             except BaseException:
                 log.seek(0); print(log.read(),file=sys.stderr); raise
             finally:

@@ -7,10 +7,11 @@ use crate::{
     error::invalid,
     model::*,
     netlink::{Message, Netlink, NlFamily, NlmF, Reply},
+    policy::{Policies, PolicyKernel, PolicyStatus},
     rpc_api as rpc,
 };
 use ipnet::IpNet;
-use netlink_packet_core::{DefaultNla, Emitable, NlasIterator, Parseable};
+use netlink_packet_core::{DefaultNla, Emitable, Nla, NlasIterator, Parseable};
 use netlink_packet_xfrm::{self as packet, XfrmAttrs as Attr, XfrmMessage};
 use std::{
     collections::{HashMap, HashSet},
@@ -212,16 +213,10 @@ pub struct PolicyKey {
     mark: Mark,
     if_id: u32,
 }
-pub struct PolicyState {
-    pub id: PolicyId,
-    pub used_by: Vec<PolicyData>,
-}
 pub struct Xfrm {
     socket: Netlink,
     pub sas: HashSet<crate::model::SaId>,
     allocations: HashSet<(IpAddr, IpAddr, u32, u8)>,
-    pub policies: HashMap<PolicyKey, PolicyState>,
-    bypasses: Vec<(PolicyId, PolicyData)>,
     pub sa_dir: bool,
     pub lastused: bool,
 }
@@ -239,8 +234,6 @@ impl Xfrm {
             socket: Netlink::new(NlFamily::Xfrm)?,
             sas: HashSet::new(),
             allocations: HashSet::new(),
-            policies: HashMap::new(),
-            bypasses: Vec::new(),
             sa_dir: version >= (6, 10),
             lastused: version >= (6, 2),
         })
@@ -547,11 +540,27 @@ fn nonzero(v: u64) -> u64 {
     }
 }
 
-impl Xfrm {
+pub struct LinuxPolicies {
+    socket: Netlink,
+}
+impl LinuxPolicies {
+    pub fn new() -> io::Result<Self> {
+        Ok(Self {
+            socket: Netlink::new(NlFamily::Xfrm)?,
+        })
+    }
     pub fn policy_key(id: &PolicyId) -> io::Result<PolicyKey> {
         // Use the same canonical networks, protocol and port masks as the
         // kernel request, without serializing a packet to identify a policy.
         let sel = selector(&id.src, &id.dst, "")?;
+        Self::selector_key(&sel, id.dir, id.mark, id.if_id)
+    }
+    fn selector_key(
+        sel: &packet::Selector,
+        dir: u8,
+        mark: Mark,
+        if_id: u32,
+    ) -> io::Result<PolicyKey> {
         Ok(PolicyKey {
             src: IpNet::new(host(sel.family, sel.saddr, 0)?.ip, sel.prefixlen_s)
                 .map_err(|_| invalid())?,
@@ -562,12 +571,12 @@ impl Xfrm {
             dst_port: sel.dport,
             dst_port_mask: sel.dport_mask,
             protocol: sel.proto,
-            dir: id.dir,
+            dir,
             mark: Mark {
-                value: id.mark.value & id.mark.mask,
-                mask: id.mark.mask,
+                value: mark.value & mark.mask,
+                mask: mark.mask,
             },
-            if_id: id.if_id,
+            if_id,
         })
     }
     fn priorities(key: &PolicyKey, data: &PolicyData) -> (u32, u32) {
@@ -590,7 +599,7 @@ impl Xfrm {
             auto,
         )
     }
-    fn policy_message(id: &PolicyId, data: &PolicyData, update: bool) -> io::Result<Message> {
+    fn policy_spec(id: &PolicyId, data: &PolicyData) -> io::Result<packet::policy::ModifyMessage> {
         let info = packet::UserPolicyInfo {
             selector: selector(&id.src, &id.dst, "")?,
             priority: Self::priorities(&Self::policy_key(id)?, data).0,
@@ -622,36 +631,19 @@ impl Xfrm {
             }]));
         }
         nlas.extend(id_attrs(id.mark, id.if_id));
-        let request = packet::policy::ModifyMessage {
+        Ok(packet::policy::ModifyMessage {
             user_policy_info: info,
             nlas,
-        };
+        })
+    }
+    fn policy_message(id: &PolicyId, data: &PolicyData, update: bool) -> io::Result<Message> {
+        let request = Self::policy_spec(id, data)?;
         let request = if update {
             XfrmMessage::UpdatePolicy(request)
         } else {
             XfrmMessage::AddPolicy(request)
         };
         Ok(message(NlmF::ACK, &request))
-    }
-    pub fn add_policy(&mut self, id: PolicyId, data: PolicyData) -> io::Result<()> {
-        let key = Self::policy_key(&id)?;
-        let current = self.policies.get(&key);
-        let mut uses = current.map(|p| p.used_by.clone()).unwrap_or_default();
-        let priority = Self::priorities(&key, &data);
-        let pos = uses
-            .iter()
-            .position(|p| {
-                let existing = Self::priorities(&key, p);
-                existing > priority || (existing == priority && (p.reqid == 0 || data.reqid != 0))
-            })
-            .unwrap_or(uses.len());
-        if pos == 0 {
-            self.socket
-                .ack(&Self::policy_message(&id, &data, current.is_some())?)?;
-        }
-        uses.insert(pos, data);
-        self.policies.insert(key, PolicyState { id, used_by: uses });
-        Ok(())
     }
     fn policy_id(id: &PolicyId) -> io::Result<packet::policy::DelGetMessage> {
         Ok(packet::policy::DelGetMessage {
@@ -678,28 +670,106 @@ impl Xfrm {
             Err(error) => Err(error),
         }
     }
-    pub fn delete_policy(&mut self, id: &PolicyId, data: &PolicyData) -> io::Result<()> {
-        let key = Self::policy_key(id)?;
-        let state = self.policies.get(&key).ok_or_else(missing)?;
-        let mut uses = state.used_by.clone();
-        let pos = uses.iter().position(|p| p == data).ok_or_else(missing)?;
-        uses.remove(pos);
-        if uses.is_empty() {
-            self.remove_kernel_policy(&state.id)?;
-            self.policies.remove(&key);
-        } else {
-            if pos == 0 {
-                self.socket
-                    .ack(&Self::policy_message(&state.id, &uses[0], true)?)?;
+    fn policy_configuration(
+        mut policy: packet::policy::ModifyMessage,
+    ) -> packet::policy::ModifyMessage {
+        policy.user_policy_info.index = 0;
+        policy.user_policy_info.lifetime_cur = packet::Lifetime::default();
+        // The kernel adds default policy type and may omit zero-valued
+        // attributes. Attribute order and usage metadata are not configuration.
+        policy.nlas.retain(|attr| match attr {
+            Attr::PolicyType(value) => value.ptype != 0,
+            Attr::Mark(value) => value.mask != 0,
+            Attr::IfId(value) => *value != 0,
+            Attr::Template(value) => !value.is_empty(),
+            Attr::Pad() => false,
+            _ => true,
+        });
+        for attr in &mut policy.nlas {
+            if let Attr::Mark(mark) = attr {
+                mark.value &= mark.mask;
             }
-            self.policies.get_mut(&key).unwrap().used_by = uses;
         }
-        Ok(())
+        policy.nlas.sort_by_key(Nla::kind);
+        policy
     }
-    pub fn query_policy(&mut self, id: &PolicyId) -> io::Result<u64> {
-        if !self.policies.contains_key(&Self::policy_key(id)?) {
-            return Err(missing());
+}
+
+impl PolicyKernel for LinuxPolicies {
+    type Key = PolicyKey;
+    type Inventory = HashMap<PolicyKey, packet::policy::ModifyMessage>;
+
+    fn key(id: &PolicyId) -> io::Result<Self::Key> {
+        Self::policy_key(id)
+    }
+    fn priority(id: &PolicyId, data: &PolicyData) -> io::Result<(u32, u32)> {
+        Ok(Self::priorities(&Self::policy_key(id)?, data))
+    }
+    fn list_policies(&mut self) -> io::Result<Self::Inventory> {
+        let request = XfrmMessage::GetPolicy(packet::policy::DelGetMessage::default());
+        let mut inventory = HashMap::new();
+        for reply in self.socket.request(&message(NlmF::DUMP, &request))? {
+            if reply.kind != packet::XFRM_MSG_NEWPOLICY {
+                continue;
+            }
+            let policy = packet::policy::ModifyMessage::parse(reply.payload.as_slice())
+                .map_err(io::Error::other)?;
+            let info = &policy.user_policy_info;
+            // Our policies have no interface selector or security label and
+            // use the main policy table. Other scopes remain foreign objects.
+            if info.selector.ifindex != 0
+                || info.selector.user != 0
+                || policy.nlas.iter().any(|attr| {
+                    matches!(
+                        attr,
+                        Attr::SecurityContext(_)
+                            | Attr::PolicyType(packet::UserPolicyType { ptype: 1.., .. })
+                    )
+                })
+            {
+                continue;
+            }
+            let (mut mark, mut if_id) = (Mark::default(), 0);
+            for attr in &policy.nlas {
+                match attr {
+                    Attr::Mark(value) => {
+                        mark = Mark {
+                            value: value.value,
+                            mask: value.mask,
+                        }
+                    }
+                    Attr::IfId(value) => if_id = *value,
+                    _ => (),
+                }
+            }
+            let key = Self::selector_key(&info.selector, info.direction, mark, if_id)?;
+            inventory.insert(key, Self::policy_configuration(policy));
         }
+        Ok(inventory)
+    }
+    fn policy_status(
+        &self,
+        inventory: &Self::Inventory,
+        id: &PolicyId,
+        data: &PolicyData,
+    ) -> io::Result<PolicyStatus> {
+        let Some(observed) = inventory.get(&Self::policy_key(id)?) else {
+            return Ok(PolicyStatus::Missing);
+        };
+        let desired = Self::policy_configuration(Self::policy_spec(id, data)?);
+        Ok(if *observed == desired {
+            PolicyStatus::Matching
+        } else {
+            PolicyStatus::Changed
+        })
+    }
+    fn write_policy(&mut self, id: &PolicyId, data: &PolicyData, replace: bool) -> io::Result<()> {
+        self.socket.ack(&Self::policy_message(id, data, replace)?)
+    }
+    fn delete_policy(&mut self, id: &PolicyId) -> io::Result<()> {
+        self.remove_kernel_policy(id)
+    }
+    fn query_policy(&mut self, id: &PolicyId) -> io::Result<u64> {
         let request = XfrmMessage::GetPolicy(Self::policy_id(id)?);
         let reply = self
             .socket
@@ -711,69 +781,14 @@ impl Xfrm {
             .map_err(io::Error::other)?;
         monotonic_use_time(policy.user_policy_info.lifetime_cur.use_time)
     }
-    pub fn flush_policies(&mut self) -> io::Result<()> {
-        let keys: Vec<_> = self
-            .policies
-            .iter()
-            .filter(|(_, p)| p.id.if_id != 0)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in keys {
-            let state = &self.policies[&key];
-            self.remove_kernel_policy(&state.id)?;
-            self.policies.remove(&key);
-        }
-        Ok(())
-    }
-    pub fn port_bypass(&mut self, family: u16, port: u16) -> io::Result<()> {
-        if port == 0 {
-            return Err(invalid());
-        }
-        let any = Host::any(family)?;
-        for dir in [1, 0] {
-            let wildcard = Ts::from_subnet(any.clone(), 0, 17, 0, 65535)?;
-            let specific = Ts::from_subnet(any.clone(), 0, 17, port, port)?;
-            let (src, dst) = if dir == 1 {
-                (specific, wildcard)
-            } else {
-                (wildcard, specific)
-            };
-            let id = PolicyId {
-                dir,
-                src,
-                dst,
-                mark: Mark::default(),
-                if_id: 0,
-            };
-            if self.bypasses.iter().any(|(p, _)| p == &id) {
-                continue;
-            }
-            let data = PolicyData {
-                kind: 2,
-                prio: 0,
-                manual_prio: 32,
-                src: any.clone(),
-                dst: any.clone(),
-                reqid: 0,
-                policy_count: 1,
-                esp: None,
-            };
-            self.add_policy(id.clone(), data.clone())?;
-            self.bypasses.push((id, data));
-        }
-        Ok(())
-    }
-    pub fn remove_bypasses(&mut self) -> io::Result<()> {
-        while let Some((id, data)) = self.bypasses.last().cloned() {
-            self.delete_policy(&id, &data)?;
-            self.bypasses.pop();
-        }
-        Ok(())
-    }
-    pub fn has_tunnel_policies(&self) -> bool {
-        self.policies.values().any(|p| p.id.if_id != 0)
-    }
-    pub fn event(&mut self, message: &Reply) -> io::Result<Option<rpc::Event>> {
+}
+
+impl Xfrm {
+    pub fn event(
+        &mut self,
+        message: &Reply,
+        policies: &Policies<LinuxPolicies>,
+    ) -> io::Result<Option<rpc::Event>> {
         let bytes = &message.payload;
         let mut event = rpc::Event {
             kind: rpc::Event_kind::ready,
@@ -802,10 +817,7 @@ impl Xfrm {
                         _ => None,
                     })
                     .unwrap_or(0);
-                if !self.policies.values().any(|policy| {
-                    policy.id.if_id == if_id
-                        && policy.used_by.iter().any(|data| data.reqid == reqid)
-                }) {
+                if !policies.contains_reqid(if_id, reqid) {
                     return Ok(None);
                 }
                 event.kind = rpc::Event_kind::acquire;
@@ -921,7 +933,7 @@ mod tests {
                 esp: Some(0x10203),
             };
             let priority = |id: &PolicyId| {
-                let request = Xfrm::policy_message(id, &data, false).unwrap();
+                let request = LinuxPolicies::policy_message(id, &data, false).unwrap();
                 packet::policy::ModifyMessage::parse(request.payload.as_slice())
                     .unwrap()
                     .user_policy_info
@@ -954,7 +966,7 @@ mod tests {
                 },
                 if_id: 41,
             };
-            let keys = HashSet::from([Xfrm::policy_key(&id).unwrap()]);
+            let keys = HashSet::from([LinuxPolicies::policy_key(&id).unwrap()]);
             // The kernel sees the same prefixes, aligned port range and
             // protocol even though the caller's traffic selectors differ.
             let mut equivalent = id.clone();
@@ -966,20 +978,20 @@ mod tests {
             equivalent.src.proto = 0;
             equivalent.dst.proto = 6;
             equivalent.mark.value = 0x1000042;
-            assert!(keys.contains(&Xfrm::policy_key(&equivalent).unwrap()));
+            assert!(keys.contains(&LinuxPolicies::policy_key(&equivalent).unwrap()));
 
             let mut different = id.clone();
             different.src.to_port = 4095;
-            assert!(!keys.contains(&Xfrm::policy_key(&different).unwrap()));
+            assert!(!keys.contains(&LinuxPolicies::policy_key(&different).unwrap()));
             different = id.clone();
             different.dir = 2;
-            assert!(!keys.contains(&Xfrm::policy_key(&different).unwrap()));
+            assert!(!keys.contains(&LinuxPolicies::policy_key(&different).unwrap()));
             different = id.clone();
             different.if_id += 1;
-            assert!(!keys.contains(&Xfrm::policy_key(&different).unwrap()));
+            assert!(!keys.contains(&LinuxPolicies::policy_key(&different).unwrap()));
             different = id.clone();
             different.mark.mask = 0xffff;
-            assert!(!keys.contains(&Xfrm::policy_key(&different).unwrap()));
+            assert!(!keys.contains(&LinuxPolicies::policy_key(&different).unwrap()));
         }
     }
 
@@ -1015,13 +1027,13 @@ mod tests {
                 mark: Mark::default(),
                 if_id: 41,
             };
-            let keys = HashSet::from([Xfrm::policy_key(&id).unwrap()]);
+            let keys = HashSet::from([LinuxPolicies::policy_key(&id).unwrap()]);
             // strongSwan may put the same ICMP type/code on either selector.
             std::mem::swap(&mut id.src, &mut id.dst);
-            assert!(keys.contains(&Xfrm::policy_key(&id).unwrap()));
+            assert!(keys.contains(&LinuxPolicies::policy_key(&id).unwrap()));
             id.dst.from_port += 1;
             id.dst.to_port += 1;
-            assert!(!keys.contains(&Xfrm::policy_key(&id).unwrap()));
+            assert!(!keys.contains(&LinuxPolicies::policy_key(&id).unwrap()));
         }
     }
 }

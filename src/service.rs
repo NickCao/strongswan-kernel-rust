@@ -20,6 +20,8 @@ use std::{
 };
 
 const ROAM_DELAY: Duration = Duration::from_millis(100);
+const POLICY_REPAIR_DELAY: Duration = Duration::from_millis(100);
+const POLICY_AUDIT_INTERVAL: Duration = Duration::from_secs(5);
 const ROUTE_CHANGED: u8 = 1;
 const ADDRESS_CHANGED: u8 = 2;
 
@@ -40,12 +42,14 @@ pub struct Session {
     closed: AtomicBool,
     roam: AtomicU8,
     network_changed: AtomicBool,
+    policy_wakeup: SyncSender<()>,
     control: UnixStream,
     event_sockets: Mutex<Option<[Netlink; 2]>>,
 }
 impl Session {
     fn fail(&self) {
         self.connected.store(false, Ordering::Release);
+        let _ = self.policy_wakeup.try_send(());
         let _ = self.control.shutdown(std::net::Shutdown::Both);
     }
 }
@@ -91,9 +95,21 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
             session.roam.fetch_or(change, Ordering::Relaxed);
             continue;
         }
+        if matches!(
+            r.kind,
+            netlink_packet_xfrm::XFRM_MSG_NEWPOLICY
+                | netlink_packet_xfrm::XFRM_MSG_UPDPOLICY
+                | netlink_packet_xfrm::XFRM_MSG_DELPOLICY
+                | netlink_packet_xfrm::XFRM_MSG_FLUSHPOLICY
+                | netlink_packet_xfrm::XFRM_MSG_POLEXPIRE
+        ) {
+            let _ = session.policy_wakeup.try_send(());
+            continue;
+        }
         let result = {
             let mut backend = session.backend.lock().unwrap();
-            let result = backend.xfrm.event(&r);
+            let Backend { xfrm, policies, .. } = &mut *backend;
+            let result = xfrm.event(&r, policies);
             if let Err(e) = backend.reconcile_interfaces() {
                 eprintln!("kernel-daemon: interface cleanup: {e}");
             }
@@ -111,6 +127,32 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
     }
     if !session.closed.load(Ordering::Acquire) {
         session.fail();
+    }
+}
+fn policy_loop(session: Arc<Session>, wakeup: Receiver<()>) {
+    let mut next_audit = Instant::now() + POLICY_AUDIT_INTERVAL;
+    while session.connected.load(Ordering::Acquire) && !session.closed.load(Ordering::Acquire) {
+        match wakeup.recv_timeout(next_audit.saturating_duration_since(Instant::now())) {
+            Ok(()) => {
+                // Bound the delay even during continuous policy updates.
+                next_audit = next_audit.min(Instant::now() + POLICY_REPAIR_DELAY);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => (),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if Instant::now() < next_audit {
+            continue;
+        }
+        // Keep this lock through both the inventory and its repairs.
+        // Install/delete/rekey requests use this same lock.
+        let mut backend = session.backend.lock().unwrap();
+        if !session.connected.load(Ordering::Acquire) || session.closed.load(Ordering::Acquire) {
+            break;
+        }
+        if let Err(error) = backend.policies.reconcile() {
+            eprintln!("kernel-daemon: policy reconciliation: {error}");
+        }
+        next_audit = Instant::now() + POLICY_AUDIT_INTERVAL;
     }
 }
 macro_rules! request {
@@ -170,10 +212,11 @@ impl VarlinkInterface for Service {
                 interfaces_use,
                 interfaces_ignore,
             )?;
-            let (xfrm_socket, xfrm) = Netlink::subscribe(NlFamily::Xfrm, 1 | 2 | 128)?;
+            let (xfrm_socket, xfrm) = Netlink::subscribe(NlFamily::Xfrm, 1 | 2 | 8 | 128)?;
             let token = hex::encode(rand::random::<[u8; 32]>());
             let features = backend.xfrm.features().into();
             let (tx, rx) = mpsc::sync_channel(256);
+            let (policy_wakeup, policy_receiver) = mpsc::sync_channel(1);
             let s = Arc::new(Session {
                 uid: self.peer.uid,
                 pid: self.peer.pid,
@@ -185,12 +228,13 @@ impl VarlinkInterface for Service {
                 closed: AtomicBool::new(false),
                 roam: AtomicU8::new(0),
                 network_changed: AtomicBool::new(false),
+                policy_wakeup,
                 control: self.socket.try_clone()?,
                 event_sockets: Mutex::new(Some([xfrm_socket, route_socket])),
             });
-            Ok((s, token, features, xfrm, route))
+            Ok((s, token, features, xfrm, route, policy_receiver))
         };
-        let (s, token, features, xfrm, route) = match create() {
+        let (s, token, features, xfrm, route, policy_receiver) = match create() {
             Ok(v) => v,
             Err(e) => return call.reply_kernel_error(e.raw_os_error().unwrap_or(libc::EIO).into()),
         };
@@ -198,6 +242,8 @@ impl VarlinkInterface for Service {
         *self.control.lock().unwrap() = Some(s.clone());
         let session = s.clone();
         thread::spawn(move || event_loop(session, true, xfrm));
+        let session = s.clone();
+        thread::spawn(move || policy_loop(session, policy_receiver));
         thread::spawn(move || event_loop(s, false, route));
         call.reply(token, features)
     }
@@ -211,6 +257,7 @@ impl VarlinkInterface for Service {
                 let s = self.control.lock().unwrap().as_ref().unwrap().clone();
                 s.connected.store(false, Ordering::Release);
                 s.closed.store(true, Ordering::Release);
+                let _ = s.policy_wakeup.try_send(());
                 // Dropping the neli routers stops their receive threads and
                 // closes the notification streams, waking our event workers.
                 s.event_sockets.lock().unwrap().take();
@@ -372,7 +419,7 @@ impl VarlinkInterface for Service {
             self,
             call,
             b,
-            b.xfrm
+            b.policies
                 .add_policy(backend::policy_id(id)?, backend::policy_config(config)?,),
             |c: &mut dyn Call_InstallPolicy, ()| c.reply()
         )
@@ -387,7 +434,7 @@ impl VarlinkInterface for Service {
             self,
             call,
             b,
-            b.xfrm
+            b.policies
                 .delete_policy(&backend::policy_id(id)?, &backend::policy_config(config)?,),
             |c: &mut dyn Call_RemovePolicy, ()| c.reply()
         )
@@ -397,7 +444,7 @@ impl VarlinkInterface for Service {
             self,
             call,
             b,
-            b.xfrm.query_policy(&backend::policy_id(id)?),
+            b.policies.query_policy(&backend::policy_id(id)?),
             |c: &mut dyn Call_QueryPolicy, time: u64| c.reply(time as i64)
         )
     }
@@ -406,7 +453,7 @@ impl VarlinkInterface for Service {
             self,
             call,
             b,
-            b.xfrm.flush_policies(),
+            b.policies.flush_policies(),
             |c: &mut dyn Call_FlushPolicies, ()| c.reply()
         )
     }
@@ -426,7 +473,7 @@ impl VarlinkInterface for Service {
                 if port < 1024 {
                     return Err(invalid());
                 }
-                b.xfrm.port_bypass(family, port)
+                b.policies.port_bypass(family, port)
             },
             |c: &mut dyn Call_BypassPort, ()| c.reply()
         )

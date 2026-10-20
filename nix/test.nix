@@ -181,6 +181,9 @@ in
     def spis(machine):
         return set(re.findall(r"spi (0x[0-9a-f]+)", machine.succeed("ip xfrm state")))
 
+    def policy_specs(machine):
+        return set(re.split(r"(?=^src )", machine.succeed("ip xfrm policy list nosock"), flags=re.M)[1:])
+
     def process_status(machine, unit):
         pid = property(machine, unit, "MainPID")
         assert int(pid) > 1
@@ -324,6 +327,22 @@ in
                 assert "encap type espinudp sport 13000 dport 13000" in state, state
                 assert "tfcpad 256" in state, state
                 assert any(int(value) > 0 for value in re.findall(r"(\d+)\(packets\)", state))
+
+        with subtest(name + ": policy flush recovers without replacing SAs or interfaces"):
+            expected_policies = [policy_specs(machine) for machine in machines]
+            original_spis = [spis(machine) for machine in machines]
+            for machine in machines:
+                machine.succeed("ip xfrm policy flush")
+            for peer, machine in enumerate(machines, 1):
+                for attempt in range(100):
+                    if policy_specs(machine) == expected_policies[peer - 1]:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise AssertionError("policy reconciliation did not restore the tunnel")
+                assert spis(machine) == original_spis[peer - 1]
+                assert indices(machine) == original_indices[peer - 1]
+                ping_overlay(machine, peer)
 
         with subtest(name + ": VICI SA use times age while idle and reset after traffic"):
             # Stop background traffic before XFRM processing during the idle interval.
