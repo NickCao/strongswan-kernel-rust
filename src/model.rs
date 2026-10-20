@@ -171,6 +171,8 @@ pub struct PolicyId {
     pub mark: Mark,
     pub if_id: u32,
 }
+/// One strongSwan policy reference, retained for priority selection and exact
+/// removal. Multiple references may share one installed policy during rekeying.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyData {
     pub kind: u8,

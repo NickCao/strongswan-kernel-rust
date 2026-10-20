@@ -448,10 +448,19 @@ network discovery and Netlink support modules. Shared controllers, traits and
 model types remain at the top level.
 
 The policy controller in `src/policy.rs` owns desired policies and shared
-references. Its `PolicyKernel` trait abstracts inventory, configuration
-comparison, writes, deletion and usage queries. `LinuxPolicies` implements
-that trait using typed XFRM messages; another device backend can reuse the
-controller with its own inventory and policy keys.
+references. It canonicalizes identities, selects the winning strongSwan
+`PolicyData` reference and resolves its effective priority and protection
+template into a `PolicySpec`. Its `PolicyKernel` trait provides
+list/get/create/update/delete operations with opaque handles and normalized
+`ObservedPolicy` values. The controller compares observed configuration and
+decides repairs; `get` reads one policy's usage without dumping the table.
+`LinuxPolicies` implements CRUD and translates typed XFRM messages. Native
+configuration outside the supported model is reported as unrepresentable, so
+the controller can repair changed policies it owns. Linux policy handles use
+selectors, direction, mark and XFRM interface ID; a replacement reusing that
+identity is indistinguishable from a changed owned policy. Another device
+backend can reuse the controller without implementing reconciliation or
+strongSwan reference selection.
 
 The interface controller in `src/interfaces.rs` derives desired interfaces from
 the current SA ownership records, grouped by interface ID. It recreates missing

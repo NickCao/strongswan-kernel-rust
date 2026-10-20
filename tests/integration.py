@@ -350,6 +350,14 @@ def run(binary):
                 ip("xfrm", "policy", "update", "src", "0.0.0.0/0", "dst", "0.0.0.0/0",
                    "dir", "out", "if_id", "41", "priority", "7", "action", "block")
                 wait(lambda: policy_specs() == expected)
+                # Unsupported native flags must remain visible as a mismatch
+                # after decoding to the shared policy configuration model.
+                priority = re.search(r"priority (\d+)", outbound_policy())[1]
+                ip("xfrm", "policy", "update", "src", "0.0.0.0/0", "dst", "0.0.0.0/0",
+                   "dir", "out", "if_id", "41", "priority", priority, "flag", "localok",
+                   "tmpl", "src", b["src"]["address"], "dst", b["dst"]["address"],
+                   "proto", "esp", "spi", b["spi"], "mode", "tunnel", "reqid", "42")
+                wait(lambda: policy_specs() == expected)
                 # A newer reference takes precedence. After it is removed,
                 # pending repair must use the surviving reference's SPI.
                 for attempt in range(20):
