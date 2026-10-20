@@ -33,7 +33,7 @@ up **before its first SA is installed**. Its default MTU is 1400. Every SA
 using that ID shares the interface, including inbound/outbound SAs and old/new
 SAs during rekeying. Removing or hard-expiring the final SA deletes the
 interface. A failed first installation rolls it back. Policies alone do not
-retain an interface. Existing interfaces are never adopted or deleted.
+retain an interface. Preexisting or foreign interfaces are not adopted or deleted.
 `--ifname-prefix` and `--mtu` change the naming prefix and MTU. Interfaces
 have multicast enabled. `--master-device NAME` attaches them to an existing
 master, such as a VRF, before installing the first SA. Without this option,
@@ -433,8 +433,8 @@ port bypasses until close.
 
 While the session is connected, missing or changed owned policies are repaired
 from the current desired policy records, including IKE port bypasses. Policy
-notifications are coalesced over 100 ms, and an audit runs every five seconds
-to catch missed notifications. An external `ip xfrm policy flush` is therefore
+and link notifications are coalesced over 100 ms, and an audit runs every five
+seconds to catch missed notifications. An external `ip xfrm policy flush` is therefore
 recoverable without replacing SAs or interfaces. Unchanged policies are not
 rewritten; kernel-assigned indices, usage counters, timestamps, attribute order
 and omitted default attributes are excluded from configuration comparisons.
@@ -446,14 +446,37 @@ The policy controller in `src/policy.rs` owns desired policies and shared
 references. Its `PolicyKernel` trait abstracts inventory, configuration
 comparison, writes, deletion and usage queries. `LinuxPolicies` implements
 that trait using typed XFRM messages; another device backend can reuse the
-controller with its own inventory and policy keys. SA handling, interface
-management and network discovery remain in their existing Linux implementations.
+controller with its own inventory and policy keys.
 
-External changes to kernel SAs or XFRM interfaces are not automatically
-reconciled. An external `ip xfrm state flush` can leave SA ownership records
+The interface controller in `src/interfaces.rs` derives desired interfaces from
+the current SA ownership records, grouped by interface ID. It recreates missing
+interfaces and restores their configured name, MTU, master, UP and multicast
+settings. Unchanged links are left alone. Repairs share the policy worker and
+backend lock, so deleting the final SA or rolling back a failed installation
+cannot race with recreation. Policies alone do not keep interfaces alive.
+Repairs stop when the session disconnects; hard expiry still removes unused
+interfaces.
+
+Its separate `InterfaceKernel` trait provides only list/create/update/delete
+operations. Listing returns normalized `ObservedInterface` values, containing
+current configuration and an opaque handle. The controller tracks ownership,
+compares settings and decides repairs. `LinuxInterfaces` implements CRUD using
+typed route Netlink messages. Its handles contain the interface index, XFRM
+interface ID and underlying link index, and are checked before updates or
+deletion. Conflicting interfaces are left untouched. These are identity checks,
+not kernel lifetime references: a replacement reusing all handle fields cannot
+be distinguished. SA handling and network discovery remain Linux-specific.
+
+Recreated links need their addresses and routes reapplied by the external
+network configuration; the daemon only restores link settings. The
+NixOS test exercises this with systemd-networkd managing tunnel addresses and
+routes while preserving the daemon-managed master attachment.
+
+External changes to kernel SAs are not automatically reconciled.
+An external `ip xfrm state flush` can leave SA ownership records
 out of sync with the kernel. Missing SAs produce query errors without
 triggering recovery, and interface cleanup still follows recorded SA
-ownership. An externally deleted XFRM interface is not automatically recreated.
+ownership, so an interface is still desired while stale SA records refer to it.
 A successful rekey or teardown may clear some drift, but there is no guarantee
 of eventual reconciliation for these objects. Reestablish the affected
 CHILD_SAs through strongSwan to recover missing SAs.
@@ -470,7 +493,7 @@ Routes through deleted interfaces disappear with the links.
 Crash recovery is deferred. Proposed follow-up work is:
 
 - If charon crashes while the daemon survives, retire the failed session,
-  stop its policy repairs, and remove its owned SAs, policies, larval SPI
+  stop its repairs, and remove its owned SAs, policies, larval SPI
   reservations, IKE bypasses and interfaces. Accept a replacement session
   only after cleanup succeeds. Graceful daemon shutdown must wait for this
   cleanup, including when systemd stops the daemon after charon exits.
@@ -515,7 +538,8 @@ The RPC test checks socket group permissions and a rejected nonmember,
 standard introspection (also with varlinkctl when installed), a
 capability-free client, address scope/type filtering, multihomed source
 selection and egress-interface exclusions, ICMP policy priorities, policy
-deletion/modification/flush repair, rekey references and teardown, validation,
+deletion/modification/flush repair, interface recreation and settings repair,
+index reuse and ownership conflicts, rekey references and teardown, validation,
 interface rollback, foreign objects, overlapping SAs, scoped flushes (including missing policies),
 larval allocation, hard expiry, and expiry after losing the client. The tunnel tests use
 capability-free charons, Ed25519 raw public keys, ranet's wildcard IPv4/IPv6

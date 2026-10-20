@@ -131,6 +131,36 @@ let
               LinkLocalAddressing = "no";
             };
           };
+          # The daemon owns link settings. Networkd owns addresses and routes,
+          # and reapplies them when reconciliation recreates a tunnel link.
+          "30-ipsec" = {
+            matchConfig.Name = if peer == 1 then "ranet*" else "gn*";
+            linkConfig = {
+              RequiredForOnline = false;
+              ActivationPolicy = "manual";
+            };
+            networkConfig = {
+              KeepMaster = true;
+              ConfigureWithoutCarrier = true;
+              LinkLocalAddressing = "no";
+              IPv6AcceptRA = false;
+            };
+            address = [
+              "198.18.${toString peer}.1/32"
+              "fd20:${toString peer}::1/128"
+            ];
+            routes = [
+              {
+                Destination = "10.${toString (3 - peer)}.0.1/32";
+                Table = 42;
+                Scope = "link";
+              }
+              {
+                Destination = "fd10:${toString (3 - peer)}::1/128";
+                Table = 42;
+              }
+            ];
+          };
         };
       };
 
@@ -211,6 +241,30 @@ in
         master = interface_settings[peer - 1][2]
         machine.succeed(f"ip vrf exec {master} ping -c 3 -W 2 -I 10.{peer}.0.1 10.{other}.0.1")
         machine.succeed(f"ip vrf exec {master} ping -6 -c 3 -W 2 -I fd10:{peer}::1 fd10:{other}::1")
+
+    def wait_interface(machine, peer, interface):
+        prefix, mtu, master = interface_settings[peer - 1]
+        for attempt in range(100):
+            current = links(machine)
+            if (len(current) == 1 and current[0]["ifname"] == interface
+                    and current[0]["mtu"] == mtu and current[0].get("master") == master
+                    and {"UP", "MULTICAST"} <= set(current[0]["flags"])):
+                return current[0]
+            time.sleep(0.1)
+        raise AssertionError(f"interface reconciliation did not restore {interface}: {current}")
+
+    def wait_overlay_config(machine, peer, interface):
+        other = 3 - peer
+        machine.wait_until_succeeds(
+            f"ip -o address show dev {interface} | grep -F '198.18.{peer}.1/32'"
+        )
+        machine.wait_until_succeeds(
+            f"ip -o -6 address show dev {interface} | grep -F 'fd20:{peer}::1/128' | grep -v tentative"
+        )
+        for family, destination in [("-4", f"10.{other}.0.1/32"), ("-6", f"fd10:{other}::1/128")]:
+            machine.wait_until_succeeds(
+                f"ip {family} route show table 42 exact {destination} | grep -F 'dev {interface}'"
+            )
 
     def sa_use_times(machine):
         listing = ctl(machine, "--list-sas --raw")
@@ -316,9 +370,7 @@ in
                 assert current[0]["mtu"] == mtu and {"UP", "MULTICAST"} <= set(current[0]["flags"]), current
                 assert current[0]["master"] == master, current
                 original_indices.append(indices(machine))
-                other = 3 - peer
-                machine.succeed(f"ip route add vrf {master} 10.{other}.0.1/32 dev {name_out}")
-                machine.succeed(f"ip -6 route add vrf {master} fd10:{other}::1/128 dev {name_out}")
+                wait_overlay_config(machine, peer, name_out)
             for peer, machine in enumerate(machines, 1):
                 ping_overlay(machine, peer)
                 state = machine.succeed("ip -s xfrm state")
@@ -343,6 +395,38 @@ in
                 assert spis(machine) == original_spis[peer - 1]
                 assert indices(machine) == original_indices[peer - 1]
                 ping_overlay(machine, peer)
+
+        with subtest(name + ": interface settings repair preserves SAs and interface indices"):
+            original_spis = [spis(machine) for machine in machines]
+            expected_policies = [policy_specs(machine) for machine in machines]
+            for peer, machine in enumerate(machines, 1):
+                interface = next(iter(original_indices[peer - 1]))
+                machine.succeed(f"ip link set dev {interface} nomaster")
+                machine.succeed(f"ip link set dev {interface} down mtu 1280 multicast off")
+            for peer, machine in enumerate(machines, 1):
+                interface = next(iter(original_indices[peer - 1]))
+                wait_interface(machine, peer, interface)
+                assert indices(machine) == original_indices[peer - 1]
+                assert spis(machine) == original_spis[peer - 1]
+                assert policy_specs(machine) == expected_policies[peer - 1]
+                wait_overlay_config(machine, peer, interface)
+                ping_overlay(machine, peer)
+
+        with subtest(name + ": deleted interfaces recover with networkd addresses and routes"):
+            original_spis = [spis(machine) for machine in machines]
+            expected_policies = [policy_specs(machine) for machine in machines]
+            for peer, machine in enumerate(machines, 1):
+                interface = next(iter(original_indices[peer - 1]))
+                machine.succeed(f"ip link del dev {interface}")
+            for peer, machine in enumerate(machines, 1):
+                interface = next(iter(original_indices[peer - 1]))
+                recreated = wait_interface(machine, peer, interface)
+                assert recreated["ifindex"] != original_indices[peer - 1][interface]
+                assert spis(machine) == original_spis[peer - 1]
+                assert policy_specs(machine) == expected_policies[peer - 1]
+                wait_overlay_config(machine, peer, interface)
+                ping_overlay(machine, peer)
+                original_indices[peer - 1] = indices(machine)
 
         with subtest(name + ": VICI SA use times age while idle and reset after traffic"):
             # Stop background traffic before XFRM processing during the idle interval.

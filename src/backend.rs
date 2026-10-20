@@ -1,27 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 use crate::{
     error::invalid,
+    interfaces::Interfaces,
+    linux_interfaces::LinuxInterfaces,
     model::*,
-    network::{self, Network},
+    network::Network,
     policy::Policies,
     rpc_api as rpc,
     xfrm::{LinuxPolicies, Xfrm},
 };
-use std::{collections::HashMap, io};
+use std::{collections::HashSet, io};
 use zeroize::Zeroizing;
 
-struct Interface {
-    name: String,
-    index: u32,
-}
 pub struct Backend {
     pub xfrm: Xfrm,
     pub net: Network,
     pub policies: Policies<LinuxPolicies>,
-    interfaces: HashMap<u32, Interface>,
-    prefix: String,
-    master_device: Option<String>,
-    mtu: u32,
+    interfaces: Interfaces<LinuxInterfaces>,
 }
 impl Backend {
     pub fn new(
@@ -50,66 +45,17 @@ impl Backend {
             xfrm: Xfrm::new()?,
             net,
             policies: Policies::new(LinuxPolicies::new()?),
-            interfaces: HashMap::new(),
-            prefix,
-            master_device,
-            mtu,
+            interfaces: Interfaces::new(LinuxInterfaces::new()?, prefix, master_device, mtu),
         })
     }
-    fn ensure_interface(&mut self, id: u32) -> io::Result<()> {
-        let links = self.net.links()?;
-        if let Some(owned) = self.interfaces.get(&id) {
-            if links
-                .iter()
-                .any(|l| l.index == owned.index && l.name == owned.name && l.xfrm == Some((id, 0)))
-            {
-                return Ok(());
-            }
-            // Refuse to adopt externally replaced objects.
-            return Err(io::Error::from_raw_os_error(libc::ESTALE));
-        }
-        let name = format!("{}{:08x}", self.prefix, id);
-        if links
-            .iter()
-            .any(|l| l.name == name || l.xfrm.is_some_and(|(i, _)| i == id))
-        {
-            return Err(io::Error::from_raw_os_error(libc::EEXIST));
-        }
-        self.net.create_xfrmi(
-            name.clone(),
-            id,
-            String::new(),
-            self.master_device.clone().unwrap_or_default(),
-            self.mtu,
-        )?;
-        self.interfaces.insert(
-            id,
-            Interface {
-                index: network::index(&name)?,
-                name,
-            },
-        );
-        Ok(())
+    fn desired_interfaces(&self) -> HashSet<u32> {
+        self.xfrm.sas.iter().map(|sa| sa.if_id).collect()
+    }
+    pub fn cleanup_interfaces(&mut self) -> io::Result<()> {
+        self.interfaces.remove_unused(&self.desired_interfaces())
     }
     pub fn reconcile_interfaces(&mut self) -> io::Result<()> {
-        let unused: Vec<_> = self
-            .interfaces
-            .keys()
-            .copied()
-            .filter(|id| !self.xfrm.sas.iter().any(|sa| sa.if_id == *id))
-            .collect();
-        for id in unused {
-            let owned = &self.interfaces[&id];
-            let links = self.net.links()?;
-            if links
-                .iter()
-                .any(|l| l.index == owned.index && l.name == owned.name && l.xfrm == Some((id, 0)))
-            {
-                self.net.delete_xfrmi(owned.index)?;
-            }
-            self.interfaces.remove(&id);
-        }
-        Ok(())
+        self.interfaces.reconcile(&self.desired_interfaces())
     }
     pub fn install_sa(&mut self, id: rpc::SaId, config: rpc::SaConfig) -> io::Result<()> {
         let id = sa_id(id)?;
@@ -154,19 +100,19 @@ impl Backend {
         if data.encap && (id.src.port < 1024 || id.dst.port < 1024) {
             return Err(invalid());
         }
-        self.ensure_interface(id.if_id)?;
+        self.interfaces.ensure(id.if_id)?;
         let result = self.xfrm.add_sa(&id, &data);
-        let cleanup = self.reconcile_interfaces();
+        let cleanup = self.cleanup_interfaces();
         result.and(cleanup)
     }
     pub fn remove_sa(&mut self, id: rpc::SaId) -> io::Result<()> {
         let result = self.xfrm.delete_sa(&sa_id(id)?);
-        let cleanup = self.reconcile_interfaces();
+        let cleanup = self.cleanup_interfaces();
         result.and(cleanup)
     }
     pub fn flush_sas(&mut self) -> io::Result<()> {
         let result = self.xfrm.flush_sas();
-        let cleanup = self.reconcile_interfaces();
+        let cleanup = self.cleanup_interfaces();
         result.and(cleanup)
     }
     pub fn close(&mut self) -> io::Result<()> {

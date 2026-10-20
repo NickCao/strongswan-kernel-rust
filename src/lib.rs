@@ -8,6 +8,8 @@
 
 pub mod backend;
 pub mod error;
+pub mod interfaces;
+pub mod linux_interfaces;
 pub mod model;
 pub mod netlink;
 pub mod network;

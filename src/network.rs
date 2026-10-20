@@ -27,7 +27,49 @@ pub struct Link {
     pub name: String,
     pub flags: LinkFlags,
     pub mtu: u32,
+    pub master: u32,
     pub xfrm: Option<(u32, u32)>,
+}
+impl Link {
+    fn from_message(info: LinkMessage) -> Self {
+        let mut link = Self {
+            index: info.header.index,
+            flags: info.header.flags,
+            name: String::new(),
+            mtu: 0,
+            master: 0,
+            xfrm: None,
+        };
+        for attr in info.attributes {
+            match attr {
+                LinkAttribute::IfName(name) => link.name = name,
+                LinkAttribute::Mtu(mtu) => link.mtu = mtu,
+                LinkAttribute::Controller(master) => link.master = master,
+                LinkAttribute::LinkInfo(infos) => {
+                    for info in infos {
+                        match info {
+                            LinkInfo::Kind(InfoKind::Xfrm) => {
+                                link.xfrm.get_or_insert((0, 0));
+                            }
+                            LinkInfo::Data(InfoData::Xfrm(attrs)) => {
+                                let (if_id, phys) = link.xfrm.get_or_insert((0, 0));
+                                for attr in attrs {
+                                    match attr {
+                                        InfoXfrm::IfId(value) => *if_id = value,
+                                        InfoXfrm::Link(value) => *phys = value,
+                                        _ => (),
+                                    }
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+        link
+    }
 }
 #[derive(Clone, Debug)]
 pub struct AddressEntry {
@@ -80,7 +122,7 @@ impl Network {
             snapshot: None,
         })
     }
-    fn request(
+    pub(crate) fn request(
         &self,
         request: RouteNetlinkMessage,
         flags: NlmF,
@@ -113,45 +155,25 @@ impl Network {
             let RouteNetlinkMessage::NewLink(info) = reply else {
                 continue;
             };
-            let mut link = Link {
-                index: info.header.index,
-                flags: info.header.flags,
-                name: String::new(),
-                mtu: 0,
-                xfrm: None,
-            };
-            for attr in info.attributes {
-                match attr {
-                    LinkAttribute::IfName(name) => link.name = name,
-                    LinkAttribute::Mtu(mtu) => link.mtu = mtu,
-                    LinkAttribute::LinkInfo(infos) => {
-                        for info in infos {
-                            match info {
-                                LinkInfo::Kind(InfoKind::Xfrm) => {
-                                    link.xfrm.get_or_insert((0, 0));
-                                }
-                                LinkInfo::Data(InfoData::Xfrm(attrs)) => {
-                                    let (if_id, phys) = link.xfrm.get_or_insert((0, 0));
-                                    for attr in attrs {
-                                        match attr {
-                                            InfoXfrm::IfId(value) => *if_id = value,
-                                            InfoXfrm::Link(value) => *phys = value,
-                                            _ => (),
-                                        }
-                                    }
-                                }
-                                _ => (),
-                            }
-                        }
-                    }
-                    _ => (),
-                }
-            }
+            let link = Link::from_message(info);
             if !link.name.is_empty() {
                 links.push(link);
             }
         }
         Ok(links)
+    }
+    pub(crate) fn link(&mut self, index: u32) -> io::Result<Option<Link>> {
+        let mut request = LinkMessage::default();
+        request.header.index = index;
+        let replies = match self.request(RouteNetlinkMessage::GetLink(request), NlmF::empty()) {
+            Ok(replies) => replies,
+            Err(error) if error.raw_os_error() == Some(libc::ENODEV) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(replies.into_iter().find_map(|reply| match reply {
+            RouteNetlinkMessage::NewLink(info) => Some(Link::from_message(info)),
+            _ => None,
+        }))
     }
     pub fn addresses(&mut self) -> io::Result<Vec<AddressEntry>> {
         let mut out = Vec::new();
@@ -343,51 +365,6 @@ impl Network {
             gateway.unwrap_or(Host::any(family)?),
             link.name.clone(),
         ))
-    }
-    pub fn create_xfrmi(
-        &mut self,
-        name: String,
-        if_id: u32,
-        phys: String,
-        master: String,
-        mtu: u32,
-    ) -> io::Result<()> {
-        if name.is_empty() || name.len() >= libc::IFNAMSIZ {
-            return Err(invalid());
-        }
-        let mut payload = LinkMessage::default();
-        payload.header.flags = LinkFlags::Up | LinkFlags::Multicast;
-        payload.header.change_mask = payload.header.flags;
-        payload.attributes.push(LinkAttribute::IfName(name));
-        if mtu != 0 {
-            payload.attributes.push(LinkAttribute::Mtu(mtu));
-        }
-        if !master.is_empty() {
-            payload
-                .attributes
-                .push(LinkAttribute::Controller(index(&master)?));
-        }
-        let mut data = vec![InfoXfrm::IfId(if_id)];
-        if !phys.is_empty() {
-            data.push(InfoXfrm::Link(index(&phys)?));
-        }
-        payload.attributes.push(LinkAttribute::LinkInfo(vec![
-            LinkInfo::Kind(InfoKind::Xfrm),
-            LinkInfo::Data(InfoData::Xfrm(data)),
-        ]));
-        self.request(
-            RouteNetlinkMessage::NewLink(payload),
-            NlmF::ACK | NlmF::CREATE | NlmF::EXCL,
-        )?;
-        self.invalidate();
-        Ok(())
-    }
-    pub(crate) fn delete_xfrmi(&mut self, index: u32) -> io::Result<()> {
-        let mut payload = LinkMessage::default();
-        payload.header.index = index;
-        self.request(RouteNetlinkMessage::DelLink(payload), NlmF::ACK)?;
-        self.invalidate();
-        Ok(())
     }
 }
 #[cfg(test)]

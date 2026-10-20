@@ -234,6 +234,52 @@ def run(binary):
                    "proto", "esp", "spi", b["spi"])
                 rpc("InstallSa",id=b,config=sa_config(update=True))
                 assert next(l for l in links() if l["ifname"] == "ranet00000029")["ifindex"] == index
+                # Interface repair uses recorded SA ownership, independently
+                # of policies and without changing the installed SAs.
+                name = "ranet00000029"
+                def tunnel():
+                    return next((l for l in links() if l["ifname"] == name), None)
+                def configured():
+                    link = tunnel()
+                    return (link is not None and link["mtu"] == 1400
+                            and {"UP", "MULTICAST"} <= set(link["flags"])
+                            and not link.get("master"))
+                before_repair = states()
+                ip("link", "set", name, "down", "mtu", 1280, "multicast", "off")
+                wait(configured)
+                assert tunnel()["ifindex"] == index
+                ip("link", "add", "accidental", "type", "vrf", "table", "5678")
+                ip("link", "set", "accidental", "up")
+                ip("link", "set", name, "master", "accidental")
+                wait(configured)
+                ip("link", "set", name, "name", "renamed")
+                wait(configured)
+                assert tunnel()["ifindex"] == index
+                ip("link", "del", name)
+                wait(configured)
+                assert tunnel()["ifindex"] != index
+                index = tunnel()["ifindex"]
+
+                # Changing the XFRM identity invalidates our old handle. The
+                # conflicting interface must not be adopted or modified, even
+                # after explicitly reusing its old index. A foreign interface
+                # holding ID 41 prevents recreation while we replace the link.
+                ip("link", "set", name, "type", "xfrm", "if_id", 66)
+                ip("link", "add", "guard41", "type", "xfrm", "if_id", 41)
+                ip("link", "del", name)
+                ip("link", "add", name, "index", index, "type", "xfrm", "if_id", 66)
+                ip("link", "set", name, "down", "mtu", 1280, "multicast", "off")
+                replacement_index = tunnel()["ifindex"]
+                assert replacement_index == index
+                failure("InstallSa", errno.EEXIST, id=b, config=sa_config(update=True))
+                time.sleep(.3)
+                assert tunnel()["ifindex"] == replacement_index and tunnel()["mtu"] == 1280
+                assert "UP" not in tunnel()["flags"] and "MULTICAST" not in tunnel()["flags"]
+                ip("link", "del", name)
+                ip("link", "del", "guard41")
+                wait(configured)
+                assert tunnel()["ifindex"] != replacement_index
+                assert states() == before_repair, "interface repair must not modify SAs"
                 # Trap policies must forward kernel acquire attributes and
                 # selectors through Varlink for both inner address families.
                 for family, source, destination in [
@@ -332,6 +378,20 @@ def run(binary):
                 after_flush = policy_specs()
                 time.sleep(5.3)
                 assert policy_specs() == after_flush and len(after_flush) == 4, "deleted policies must not return"
+                # Final-SA removal must not resurrect a missing interface or
+                # delete a foreign interface that replaced the owned object.
+                for attempt in range(5):
+                    temporary = sa_id(spi=0x30000 + attempt, interface=60)
+                    rpc("InstallSa", id=temporary, config=sa_config())
+                    temporary_name = "ranet0000003c"
+                    if attempt == 4:
+                        ip("link", "set", temporary_name, "type", "xfrm", "if_id", 160)
+                    else:
+                        ip("link", "del", temporary_name)
+                    rpc("RemoveSa", id=temporary)
+                    time.sleep(.15)
+                    assert any(l["ifname"] == temporary_name for l in links()) == (attempt == 4)
+                ip("link", "del", temporary_name)
                 # Inbound larval SPI allocation and conversion to an interface SA.
                 spi = rpc("AllocateSpi",src=endpoint(),dst=endpoint("192.0.2.2"),minimum=0xc0000000,maximum=0xcfffffff)["spi"]
                 inbound = sa_id(spi=spi,interface=43)
@@ -388,7 +448,7 @@ def run(binary):
                 assert probe.call("OpenSession",dict(interfacesUse="",interfacesIgnore=""))["error"].endswith("SessionBusy")
                 probe.socket.close()
                 wait(lambda: [l["ifname"] for l in links()] == ["foreign"])
-                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, address scope/type filtering, multihomed sources and egress-interface exclusions, ICMP policy priorities, policy deletion/modification/flush repair without SA changes, rekey references and teardown, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, update-to-add retry, IPv4/IPv6 acquire events, rollback, foreign objects, larval SPI, hard expiry, scoped cleanup including missing policies, and disconnected-client expiry")
+                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, address scope/type filtering, multihomed sources and egress-interface exclusions, ICMP policy priorities, policy and interface repair without SA changes, rekey references and teardown, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, update-to-add retry, IPv4/IPv6 acquire events, rollback, foreign replacements, larval SPI, hard expiry, scoped cleanup including missing objects, and disconnected-client expiry")
             except BaseException:
                 log.seek(0); print(log.read(),file=sys.stderr); raise
             finally:

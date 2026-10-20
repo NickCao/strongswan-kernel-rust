@@ -20,8 +20,8 @@ use std::{
 };
 
 const ROAM_DELAY: Duration = Duration::from_millis(100);
-const POLICY_REPAIR_DELAY: Duration = Duration::from_millis(100);
-const POLICY_AUDIT_INTERVAL: Duration = Duration::from_secs(5);
+const REPAIR_DELAY: Duration = Duration::from_millis(100);
+const AUDIT_INTERVAL: Duration = Duration::from_secs(5);
 const ROUTE_CHANGED: u8 = 1;
 const ADDRESS_CHANGED: u8 = 2;
 
@@ -42,14 +42,14 @@ pub struct Session {
     closed: AtomicBool,
     roam: AtomicU8,
     network_changed: AtomicBool,
-    policy_wakeup: SyncSender<()>,
+    repair_wakeup: SyncSender<()>,
     control: UnixStream,
     event_sockets: Mutex<Option<[Netlink; 2]>>,
 }
 impl Session {
     fn fail(&self) {
         self.connected.store(false, Ordering::Release);
-        let _ = self.policy_wakeup.try_send(());
+        let _ = self.repair_wakeup.try_send(());
         let _ = self.control.shutdown(std::net::Shutdown::Both);
     }
 }
@@ -76,7 +76,11 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
         }
         let r = match notification {
             Ok(reply) => reply,
-            Err(_) => {
+            Err(error) => {
+                eprintln!(
+                    "kernel-daemon: {} notification: {error}",
+                    if xfrm { "XFRM" } else { "network" }
+                );
                 session.fail();
                 return;
             }
@@ -85,7 +89,11 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
             // A routing daemon can send thousands of notifications per second.
             // Keep one pending roam update, retaining address/link changes,
             // instead of queueing a separate IKE-wide job for every route.
-            let change = match Rtm::from(r.kind) {
+            let kind = Rtm::from(r.kind);
+            if matches!(kind, Rtm::Newlink | Rtm::Dellink) {
+                let _ = session.repair_wakeup.try_send(());
+            }
+            let change = match kind {
                 Rtm::Newlink | Rtm::Dellink | Rtm::Newaddr | Rtm::Deladdr => {
                     session.network_changed.store(true, Ordering::Release);
                     ADDRESS_CHANGED
@@ -103,14 +111,14 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
                 | netlink_packet_xfrm::XFRM_MSG_FLUSHPOLICY
                 | netlink_packet_xfrm::XFRM_MSG_POLEXPIRE
         ) {
-            let _ = session.policy_wakeup.try_send(());
+            let _ = session.repair_wakeup.try_send(());
             continue;
         }
         let result = {
             let mut backend = session.backend.lock().unwrap();
             let Backend { xfrm, policies, .. } = &mut *backend;
             let result = xfrm.event(&r, policies);
-            if let Err(e) = backend.reconcile_interfaces() {
+            if let Err(e) = backend.cleanup_interfaces() {
                 eprintln!("kernel-daemon: interface cleanup: {e}");
             }
             result
@@ -129,13 +137,13 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
         session.fail();
     }
 }
-fn policy_loop(session: Arc<Session>, wakeup: Receiver<()>) {
-    let mut next_audit = Instant::now() + POLICY_AUDIT_INTERVAL;
+fn repair_loop(session: Arc<Session>, wakeup: Receiver<()>) {
+    let mut next_audit = Instant::now() + AUDIT_INTERVAL;
     while session.connected.load(Ordering::Acquire) && !session.closed.load(Ordering::Acquire) {
         match wakeup.recv_timeout(next_audit.saturating_duration_since(Instant::now())) {
             Ok(()) => {
-                // Bound the delay even during continuous policy updates.
-                next_audit = next_audit.min(Instant::now() + POLICY_REPAIR_DELAY);
+                // Bound the delay even during continuous policy/link updates.
+                next_audit = next_audit.min(Instant::now() + REPAIR_DELAY);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => (),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -149,10 +157,13 @@ fn policy_loop(session: Arc<Session>, wakeup: Receiver<()>) {
         if !session.connected.load(Ordering::Acquire) || session.closed.load(Ordering::Acquire) {
             break;
         }
+        if let Err(error) = backend.reconcile_interfaces() {
+            eprintln!("kernel-daemon: interface reconciliation: {error}");
+        }
         if let Err(error) = backend.policies.reconcile() {
             eprintln!("kernel-daemon: policy reconciliation: {error}");
         }
-        next_audit = Instant::now() + POLICY_AUDIT_INTERVAL;
+        next_audit = Instant::now() + AUDIT_INTERVAL;
     }
 }
 macro_rules! request {
@@ -216,7 +227,7 @@ impl VarlinkInterface for Service {
             let token = hex::encode(rand::random::<[u8; 32]>());
             let features = backend.xfrm.features().into();
             let (tx, rx) = mpsc::sync_channel(256);
-            let (policy_wakeup, policy_receiver) = mpsc::sync_channel(1);
+            let (repair_wakeup, repair_receiver) = mpsc::sync_channel(1);
             let s = Arc::new(Session {
                 uid: self.peer.uid,
                 pid: self.peer.pid,
@@ -228,13 +239,13 @@ impl VarlinkInterface for Service {
                 closed: AtomicBool::new(false),
                 roam: AtomicU8::new(0),
                 network_changed: AtomicBool::new(false),
-                policy_wakeup,
+                repair_wakeup,
                 control: self.socket.try_clone()?,
                 event_sockets: Mutex::new(Some([xfrm_socket, route_socket])),
             });
-            Ok((s, token, features, xfrm, route, policy_receiver))
+            Ok((s, token, features, xfrm, route, repair_receiver))
         };
-        let (s, token, features, xfrm, route, policy_receiver) = match create() {
+        let (s, token, features, xfrm, route, repair_receiver) = match create() {
             Ok(v) => v,
             Err(e) => return call.reply_kernel_error(e.raw_os_error().unwrap_or(libc::EIO).into()),
         };
@@ -243,7 +254,7 @@ impl VarlinkInterface for Service {
         let session = s.clone();
         thread::spawn(move || event_loop(session, true, xfrm));
         let session = s.clone();
-        thread::spawn(move || policy_loop(session, policy_receiver));
+        thread::spawn(move || repair_loop(session, repair_receiver));
         thread::spawn(move || event_loop(s, false, route));
         call.reply(token, features)
     }
@@ -257,7 +268,7 @@ impl VarlinkInterface for Service {
                 let s = self.control.lock().unwrap().as_ref().unwrap().clone();
                 s.connected.store(false, Ordering::Release);
                 s.closed.store(true, Ordering::Release);
-                let _ = s.policy_wakeup.try_send(());
+                let _ = s.repair_wakeup.try_send(());
                 // Dropping the neli routers stops their receive threads and
                 // closes the notification streams, waking our event workers.
                 s.event_sockets.lock().unwrap().take();
