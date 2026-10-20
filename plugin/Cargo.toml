@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.99.1"
 license = "GPL-2.0-or-later"
-description = "Unprivileged strongSwan kernel backend Varlink client"
+description = "Unprivileged strongSwan kernel backend tarpc client"
 publish = false
 
 [lib]
@@ -32,9 +32,7 @@ versioning = false
 [dependencies]
 kernel-rust-protocol = { path = "../protocol" }
 libc = "0.2"
-serde = { version = "1", features = ["derive"] }
-rustix = { version = "1.1", features = ["net"] }
-hex = "0.4.3"
+rustix = { version = "1.1", features = ["net", "time"] }
 foreign-types = "0.5.0"
 
 [build-dependencies]

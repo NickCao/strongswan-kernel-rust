@@ -3,11 +3,11 @@
 This repository builds independently of strongSwan. `kernel-rust` replaces
 charon's `kernel-netlink` plugin with a Rust `cdylib` and a
 Rust process, `charon-kernel-daemon`. They communicate using
-[Varlink](https://varlink.org/) over Unix stream sockets. The Rust daemon
+[tarpc](https://docs.rs/tarpc/) over Unix stream sockets. The Rust daemon
 implements Linux XFRM and link operations directly; it never loads the C
 netlink backend. Netlink transport uses `neli`; typed network and XFRM payloads
 use `netlink-packet-route` and `netlink-packet-xfrm`. The canonical API is
-[io.ranet.Kernel.varlink](io.ranet.Kernel.varlink).
+[protocol/src/lib.rs](protocol/src/lib.rs).
 
 The daemon exclusively owns **all global XFRM policies and the XFRM state table
 in its network namespace**, including objects for other transform protocols.
@@ -22,8 +22,8 @@ IKE ports, IPv4/IPv6 selectors, SA output marks, statistics, expiry events,
 and CHILD_SA rekeying. Both default ESP proposals (including AES-GCM and
 AES-CBC with HMAC) and ESN are supported. MOBIKE, transport/BEET mode, AH,
 IPComp, IP-TFS, hardware offload, labels, virtual IPs, and host route/rule
-installation are outside this backend's scope. The plugin rejects these
-features instead of silently changing their behavior.
+installation are outside this backend's scope. The daemon rejects unsupported SA and policy options. The plugin forwards
+all input fields, including options that future backends may support.
 
 The backend advertises `KERNEL_REQUIRE_UDP_ENCAPSULATION`, so charon forces
 ESP-in-UDP for its connections. Existing `encap=yes` configurations behave
@@ -417,12 +417,25 @@ interface ID/mark attributes that its high-level expiry message omits.
 The daemon translates kernel errors to errno replies. Closing a session drops
 its notification routers and wakes the event workers.
 
-Varlink's protocol engine handles client framing and streaming state; its
-standard service dispatcher handles server framing. Socket credentials and
-the session's ownership/disconnect rules stay in this repository. Subnet
-arithmetic uses `ipnet`, hexadecimal keys and tokens use `hex`, session token
-randomness uses `rand`, and daemon arguments use `clap`. Library buffers use
-their normal allocation and release behavior.
+tarpc generates typed clients and dispatch from the shared Rust service trait,
+with Bincode over length-delimited Unix socket frames. Inputs use native integer
+widths, including full-range `u64` lifetimes and counters, and byte vectors for
+keys and security labels. Endpoints retain IP, port, IPv6 flow information and
+scope ID. SA inputs include mode, selectors, interface restrictions, lifetime
+jitter, compression, offload, CPU selection and all flags. Policy inputs retain
+the complete associated ESP/AH/IPComp configuration. Capability checks run in
+the daemon's adapter; the kernel CRUD and reconciliation implementations are
+unchanged. Socket credentials and session ownership/disconnect rules remain in
+this repository. Subnet arithmetic uses `ipnet`, tokens use `rand`, and daemon
+arguments use `clap`. Library buffers use their normal allocation and release
+behavior. Install matching plugin and daemon builds; this internal binary RPC
+contract does not support mixing versions.
+
+The plugin shares one Tokio runtime with a single worker. StrongSwan's
+synchronous callbacks use `Runtime::block_on()` to wait for control replies.
+The Tokio worker drives socket I/O and receives event batches into a bounded
+queue, waking charon's watcher through a local socket pair. StrongSwan event
+callbacks run on its own workers. The runtime drops when the plugin unloads.
 
 The plugin still implements strongSwan's C interfaces. Its remaining unsafe
 code borrows C callback arguments, invokes host functions, manages the exported
@@ -438,7 +451,11 @@ connection.
 ## Session and recovery behavior
 
 The daemon serves one charon session at a time. An independently authenticated
-second connection from the same PID/UID carries Varlink streaming events.
+second connection from the same PID/UID subscribes to typed event batches.
+The event connection waits asynchronously; quiet subscriptions return an empty
+heartbeat every 30 seconds without querying the backend. A bounded local queue
+and socket-pair wakeups deliver batches to charon's synchronous watcher. A
+transport failure disables the control connection without replaying mutations.
 A clean close requires all tunnel SAs/policies removed, cleans larval SPI
 reservations and all remaining global policies, and permits a new session.
 The `FlushSas` RPC clears desired SAs and flushes the whole state table. Flushing
@@ -636,7 +653,9 @@ setpriv, and the Python VICI library. Install that library, or point
 network namespaces and leave the caller's network namespace untouched:
 
 ```sh
-unshare --net -- python3 tests/integration.py target/release/charon-kernel-daemon
+cargo build --release --locked --features test-client --bin kernel-rpc-test-client
+unshare --net -- python3 tests/integration.py target/release/charon-kernel-daemon \
+    target/release/kernel-rpc-test-client
 # Direct backend checks, including mutations through reused native indices:
 unshare --net -- cargo test --locked -p charon-kernel-daemon \
     linux:: -- --ignored
@@ -651,7 +670,7 @@ unshare --net -- python3 tests/tunnel.py /tmp/strongswan-install --dynamic-user 
 ```
 
 The RPC test checks socket group permissions and a rejected nonmember,
-standard introspection (also with varlinkctl when installed), a
+typed tarpc calls through a test-only Rust client adapter, a
 capability-free client, address scope/type filtering, multihomed source
 selection and egress-interface exclusions, ICMP policy priorities, policy
 deletion/modification/flush repair, unsolicited global policy cleanup, policy
@@ -672,7 +691,7 @@ selectors, high ports, output marks, traffic counters, actual rekeying with
 stable interface indices, and final-SA interface deletion. The ABI test uses
 the stock strongSwan 6.1 function tables to exercise both variadic `enumerate`
 and C `va_list` forwarding to Rust's `venumerate`, with IPv4/IPv6 addresses and
-subnets, plus repeated clean sessions and client/daemon descriptor and daemon
+subnets, complete IPv6 sockaddr round trips, plus repeated clean sessions and client/daemon descriptor and daemon
 worker cleanup. The default tunnel run
 negotiates default ESP proposals; the second forces AES-CBC/HMAC-SHA256
 with ESN.

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #![forbid(unsafe_code)]
 use charon_kernel_daemon::{
-    error::invalid,
     linux::interfaces::{name_prefix, DEFAULT_INTERFACE_GROUP},
-    rpc_api,
+    rpc_api::Kernel,
     service::{Server, Service},
     transport,
 };
 use clap::Parser;
+use futures::StreamExt;
 use nix::sys::{
     signal::Signal,
     signalfd::{SfdFlags, SignalFd},
@@ -19,17 +19,16 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     thread,
-    time::Duration,
 };
-use varlink::ConnectionHandler;
+use tarpc::server::Channel;
 
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// Filesystem path for the Varlink socket.
+    /// Filesystem path for the tarpc socket.
     #[arg(long, default_value = "/run/charon-kernel/charon-kernel.sock")]
     socket: PathBuf,
     /// Socket access group, specified by name or numeric GID.
@@ -63,40 +62,41 @@ fn interface_name(value: &str) -> Result<String, String> {
     }
     Ok(value.to_owned())
 }
-fn connection(
-    mut socket: UnixStream,
-    peer: transport::Peer,
-    server: Arc<Server>,
-) -> io::Result<()> {
-    socket.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let service = Service {
-        server,
-        socket: socket.try_clone()?,
-        peer,
-        control: Mutex::new(None),
-    };
-    let dispatcher = varlink::VarlinkService::new(
-        "ranet",
-        "IPsec kernel backend",
-        env!("CARGO_PKG_VERSION"),
-        "https://github.com/NickCao/ranet",
-        vec![Box::new(rpc_api::new(Box::new(service)))],
-    );
-    let mut reader = io::BufReader::new(socket.try_clone()?);
-    // Varlink owns request framing and generated dispatch. Error payloads may
-    // contain key material, so only report an error kind to the accept loop.
-    loop {
-        match dispatcher.handle(&mut reader, &mut socket, None) {
-            // Generated dispatch has already replied InvalidParameter; the
-            // connection remains usable for a subsequent semantic request.
-            Err(error) if matches!(error.kind(), varlink::ErrorKind::SerdeJsonDe(_)) => continue,
-            Err(error) if matches!(error.kind(), varlink::ErrorKind::ConnectionClosed) => {
-                return Ok(())
+fn connection(socket: UnixStream, peer: transport::Peer, server: Arc<Server>) -> io::Result<()> {
+    socket.set_nonblocking(true)?;
+    let service = Service::new(server, socket.try_clone()?, peer);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let socket = tokio::net::UnixStream::from_std(socket)?;
+        let channel = tarpc::server::BaseChannel::with_defaults(
+            charon_kernel_daemon::rpc_api::transport::framed(socket),
+        );
+        let mut requests = channel.requests();
+        let mut tasks = tokio::task::JoinSet::new();
+        let result = loop {
+            tokio::select! {
+                request = requests.next() => match request {
+                    Some(Ok(request)) => { tasks.spawn(request.execute(service.clone().serve())); }
+                    // Do not log decode errors: a failed frame can contain keys.
+                    Some(Err(error)) => {
+                        use tarpc::ChannelError::*;
+                        let kind = match error {
+                            Read(error) | Ready(error) | Write(error) | Flush(error) | Close(error) => error.kind(),
+                        };
+                        break if matches!(kind, io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe) {
+                            Ok(())
+                        } else { Err(kind.into()) };
+                    },
+                    None => break Ok(()),
+                },
+                _ = tasks.join_next(), if !tasks.is_empty() => (),
             }
-            Ok((unread, None)) if unread.is_empty() => return Ok(()),
-            _ => return Err(invalid()),
-        }
-    }
+        };
+        tasks.shutdown().await;
+        result
+    })
 }
 fn run() -> io::Result<()> {
     let Args {
@@ -117,7 +117,7 @@ fn run() -> io::Result<()> {
     let listener = transport::listen(&path, gid)?;
     listener.set_nonblocking(true)?;
     eprintln!(
-        "kernel-daemon: Varlink listening on {} with socket group {gid}",
+        "kernel-daemon: tarpc listening on {} with socket group {gid}",
         path.display()
     );
     let server = Arc::new(Server::new(prefix, master_device, mtu, interface_group));

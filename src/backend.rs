@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 use crate::{
-    error::invalid,
+    error::{invalid, unsupported},
     interfaces::Interfaces,
     linux::{interfaces::LinuxInterfaces, network::Network, policy::LinuxPolicies, xfrm::LinuxSas},
     model::*,
@@ -9,7 +9,6 @@ use crate::{
     sa::{SaChanges, Sas},
 };
 use std::{collections::HashSet, io};
-use zeroize::Zeroizing;
 
 pub struct Backend {
     pub sas: Sas<LinuxSas>,
@@ -66,33 +65,47 @@ impl Backend {
     }
     pub fn install_sa(&mut self, id: rpc::SaId, config: rpc::SaConfig) -> io::Result<()> {
         let id = sa_id(id)?;
-        let enc = decode_key(&config.encryption.key)?;
-        let auth = decode_key(&config.integrity.key)?;
+        // These checks used to run in the plugin. All options now arrive at
+        // this boundary, even when the current backend does not support them.
+        if config.mode != 2
+            || config.ipcomp != 0
+            || config.cpi != 0
+            || config.security_label.is_some()
+            || config.hw_offload != 0
+            || config.cpu != u32::MAX
+            || config.forward_icmp
+            || restricted_interface(config.interface.as_deref())
+        {
+            return Err(unsupported());
+        }
+        let lifetime = config.lifetime.as_ref().ok_or_else(invalid)?;
+        // strongSwan has already applied jitter to these rekey limits. Tunnel
+        // SAs use policies for selection; their selector lists are not installed.
         let data = AddSa {
-            reqid: number(config.reqid)?,
-            seq: number(config.acquireSequence)?,
+            reqid: config.reqid,
+            seq: config.acquire_sequence,
             lifetime: [
-                number(config.lifetime.timeLife)?,
-                number(config.lifetime.timeRekey)?,
-                decimal(&config.lifetime.byteLife)?,
-                decimal(&config.lifetime.byteRekey)?,
-                decimal(&config.lifetime.packetLife)?,
-                decimal(&config.lifetime.packetRekey)?,
+                lifetime.time.life,
+                lifetime.time.rekey,
+                lifetime.bytes.life,
+                lifetime.bytes.rekey,
+                lifetime.packets.life,
+                lifetime.packets.rekey,
             ],
-            enc_alg: number(config.encryption.id)?,
-            enc_key: &enc,
-            int_alg: number(config.integrity.id)?,
-            int_key: &auth,
+            enc_alg: config.encryption.id,
+            enc_key: &config.encryption.key,
+            int_alg: config.integrity.id,
+            int_key: &config.integrity.key,
             enc_name: config.encryption.name.clone(),
             int_name: config.integrity.name.clone(),
-            replay_window: number(config.replayWindow)?,
-            tfc: number(config.tfc)?,
-            encap: config.udpEncapsulation,
-            mark: mark(config.outputMark)?,
+            replay_window: config.replay_window,
+            tfc: config.tfc,
+            encap: config.udp_encapsulation,
+            mark: mark(config.output_mark),
             esn: config.esn,
-            copy_df: config.copyDf,
-            copy_ecn: config.copyEcn,
-            copy_dscp: number(config.copyDscp)?,
+            copy_df: config.copy_df,
+            copy_ecn: config.copy_ecn,
+            copy_dscp: number(config.copy_dscp)?,
             inbound: config.inbound,
             update: config.update,
         };
@@ -101,6 +114,8 @@ impl Backend {
             || data.reqid == 0
             || data.enc_name.len() >= 64
             || data.int_name.len() >= 64
+            || data.enc_key.len() > 8192
+            || data.int_key.len() > 8192
         {
             return Err(invalid());
         }
@@ -139,41 +154,41 @@ impl Backend {
         self.policies.reconcile()
     }
 }
-pub fn number<T: TryFrom<i64>>(n: i64) -> io::Result<T> {
+fn number<T: TryFrom<i32>>(n: i32) -> io::Result<T> {
     T::try_from(n).map_err(|_| invalid())
 }
-fn decimal(s: &str) -> io::Result<u64> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(invalid());
-    }
-    s.parse().map_err(|_| invalid())
-}
 pub fn host(h: rpc::Endpoint) -> io::Result<Host> {
+    let address = std::net::SocketAddr::try_from(&h).map_err(|_| invalid())?;
     Ok(Host {
-        ip: h.address.parse().map_err(|_| invalid())?,
-        port: number(h.port)?,
+        ip: address.ip(),
+        port: address.port(),
     })
 }
 pub fn endpoint(h: Host) -> rpc::Endpoint {
     rpc::Endpoint {
-        address: h.ip.to_string(),
-        port: h.port.into(),
+        address: h.ip,
+        port: h.port,
+        flow_info: 0,
+        scope_id: 0,
     }
 }
-fn mark(m: rpc::Mark) -> io::Result<Mark> {
-    Ok(Mark {
-        value: number(m.value)?,
-        mask: number(m.mask)?,
-    })
+fn mark(m: rpc::Mark) -> Mark {
+    Mark {
+        value: m.value,
+        mask: m.mask,
+    }
 }
 pub fn sa_id(id: rpc::SaId) -> io::Result<SaId> {
+    if id.protocol != 50 {
+        return Err(unsupported());
+    }
     let s = SaId {
         src: host(id.src)?,
         dst: host(id.dst)?,
-        spi: number(id.spi)?,
-        proto: 50,
-        mark: mark(id.mark)?,
-        if_id: number(id.interfaceId)?,
+        spi: id.spi,
+        proto: id.protocol,
+        mark: mark(id.mark),
+        if_id: id.interface_id,
     };
     if s.src.family() != s.dst.family() || s.spi < 256 || s.if_id == 0 {
         return Err(invalid());
@@ -181,20 +196,20 @@ pub fn sa_id(id: rpc::SaId) -> io::Result<SaId> {
     Ok(s)
 }
 pub fn selector(s: rpc::Selector) -> io::Result<Ts> {
-    let from = host(rpc::Endpoint {
-        address: s.from,
+    let from = Host {
+        ip: s.from,
         port: 0,
-    })?;
-    let to = host(rpc::Endpoint {
-        address: s.to,
-        port: 0,
-    })?;
+    };
+    let to = Host { ip: s.to, port: 0 };
+    if s.dynamic || s.kind != if s.from.is_ipv4() { 7 } else { 8 } {
+        return Err(unsupported());
+    }
     let ts = Ts {
         from,
         to,
-        proto: number(s.protocol)?,
-        from_port: number(s.fromPort)?,
-        to_port: number(s.toPort)?,
+        proto: s.protocol,
+        from_port: s.from_port,
+        to_port: s.to_port,
     };
     if ts.from.family() != ts.to.family() || ts.from.ip > ts.to.ip || ts.from_port > ts.to_port {
         return Err(invalid());
@@ -214,20 +229,25 @@ pub fn selector(s: rpc::Selector) -> io::Result<Ts> {
 }
 pub fn rpc_selector(s: Ts) -> rpc::Selector {
     rpc::Selector {
-        from: s.from.ip.to_string(),
-        to: s.to.ip.to_string(),
-        protocol: s.proto.into(),
-        fromPort: s.from_port.into(),
-        toPort: s.to_port.into(),
+        kind: if s.from.ip.is_ipv4() { 7 } else { 8 },
+        dynamic: false,
+        from: s.from.ip,
+        to: s.to.ip,
+        protocol: s.proto,
+        from_port: s.from_port,
+        to_port: s.to_port,
     }
 }
 pub fn policy_id(p: rpc::PolicyId) -> io::Result<PolicyId> {
+    if p.security_label.is_some() || restricted_interface(p.interface.as_deref()) {
+        return Err(unsupported());
+    }
     let id = PolicyId {
         dir: number(p.direction)?,
         src: selector(p.src)?,
         dst: selector(p.dst)?,
-        mark: mark(p.mark)?,
-        if_id: number(p.interfaceId)?,
+        mark: mark(p.mark),
+        if_id: p.interface_id,
     };
     if id.dir > 2 || id.if_id == 0 || id.src.from.family() != id.dst.from.family() {
         return Err(invalid());
@@ -235,15 +255,25 @@ pub fn policy_id(p: rpc::PolicyId) -> io::Result<PolicyId> {
     Ok(id)
 }
 pub fn policy_config(p: rpc::PolicyConfig) -> io::Result<PolicyData> {
+    let sa = p.sa.ok_or_else(unsupported)?;
+    if sa.mode != 2
+        || sa.ah.used
+        || sa.ipcomp.transform != 0
+        || p.hw_offload != 0
+        || p.pcpu_acquires
+        || p.forward_icmp
+    {
+        return Err(unsupported());
+    }
     let d = PolicyData {
         kind: number(p.kind)?,
         prio: number(p.priority)?,
-        manual_prio: number(p.manualPriority)?,
-        src: host(p.src)?,
-        dst: host(p.dst)?,
-        reqid: number(p.reqid)?,
-        policy_count: number(p.policyCount)?,
-        esp: p.espSpi.map(number).transpose()?,
+        manual_prio: p.manual_priority,
+        src: host(p.src.ok_or_else(invalid)?)?,
+        dst: host(p.dst.ok_or_else(invalid)?)?,
+        reqid: sa.reqid,
+        policy_count: sa.policy_count,
+        esp: sa.esp.used.then_some(sa.esp.spi),
     };
     if !(1..=3).contains(&d.kind)
         || d.prio > 3
@@ -254,9 +284,6 @@ pub fn policy_config(p: rpc::PolicyConfig) -> io::Result<PolicyData> {
     }
     Ok(d)
 }
-fn decode_key(s: &str) -> io::Result<Zeroizing<Vec<u8>>> {
-    if s.len() > 16384 {
-        return Err(invalid());
-    }
-    hex::decode(s).map(Zeroizing::new).map_err(|_| invalid())
+fn restricted_interface(interface: Option<&str>) -> bool {
+    interface.is_some_and(|name| !name.is_empty())
 }

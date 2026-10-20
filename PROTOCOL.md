@@ -1,52 +1,52 @@
-# Varlink kernel API
+# tarpc kernel API
 
-[io.ranet.Kernel.varlink](io.ranet.Kernel.varlink) defines the types, methods,
-and errors. The Rust plugin and daemon share bindings generated from this IDL
-with varlink_generator. The Varlink library handles standard JSON framing and
-client protocol state, including streaming event replies.
-The service supports org.varlink.service.GetInfo and
-GetInterfaceDescription. For example:
+[protocol/src/lib.rs](protocol/src/lib.rs) defines the shared Rust types,
+service trait and errors. `#[tarpc::service]` generates the client and dispatch.
+Connections are Unix SOCK_STREAM sockets carrying Bincode-encoded tarpc messages
+in length-delimited frames, with an 8 MiB frame limit. Install matching plugin
+and daemon builds; this internal binary API does not support mixing versions.
 
-```sh
-varlinkctl introspect /run/charon-kernel/charon-kernel.sock io.ranet.Kernel
-```
+The plugin bridges strongSwan's synchronous callbacks using `Runtime::block_on()`
+on charon's calling threads. One shared Tokio worker drives socket I/O and
+receives events into a bounded queue, waking charon's watcher, which invokes
+strongSwan callbacks on its own workers.
+Application errors distinguish invalid sessions, an occupied session and kernel
+errors carrying a positive errno. tarpc handles request IDs, deadlines,
+cancellation, framing and transport errors.
 
-Connections are Unix SOCK_STREAM sockets. Each JSON message ends with NUL.
-Requests on the control connection are serialized, as required by Varlink.
-Replies may omit `parameters` for methods with no output. Standard Varlink errors describe
-unknown methods and invalid parameter types; io.ranet.Kernel.KernelError
-contains a positive Linux errno for rejected/kernel operations.
-
-OpenSession authenticates ownership of the control connection and returns
-feature flags plus a random token. Its interfacesUse and interfacesIgnore
+`open_session` authenticates ownership of the control connection and returns
+feature flags plus a random token. Its `interfaces_use` and `interfaces_ignore`
 arguments carry charon's interface filters; a nonempty allowlist takes
-precedence over the denylist. WatchEvents requires a second connection
-from the same UID/PID and that token, with `more: true`. Its first response
-has `event.kind: ready`, then events use `continues: true`. Events are typed
-expiry, acquire, NAT mapping, or network change notifications. The event
-queue is bounded; a broken or stalled event channel invalidates control
+precedence over the denylist. `subscribe_events` requires a second connection
+from the same UID/PID and that token. After successful subscription,
+`next_events` waits for a batch of typed expiry, acquire, NAT mapping, or
+network change notifications. Quiet
+subscriptions return an empty heartbeat after 30 seconds; the plugin uses a
+60-second event deadline. The event queue is bounded; a broken or stalled event channel invalidates control
 instead of silently losing expiry events. The daemon keeps receiving hard
 expiry events after a client disconnects to release expired SA interfaces.
 
-SA keys are hexadecimal input strings. Algorithm identifiers use
+SA keys and security labels use byte vectors. Algorithm identifiers use
 strongSwan's encryption/integrity identifiers; optional kernel names support
 registered algorithms. Mark values/masks, SPIs, interface IDs, and request
-IDs are unsigned 32-bit values expressed as Varlink integers. Addresses are
-numeric IPv4/IPv6 strings. Byte/packet counters and lifetime limits use
-unsigned decimal strings to retain all uint64 values. Last-use timestamps
-are monotonic seconds, matching the kernel interface. Negative or
-out-of-range numbers and selectors that cannot be represented as XFRM
-prefixes/port masks are rejected.
+IDs use native `u32` values. Endpoints retain `IpAddr`, port, IPv6 flow information
+and scope ID. Counters and all lifetime limits/jitter use `u64`. Last-use
+timestamps are monotonic seconds, matching the kernel interface. SA and policy
+inputs carry the complete strongSwan callback data, including unsupported
+options; the daemon's adapter rejects unsupported configurations before calling
+the existing backend. Its supported kernel model remains tunnel-mode ESP over
+XFRM interfaces. Discovery's backend currently uses IP and port; transporting
+IPv6 metadata does not add scoped routing support.
 
-InstallSa always means tunnel-mode ESP with a nonzero interface ID. It
+`install_sa` currently requires tunnel-mode ESP with a nonzero interface ID. It
 creates an up XFRM interface when necessary; no route, address, or explicit
-interface-management methods exist. RemoveSa, FlushSas, or a hard expiry
+interface-management methods exist. `remove_sa`, `flush_sas`, or a hard expiry
 release an unused interface. Policy reference counts preserve overlapping
-rekey policies. FlushPolicies removes only session-owned tunnel policies,
-retaining port bypasses. CloseSession succeeds only with no tunnel
+rekey policies. `flush_policies` clears desired tunnel policies and reconciles,
+retaining port bypasses. `close_session` succeeds only with no tunnel
 SAs/policies and then removes bypasses and larval allocations.
 
-BypassPort takes an address family (AF_INET/AF_INET6) and a UDP port at least
+`bypass_port` takes an address family (AF_INET/AF_INET6) and a UDP port at least
 1024. Charon binds and enables UDP encapsulation itself; no descriptors are
 passed. Read-only network discovery caches link/address Netlink dumps and
 invalidates them on link/address changes. Source-address and nexthop queries

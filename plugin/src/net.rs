@@ -5,10 +5,7 @@ use crate::{
     status_t, status_t_FAILED, status_t_NOT_SUPPORTED, ClientExt, Result,
 };
 use foreign_types::ForeignType;
-use kernel_rust_protocol::{
-    self as api,
-    client::{Client, Empty},
-};
+use kernel_rust_protocol::{client::Client, context};
 use std::{
     ffi::{CString, VaList},
     mem::ManuallyDrop,
@@ -58,15 +55,14 @@ unsafe extern "C" fn get_source_addr(
 ) -> *mut ffi::host_t {
     let this = unsafe { &*this.cast::<Net>() };
     let operation = || -> Result<Host> {
-        let parameters = unsafe {
-            api::GetSourceAddress_Args {
-                destination: host::endpoint(destination)?,
-                source: host::optional_endpoint(source)?,
-            }
-        };
-        let reply: api::GetSourceAddress_Reply =
-            this.client.call("GetSourceAddress", &parameters)?;
-        Host::parse(&reply.address)
+        let destination = unsafe { host::endpoint(destination) }?;
+        let source = unsafe { host::optional_endpoint(source) }?;
+        let address = this.client.call(this.client.rpc().get_source_address(
+            context::current(),
+            destination,
+            source,
+        ))?;
+        Host::parse(&address)
     };
     operation().map_or(ptr::null_mut(), Host::into_ptr)
 }
@@ -84,14 +80,14 @@ unsafe extern "C" fn get_nexthop(
         **output = ptr::null_mut();
     }
     let operation = || -> Result<Host> {
-        let parameters = unsafe {
-            api::GetNextHop_Args {
-                destination: host::endpoint(destination)?,
-                source: host::optional_endpoint(source)?,
-                prefix: Some(prefix.into()),
-            }
-        };
-        let reply: api::GetNextHop_Reply = this.client.call("GetNextHop", &parameters)?;
+        let destination = unsafe { host::endpoint(destination) }?;
+        let source = unsafe { host::optional_endpoint(source) }?;
+        let reply = this.client.call(this.client.rpc().get_next_hop(
+            context::current(),
+            destination,
+            source,
+            Some(prefix),
+        ))?;
         let host = Host::parse(&reply.gateway)?;
         if let Some(output) = interface {
             *output = host::duplicate(&reply.interface)?;
@@ -112,12 +108,12 @@ unsafe extern "C" fn get_interface(
         **output = ptr::null_mut();
     }
     let operation = || -> Result<()> {
-        let parameters = api::GetInterface_Args {
-            address: unsafe { host::endpoint(address) }?,
-        };
-        let reply: api::GetInterface_Reply = this.client.call("GetInterface", &parameters)?;
+        let address = unsafe { host::endpoint(address) }?;
+        let interface = this
+            .client
+            .call(this.client.rpc().get_interface(context::current(), address))?;
         if let Some(output) = name {
-            *output = host::duplicate(&reply.interface)?;
+            *output = host::duplicate(&interface)?;
         }
         Ok(())
     };
@@ -207,17 +203,13 @@ unsafe extern "C" fn create_address_enumerator(
 ) -> *mut ffi::enumerator_t {
     let this = unsafe { &*this.cast::<Net>() };
     let operation = || -> Result<Vec<Item>> {
-        let reply: api::ListAddresses_Reply = this.client.call(
-            "ListAddresses",
-            &api::ListAddresses_Args {
-                which: which.into(),
-            },
-        )?;
-        if reply.addresses.len() > 4096 {
+        let addresses = this
+            .client
+            .call(this.client.rpc().list_addresses(context::current(), which))?;
+        if addresses.len() > 4096 {
             return Err(status_t_FAILED);
         }
-        reply
-            .addresses
+        addresses
             .iter()
             .map(|a| {
                 Ok(Item {
@@ -236,16 +228,17 @@ unsafe extern "C" fn create_local_subnet_enumerator(
 ) -> *mut ffi::enumerator_t {
     let this = unsafe { &*this.cast::<Net>() };
     let operation = || -> Result<Vec<Item>> {
-        let reply: api::ListSubnets_Reply = this.client.call("ListSubnets", &Empty {})?;
-        if reply.subnets.len() > 4096 {
+        let subnets = this
+            .client
+            .call(this.client.rpc().list_subnets(context::current()))?;
+        if subnets.len() > 4096 {
             return Err(status_t_FAILED);
         }
-        reply
-            .subnets
+        subnets
             .iter()
             .map(|s| {
                 let host = Host::parse(&s.address)?;
-                let prefix = u8::try_from(s.prefix).map_err(|_| status_t_FAILED)?;
+                let prefix = s.prefix;
                 let max = if host.family() == libc::AF_INET {
                     32
                 } else {

@@ -1,5 +1,16 @@
-{ pkgs, module }:
+{
+  pkgs,
+  module,
+  package,
+}:
 let
+  abiPrefix = pkgs.symlinkJoin {
+    name = "kernel-rust-abi-prefix";
+    paths = [
+      package.strongswan
+      package
+    ];
+  };
   connection =
     peer: proposal:
     pkgs.writeText "swanctl-${toString peer}-${proposal}.conf" ''
@@ -77,6 +88,11 @@ let
         "esp6"
         "vrf"
       ];
+      # Tokio/tarpc read the clock frequently. The test harness's emulated ACPI
+      # clock is costly under nested KVM; use its paravirtual clock for VICI.
+      boot.kernelParams = lib.mkAfter (
+        lib.optional pkgs.stdenv.hostPlatform.isx86_64 "clocksource=kvm-clock"
+      );
       networking = {
         useDHCP = false;
         interfaces.eth1.ipv4.addresses = lib.mkForce [
@@ -346,9 +362,12 @@ in
     with subtest("kernel RPC contracts in an isolated network namespace"):
         daemon = left.succeed("command -v charon-kernel-daemon").strip()
         bypasses = left.succeed("ip xfrm policy list nosock")
-        left.succeed("unshare --net python3 ${../tests/integration.py} " + daemon)
+        left.succeed("unshare --net python3 ${../tests/integration.py} " + daemon + " ${package.testClient}/bin/kernel-rpc-test-client")
         assert not links(left) and not spis(left)
         assert left.succeed("ip xfrm policy list nosock") == bypasses
+
+    with subtest("C ABI and complete IPv6 endpoints through tarpc"):
+        left.succeed("unshare --net python3 ${../tests/plugin.py} ${abiPrefix}")
 
     with subtest("VICI stays responsive with 200 connections and continuous route updates"):
         left.succeed(

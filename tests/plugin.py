@@ -10,6 +10,7 @@ import argparse
 import ctypes as c
 import ipaddress
 import os
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -46,6 +47,11 @@ class Host(c.Structure):
         "get_address", "get_port", "set_port", "ip_equals", "equals", "destroy")]
 
 
+class SockaddrIn6(c.Structure):
+    _fields_ = [("family", c.c_uint16), ("port", c.c_uint16), ("flow", c.c_uint32),
+                ("address", c.c_ubyte * 16), ("scope", c.c_uint32)]
+
+
 def method(pointer, table, field, result, *arguments):
     address = c.cast(pointer, c.POINTER(table)).contents
     return c.CFUNCTYPE(result, c.c_void_p, *arguments)(getattr(address, field))
@@ -61,6 +67,8 @@ def child(prefix, config):
     library.library_init.restype = c.c_bool
     library.host_create_from_string.argtypes = [c.c_char_p, c.c_uint16]
     library.host_create_from_string.restype = c.c_void_p
+    library.host_create_from_sockaddr.argtypes = [c.c_void_p]
+    library.host_create_from_sockaddr.restype = c.c_void_p
     charon.libcharon_init.restype = c.c_bool
     assert library.library_init(os.fsencode(config), b"charon")
     assert charon.libcharon_init()
@@ -98,6 +106,29 @@ def child(prefix, config):
                             method(source, Host, "destroy", None)(source)
                     finally:
                         method(destination, Host, "destroy", None)(destination)
+                # Exercise all sockaddr_in6 endpoint fields through both C/Rust
+                # conversions and the real daemon, including nonzero flow/scope.
+                native = SockaddrIn6(socket.AF_INET6, socket.htons(13000),
+                                     socket.htonl(0x12345678),
+                                     (c.c_ubyte * 16).from_buffer_copy(ipaddress.ip_address("2001:db8::63").packed),
+                                     socket.if_nametoindex("test0"))
+                supplied = library.host_create_from_sockaddr(c.byref(native))
+                destination = library.host_create_from_string(b"2001:db8::1", 13001)
+                assert supplied and destination
+                try:
+                    source = method(net, Net, "get_source_addr", c.c_void_p,
+                                    c.c_void_p, c.c_void_p)(net, destination, supplied)
+                    assert source
+                    try:
+                        pointer = method(source, Host, "get_sockaddr", c.c_void_p)(source)
+                        actual = c.cast(pointer, c.POINTER(SockaddrIn6)).contents
+                        assert (actual.family, actual.port, actual.flow, bytes(actual.address), actual.scope) == (
+                            native.family, native.port, native.flow, bytes(native.address), native.scope)
+                    finally:
+                        method(source, Host, "destroy", None)(source)
+                finally:
+                    method(supplied, Host, "destroy", None)(supplied)
+                    method(destination, Host, "destroy", None)(destination)
                 for subnets in (False, True):
                     for forwarded in (False, True):
                         if subnets:

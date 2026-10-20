@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 use crate::{
     backend::{self, Backend},
-    error::invalid,
+    error::{invalid, unsupported},
     linux::{
         netlink::{Netlink, NlFamily, Notifications},
         xfrm,
@@ -82,10 +82,10 @@ impl Server {
 pub struct Session {
     uid: u32,
     pid: i32,
-    token: String,
+    token: SessionToken,
     backend: Mutex<Backend>,
-    events: SyncSender<Option<Vec<Event>>>,
-    receiver: Mutex<Option<Receiver<Option<Vec<Event>>>>>,
+    events: tokio::sync::mpsc::Sender<Option<Vec<Event>>>,
+    receiver: Mutex<Option<tokio::sync::mpsc::Receiver<Option<Vec<Event>>>>>,
     connected: AtomicBool,
     closed: AtomicBool,
     roam: AtomicU8,
@@ -110,20 +110,63 @@ impl Session {
         let _ = self.events.try_send(None);
     }
 }
-pub struct Service {
-    pub server: Arc<Server>,
-    pub socket: UnixStream,
-    pub peer: transport::Peer,
-    pub control: Mutex<Option<Arc<Session>>>,
+#[derive(Clone)]
+pub struct Service(Arc<Connection>);
+pub struct Connection {
+    server: Arc<Server>,
+    socket: UnixStream,
+    peer: transport::Peer,
+    control: Mutex<Option<Arc<Session>>>,
+    watch: tokio::sync::Mutex<Option<Watch>>,
 }
-impl Drop for Service {
+struct Watch {
+    session: Arc<Session>,
+    receiver: tokio::sync::mpsc::Receiver<Option<Vec<Event>>>,
+    next_roam: Instant,
+}
+impl Drop for Connection {
     fn drop(&mut self) {
-        if let Some(s) = self.control.lock().unwrap().as_ref() {
+        let control = self.control.get_mut().unwrap().as_ref();
+        let watch = self.watch.get_mut().as_ref().map(|w| &w.session);
+        if let Some(s) = control.or(watch) {
             if !s.closed.load(Ordering::Acquire) {
                 s.fail();
                 eprintln!("kernel-daemon: client disconnected; preserving tunnel objects; replacement sessions require daemon restart");
             }
         }
+    }
+}
+impl std::ops::Deref for Service {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+impl Service {
+    pub fn new(server: Arc<Server>, socket: UnixStream, peer: transport::Peer) -> Self {
+        Self(Arc::new(Connection {
+            server,
+            socket,
+            peer,
+            control: Mutex::new(None),
+            watch: tokio::sync::Mutex::new(None),
+        }))
+    }
+    fn request<T>(&self, operation: impl FnOnce(&mut Backend) -> io::Result<T>) -> Result<T> {
+        let session = self
+            .control
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(Error::InvalidSession)?;
+        let mut backend = session.backend.lock().unwrap();
+        if !session.connected.load(Ordering::Acquire) || session.closed.load(Ordering::Acquire) {
+            return Err(Error::InvalidSession);
+        }
+        if session.network_changed.swap(false, Ordering::Acquire) {
+            backend.net.invalidate();
+        }
+        operation(&mut backend).map_err(Error::from)
     }
 }
 fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
@@ -232,16 +275,16 @@ fn repair_loop(session: Arc<Session>, wakeup: Receiver<()>) {
                     .expired
                     .into_iter()
                     .map(|id| Event {
-                        kind: Event_kind::expire,
+                        kind: EventKind::Expire,
                         expiry: Some(Expiry {
-                            protocol: id.proto.into(),
-                            spi: id.spi.into(),
+                            protocol: id.proto,
+                            spi: id.spi,
                             destination: backend::endpoint(id.dst),
                             hard: true,
                         }),
                         acquire: None,
                         mapping: None,
-                        addressChanged: None,
+                        address_changed: None,
                     })
                     .collect();
                 if !events.is_empty() && session.events.try_send(Some(events)).is_err() {
@@ -259,60 +302,24 @@ fn repair_loop(session: Arc<Session>, wakeup: Receiver<()>) {
         next_audit = Instant::now() + AUDIT_INTERVAL;
     }
 }
-macro_rules! request {
-    ($this:expr, $call:expr, $b:ident, $body:expr, $reply:expr) => {{
-        let session = $this.control.lock().unwrap().clone();
-        match session {
-            Some(s) if s.connected.load(Ordering::Acquire) && !s.closed.load(Ordering::Acquire) => {
-                let result = {
-                    let mut guard = s.backend.lock().unwrap();
-                    if !s.connected.load(Ordering::Acquire) || s.closed.load(Ordering::Acquire) {
-                        return $call.reply_invalid_session();
-                    }
-                    let $b = &mut *guard;
-                    if s.network_changed.swap(false, Ordering::Acquire) {
-                        $b.net.invalidate();
-                    }
-                    {
-                        #[allow(clippy::redundant_closure_call)]
-                        let result = (|| -> io::Result<_> { $body })();
-                        result
-                    }
-                };
-                match result {
-                    Ok(value) => ($reply)($call, value),
-                    Err(e) => {
-                        $call.reply_kernel_error(e.raw_os_error().unwrap_or(libc::EINVAL).into())
-                    }
-                }
-            }
-            _ => $call.reply_invalid_session(),
-        }
-    }};
-}
-impl VarlinkInterface for Service {
-    fn open_session(
-        &self,
-        call: &mut dyn Call_OpenSession,
-        interfaces_use: String,
-        interfaces_ignore: String,
-    ) -> varlink::Result<()> {
-        if call.is_oneway() || call.wants_more() {
-            return call.reply_invalid_parameter("OpenSession".into());
-        }
+impl Kernel for Service {
+    async fn open_session(
+        self,
+        _: tarpc::context::Context,
+        config: SessionConfig,
+    ) -> Result<SessionInfo> {
         let mut active = self.server.active.lock().unwrap();
         if self.server.stopping.load(Ordering::Acquire) {
-            return call.reply_invalid_session();
+            return Err(Error::InvalidSession);
         }
         if active.is_some() || self.control.lock().unwrap().is_some() {
-            return call.reply_session_busy();
+            return Err(Error::SessionBusy);
         }
         let create = || -> io::Result<_> {
-            if interfaces_use.len() > 4096 || interfaces_ignore.len() > 4096 {
+            if config.interfaces_use.len() > 4096 || config.interfaces_ignore.len() > 4096 {
                 return Err(invalid());
             }
-            // Subscribe before the first discovery snapshot so changes during
-            // startup are retained and invalidate it on the next request.
+            // Subscribe before discovery so startup changes remain observable.
             let (route_socket, route) =
                 Netlink::subscribe(NlFamily::Route, 1 | 0x10 | 0x100 | 0x40 | 0x400)?;
             let mut backend = Backend::new(
@@ -320,23 +327,21 @@ impl VarlinkInterface for Service {
                 self.server.master_device.clone(),
                 self.server.mtu,
                 self.server.interface_group,
-                interfaces_use,
-                interfaces_ignore,
+                config.interfaces_use,
+                config.interfaces_ignore,
             )?;
-            // Retire namespace-owned leftovers before accepting new desired
-            // state. No established SA or old key is adopted after a restart.
             backend.policies.reconcile()?;
             backend.sas.clear()?;
             backend.reconcile_interfaces()?;
             let (xfrm_socket, xfrm) = Netlink::subscribe(NlFamily::Xfrm, 1 | 2 | 4 | 8 | 128)?;
-            let token = hex::encode(rand::random::<[u8; 32]>());
-            let features = backend.sas.features().into();
-            let (tx, rx) = mpsc::sync_channel(256);
+            let token = rand::random::<SessionToken>();
+            let features = backend.sas.features();
+            let (tx, rx) = tokio::sync::mpsc::channel(256);
             let (repair_wakeup, repair_receiver) = mpsc::sync_channel(1);
-            let s = Arc::new(Session {
+            let session = Arc::new(Session {
                 uid: self.peer.uid,
                 pid: self.peer.pid,
-                token: token.clone(),
+                token,
                 backend: Mutex::new(backend),
                 events: tx,
                 receiver: Mutex::new(Some(rx)),
@@ -348,331 +353,264 @@ impl VarlinkInterface for Service {
                 control: self.socket.try_clone()?,
                 event_sockets: Mutex::new(Some([xfrm_socket, route_socket])),
             });
-            Ok((s, token, features, xfrm, route, repair_receiver))
+            Ok((session, token, features, xfrm, route, repair_receiver))
         };
-        let (s, token, features, xfrm, route, repair_receiver) = match create() {
-            Ok(v) => v,
-            Err(e) => return call.reply_kernel_error(e.raw_os_error().unwrap_or(libc::EIO).into()),
-        };
-        *active = Some(s.clone());
-        *self.control.lock().unwrap() = Some(s.clone());
-        let session = s.clone();
-        thread::spawn(move || event_loop(session, true, xfrm));
-        let session = s.clone();
-        thread::spawn(move || repair_loop(session, repair_receiver));
-        thread::spawn(move || event_loop(s, false, route));
-        call.reply(token, features)
+        let (session, token, features, xfrm, route, repair_receiver) = create()?;
+        *active = Some(session.clone());
+        *self.control.lock().unwrap() = Some(session.clone());
+        let worker = session.clone();
+        thread::spawn(move || event_loop(worker, true, xfrm));
+        let worker = session.clone();
+        thread::spawn(move || repair_loop(worker, repair_receiver));
+        thread::spawn(move || event_loop(session, false, route));
+        Ok(SessionInfo { token, features })
     }
-    fn close_session(&self, call: &mut dyn Call_CloseSession) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            {
-                b.close()?;
-                let s = self.control.lock().unwrap().as_ref().unwrap().clone();
-                s.stop_workers();
-                *self.server.active.lock().unwrap() = None;
-                Ok(())
-            },
-            |c: &mut dyn Call_CloseSession, ()| c.reply()
-        )
+    async fn close_session(self, _: tarpc::context::Context) -> Result<()> {
+        self.request(|backend| {
+            backend.close()?;
+            self.control
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .stop_workers();
+            *self.server.active.lock().unwrap() = None;
+            Ok(())
+        })
     }
-    fn watch_events(&self, call: &mut dyn Call_WatchEvents, token: String) -> varlink::Result<()> {
-        if !call.wants_more() || call.is_oneway() {
-            return call.reply_invalid_parameter("more".into());
+    async fn subscribe_events(self, _: tarpc::context::Context, token: SessionToken) -> Result<()> {
+        let mut watch = self.watch.lock().await;
+        if watch.is_some() {
+            return Err(Error::SessionBusy);
         }
-        let session = self.server.active.lock().unwrap().clone();
-        let s = match session {
-            Some(s)
-                if s.uid == self.peer.uid
-                    && s.pid == self.peer.pid
-                    && s.token == token
-                    && s.connected.load(Ordering::Acquire) =>
+        let session = self
+            .server
+            .active
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(Error::InvalidSession)?;
+        if session.uid != self.peer.uid
+            || session.pid != self.peer.pid
+            || session.token != token
+            || !session.connected.load(Ordering::Acquire)
+        {
+            return Err(Error::InvalidSession);
+        }
+        let receiver = session
+            .receiver
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or(Error::SessionBusy)?;
+        *watch = Some(Watch {
+            session,
+            receiver,
+            next_roam: Instant::now() + ROAM_DELAY,
+        });
+        Ok(())
+    }
+    async fn next_events(self, _: tarpc::context::Context) -> Result<Vec<Event>> {
+        let mut guard = self.watch.lock().await;
+        let watch = guard.as_mut().ok_or(Error::InvalidSession)?;
+        let heartbeat = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(heartbeat);
+        loop {
+            let session = &watch.session;
+            if !session.connected.load(Ordering::Acquire) || session.closed.load(Ordering::Acquire)
             {
-                s
+                return Err(Error::InvalidSession);
             }
-            _ => return call.reply_invalid_session(),
-        };
-        let receiver = match s.receiver.lock().unwrap().take() {
-            Some(r) => r,
-            None => return call.reply_session_busy(),
-        };
-        call.set_continues(true);
-        if let Err(e) = call.reply(Event {
-            kind: Event_kind::ready,
-            expiry: None,
-            acquire: None,
-            mapping: None,
-            addressChanged: None,
-        }) {
-            s.fail();
-            return Err(e);
-        }
-        let mut next_roam = Instant::now() + ROAM_DELAY;
-        while s.connected.load(Ordering::Acquire) && !s.closed.load(Ordering::Acquire) {
-            match receiver.recv_timeout(next_roam.saturating_duration_since(Instant::now())) {
-                Ok(Some(events)) => {
-                    for event in events {
-                        if s.closed.load(Ordering::Acquire) {
-                            break;
-                        }
-                        if let Err(e) = call.reply(event) {
-                            s.fail();
-                            return Err(e);
-                        }
-                    }
-                }
-                Ok(None) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => (),
-                Err(_) => break,
-            }
-            if Instant::now() >= next_roam {
-                let changes = s.roam.swap(0, Ordering::Relaxed);
+            if Instant::now() >= watch.next_roam {
+                watch.next_roam = Instant::now() + ROAM_DELAY;
+                let changes = session.roam.swap(0, Ordering::Relaxed);
                 if changes != 0 {
-                    if let Err(e) = call.reply(Event {
-                        kind: Event_kind::roam,
-                        addressChanged: Some(changes & ADDRESS_CHANGED != 0),
+                    return Ok(vec![Event {
+                        kind: EventKind::Roam,
+                        address_changed: Some(changes & ADDRESS_CHANGED != 0),
                         expiry: None,
                         acquire: None,
                         mapping: None,
-                    }) {
-                        s.fail();
-                        return Err(e);
-                    }
+                    }]);
                 }
-                next_roam = Instant::now() + ROAM_DELAY;
             }
-            if transport::disconnected(&self.socket) {
-                s.fail();
-                break;
+            tokio::select! {
+                batch = watch.receiver.recv() => return batch.flatten().ok_or(Error::InvalidSession),
+                _ = tokio::time::sleep_until(watch.next_roam.into()) => (),
+                // Keep a quiet subscription within tarpc's request deadline.
+                // No backend inventory or mutation is triggered by heartbeats.
+                _ = &mut heartbeat => return Ok(Vec::new()),
             }
         }
-        call.set_continues(false);
-        call.reply_invalid_session()
     }
-    fn allocate_spi(
-        &self,
-        call: &mut dyn Call_AllocateSpi,
+    async fn allocate_spi(
+        self,
+        _: tarpc::context::Context,
         src: Endpoint,
         dst: Endpoint,
-        minimum: i64,
-        maximum: i64,
-    ) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            {
-                let (src, dst) = (backend::host(src)?, backend::host(dst)?);
-                let (min, max): (u32, u32) = (backend::number(minimum)?, backend::number(maximum)?);
-                if src.family() != dst.family() || min < 256 || min > max {
-                    return Err(invalid());
-                }
-                b.sas.allocate(src, dst, 50, min, max)
-            },
-            |c: &mut dyn Call_AllocateSpi, spi: u32| c.reply(spi.into())
-        )
+        protocol: u8,
+        minimum: u32,
+        maximum: u32,
+    ) -> Result<u32> {
+        self.request(|backend| {
+            if protocol != 50 {
+                return Err(unsupported());
+            }
+            let (src, dst) = (backend::host(src)?, backend::host(dst)?);
+            if src.family() != dst.family() || minimum < 256 || minimum > maximum {
+                return Err(invalid());
+            }
+            backend.sas.allocate(src, dst, protocol, minimum, maximum)
+        })
     }
-    fn install_sa(
-        &self,
-        call: &mut dyn Call_InstallSa,
+    async fn allocate_cpi(
+        self,
+        _: tarpc::context::Context,
+        _src: Endpoint,
+        _dst: Endpoint,
+    ) -> Result<u16> {
+        self.request(|_| Err(unsupported()))
+    }
+    async fn install_sa(
+        self,
+        _: tarpc::context::Context,
         id: SaId,
         config: SaConfig,
-    ) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            b.install_sa(id, config),
-            |c: &mut dyn Call_InstallSa, ()| c.reply()
-        )
+    ) -> Result<()> {
+        self.request(|backend| backend.install_sa(id, config))
     }
-    fn remove_sa(&self, call: &mut dyn Call_RemoveSa, id: SaId) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            b.remove_sa(id),
-            |c: &mut dyn Call_RemoveSa, ()| c.reply()
-        )
+    async fn update_sa(
+        self,
+        _: tarpc::context::Context,
+        _id: SaId,
+        _config: SaUpdate,
+    ) -> Result<()> {
+        self.request(|_| Err(unsupported()))
     }
-    fn query_sa(&self, call: &mut dyn Call_QuerySa, id: SaId) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            b.sas.query(&backend::sa_id(id)?),
-            |c: &mut dyn Call_QuerySa, usage: crate::sa::SaUsage| c.reply(
-                usage.bytes.to_string(),
-                usage.packets.to_string(),
-                usage.last_use as i64
-            )
-        )
+    async fn query_sa(self, _: tarpc::context::Context, id: SaId, cpi: u16) -> Result<SaUsage> {
+        self.request(|backend| {
+            if cpi != 0 {
+                return Err(unsupported());
+            }
+            let usage = backend.sas.query(&backend::sa_id(id)?)?;
+            Ok(SaUsage {
+                bytes: usage.bytes,
+                packets: usage.packets,
+                last_use: usage.last_use,
+            })
+        })
     }
-    fn flush_sas(&self, call: &mut dyn Call_FlushSas) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            b.flush_sas(),
-            |c: &mut dyn Call_FlushSas, ()| c.reply()
-        )
+    async fn remove_sa(self, _: tarpc::context::Context, id: SaId, cpi: u16) -> Result<()> {
+        self.request(|backend| {
+            if cpi != 0 {
+                return Err(unsupported());
+            }
+            backend.remove_sa(id)
+        })
     }
-    fn install_policy(
-        &self,
-        call: &mut dyn Call_InstallPolicy,
+    async fn flush_sas(self, _: tarpc::context::Context) -> Result<()> {
+        self.request(Backend::flush_sas)
+    }
+    async fn install_policy(
+        self,
+        _: tarpc::context::Context,
         id: PolicyId,
         config: PolicyConfig,
-    ) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            b.policies
-                .add_policy(backend::policy_id(id)?, backend::policy_config(config)?,),
-            |c: &mut dyn Call_InstallPolicy, ()| c.reply()
-        )
+    ) -> Result<()> {
+        self.request(|backend| {
+            backend
+                .policies
+                .add_policy(backend::policy_id(id)?, backend::policy_config(config)?)
+        })
     }
-    fn remove_policy(
-        &self,
-        call: &mut dyn Call_RemovePolicy,
+    async fn remove_policy(
+        self,
+        _: tarpc::context::Context,
         id: PolicyId,
         config: PolicyConfig,
-    ) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            b.policies
-                .delete_policy(&backend::policy_id(id)?, &backend::policy_config(config)?,),
-            |c: &mut dyn Call_RemovePolicy, ()| c.reply()
-        )
+    ) -> Result<()> {
+        self.request(|backend| {
+            backend
+                .policies
+                .delete_policy(&backend::policy_id(id)?, &backend::policy_config(config)?)
+        })
     }
-    fn query_policy(&self, call: &mut dyn Call_QueryPolicy, id: PolicyId) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            b.policies.query_policy(&backend::policy_id(id)?),
-            |c: &mut dyn Call_QueryPolicy, time: u64| c.reply(time as i64)
-        )
+    async fn query_policy(self, _: tarpc::context::Context, id: PolicyId) -> Result<u64> {
+        self.request(|backend| backend.policies.query_policy(&backend::policy_id(id)?))
     }
-    fn flush_policies(&self, call: &mut dyn Call_FlushPolicies) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            b.policies.flush_policies(),
-            |c: &mut dyn Call_FlushPolicies, ()| c.reply()
-        )
+    async fn flush_policies(self, _: tarpc::context::Context) -> Result<()> {
+        self.request(|backend| backend.policies.flush_policies())
     }
-    fn bypass_port(
-        &self,
-        call: &mut dyn Call_BypassPort,
-        family: i64,
-        port: i64,
-    ) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            {
-                let port: u16 = backend::number(port)?;
-                let family = backend::number(family)?;
-                if port < 1024 {
-                    return Err(invalid());
-                }
-                b.policies.port_bypass(family, port)
-            },
-            |c: &mut dyn Call_BypassPort, ()| c.reply()
-        )
+    async fn bypass_port(self, _: tarpc::context::Context, family: u16, port: u16) -> Result<()> {
+        self.request(|backend| {
+            if ![libc::AF_INET as u16, libc::AF_INET6 as u16].contains(&family) || port < 1024 {
+                return Err(invalid());
+            }
+            backend.policies.port_bypass(family, port)
+        })
     }
-    fn get_source_address(
-        &self,
-        call: &mut dyn Call_GetSourceAddress,
+    async fn get_source_address(
+        self,
+        _: tarpc::context::Context,
         destination: Endpoint,
         source: Option<Endpoint>,
-    ) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            {
-                let src = source.map(backend::host).transpose()?;
-                let (h, _, _) = b
+    ) -> Result<Endpoint> {
+        self.request(|backend| {
+            let src = source.map(backend::host).transpose()?;
+            let (host, _, _) =
+                backend
                     .net
                     .lookup(&backend::host(destination)?, src.as_ref(), -1)?;
-                Ok(backend::endpoint(h))
-            },
-            |c: &mut dyn Call_GetSourceAddress, h| c.reply(h)
-        )
+            // Preserve the full caller endpoint when the backend confirms it.
+            Ok(source
+                .filter(|s| s.address == host.ip)
+                .unwrap_or_else(|| backend::endpoint(host)))
+        })
     }
-    fn get_next_hop(
-        &self,
-        call: &mut dyn Call_GetNextHop,
+    async fn get_next_hop(
+        self,
+        _: tarpc::context::Context,
         destination: Endpoint,
         source: Option<Endpoint>,
-        prefix: Option<i64>,
-    ) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            {
-                let dst = backend::host(destination)?;
-                let src = source.map(backend::host).transpose()?;
-                let prefix: i32 = prefix.map(backend::number).transpose()?.unwrap_or(-1);
-                if prefix < -1 || prefix > dst.bits().into() {
-                    return Err(invalid());
-                }
-                let (_, gw, iface) = b.net.lookup(&dst, src.as_ref(), prefix)?;
-                Ok((backend::endpoint(gw), iface))
-            },
-            |c: &mut dyn Call_GetNextHop, (gw, iface)| c.reply(gw, iface)
-        )
+        prefix: Option<i32>,
+    ) -> Result<NextHop> {
+        self.request(|backend| {
+            let dst = backend::host(destination)?;
+            let src = source.map(backend::host).transpose()?;
+            let prefix = prefix.unwrap_or(-1);
+            if prefix < -1 || prefix > dst.bits().into() {
+                return Err(invalid());
+            }
+            let (_, gateway, interface) = backend.net.lookup(&dst, src.as_ref(), prefix)?;
+            Ok(NextHop {
+                gateway: backend::endpoint(gateway),
+                interface,
+            })
+        })
     }
-    fn get_interface(
-        &self,
-        call: &mut dyn Call_GetInterface,
-        address: Endpoint,
-    ) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            b.net.interface(&backend::host(address)?),
-            |c: &mut dyn Call_GetInterface, iface| c.reply(iface)
-        )
+    async fn get_interface(self, _: tarpc::context::Context, address: Endpoint) -> Result<String> {
+        self.request(|backend| backend.net.interface(&backend::host(address)?))
     }
-    fn list_addresses(&self, call: &mut dyn Call_ListAddresses, which: i64) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            Ok(b.net
-                .enumerate(backend::number(which)?)?
-                .into_iter()
-                .map(backend::endpoint)
-                .collect()),
-            |c: &mut dyn Call_ListAddresses, addresses| c.reply(addresses)
-        )
+    async fn list_addresses(self, _: tarpc::context::Context, which: i32) -> Result<Vec<Endpoint>> {
+        self.request(|backend| {
+            backend
+                .net
+                .enumerate(u32::try_from(which).map_err(|_| invalid())?)
+                .map(|hosts| hosts.into_iter().map(backend::endpoint).collect())
+        })
     }
-    fn list_subnets(&self, call: &mut dyn Call_ListSubnets) -> varlink::Result<()> {
-        request!(
-            self,
-            call,
-            b,
-            Ok(b.net
-                .subnets()?
-                .into_iter()
-                .map(|(a, p, i)| Subnet {
-                    address: backend::endpoint(a),
-                    prefix: p.into(),
-                    interface: i
-                })
-                .collect()),
-            |c: &mut dyn Call_ListSubnets, subnets| c.reply(subnets)
-        )
+    async fn list_subnets(self, _: tarpc::context::Context) -> Result<Vec<Subnet>> {
+        self.request(|backend| {
+            backend.net.subnets().map(|subnets| {
+                subnets
+                    .into_iter()
+                    .map(|(address, prefix, interface)| Subnet {
+                        address: backend::endpoint(address),
+                        prefix,
+                        interface,
+                    })
+                    .collect()
+            })
+        })
     }
 }

@@ -613,11 +613,16 @@ pub fn event(
 ) -> io::Result<Option<rpc::Event>> {
     let bytes = &message.payload;
     let mut event = rpc::Event {
-        kind: rpc::Event_kind::ready,
+        kind: match message.kind {
+            packet::XFRM_MSG_ACQUIRE => rpc::EventKind::Acquire,
+            packet::XFRM_MSG_EXPIRE => rpc::EventKind::Expire,
+            packet::XFRM_MSG_MAPPING => rpc::EventKind::Mapping,
+            _ => return Ok(None),
+        },
         expiry: None,
         acquire: None,
         mapping: None,
-        addressChanged: None,
+        address_changed: None,
     };
     match message.kind {
         packet::XFRM_MSG_ACQUIRE => {
@@ -640,12 +645,12 @@ pub fn event(
             if !policies.contains_reqid(if_id, reqid) {
                 return Ok(None);
             }
-            event.kind = rpc::Event_kind::acquire;
+            event.kind = rpc::EventKind::Acquire;
             event.acquire = Some(rpc::Acquire {
-                reqid: reqid.into(),
+                reqid,
                 src: rpc_selector(selector_ts(&acquire.selector, true)?),
                 dst: rpc_selector(selector_ts(&acquire.selector, false)?),
-                sequence: acquire.seq.into(),
+                sequence: acquire.seq,
             });
         }
         packet::XFRM_MSG_EXPIRE => {
@@ -685,10 +690,10 @@ pub fn event(
             if !sas.expire(&id, hard) {
                 return Ok(None);
             }
-            event.kind = rpc::Event_kind::expire;
+            event.kind = rpc::EventKind::Expire;
             event.expiry = Some(rpc::Expiry {
-                protocol: sa.id.proto.into(),
-                spi: sa.id.spi.into(),
+                protocol: sa.id.proto,
+                spi: sa.id.spi,
                 destination: endpoint(dst),
                 hard,
             });
@@ -706,9 +711,9 @@ pub fn event(
                 return Ok(None);
             }
             let remote = host(family, mapping.new_saddr, mapping.new_sport)?;
-            event.kind = rpc::Event_kind::mapping;
+            event.kind = rpc::EventKind::Mapping;
             event.mapping = Some(rpc::Mapping {
-                spi: spi.into(),
+                spi,
                 destination: endpoint(dst),
                 remote: endpoint(remote),
             });

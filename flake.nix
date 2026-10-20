@@ -1,5 +1,5 @@
 {
-  description = "strongSwan kernel privilege separation with Rust and Varlink";
+  description = "strongSwan kernel privilege separation with Rust and tarpc";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -47,6 +47,7 @@
         end-to-end = builds.${system}.pkgs.testers.runNixOSTest (
           import ./nix/test.nix {
             inherit (builds.${system}) pkgs;
+            package = builds.${system}.kernelRust;
             module = self.nixosModules.default;
           }
         );

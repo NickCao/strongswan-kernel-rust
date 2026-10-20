@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Real Varlink/XFRM lifecycle tests. Run in a disposable network namespace."""
+"""Real tarpc/XFRM lifecycle tests. Run in a disposable network namespace."""
 import errno
 import ipaddress
 import json
@@ -15,50 +15,84 @@ import sys
 import tempfile
 import time
 
-class Varlink:
+# A test-only Rust process handles typed tarpc calls. All connections opened
+# by one Python client share its helper PID, preserving the peer-binding tests.
+import atexit
+
+_bridge = None
+_next_connection = 0
+
+def bridge(command):
+    global _bridge
+    if _bridge is None:
+        _bridge = subprocess.Popen([RPC_HELPER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        def stop():
+            if _bridge.poll() is None:
+                _bridge.stdin.close()
+                _bridge.wait(timeout=5)
+        atexit.register(stop)
+    _bridge.stdin.write(json.dumps(command) + "\n"); _bridge.stdin.flush()
+    line = _bridge.stdout.readline()
+    if not line: raise EOFError("RPC test helper exited")
+    return json.loads(line)
+
+class Rpc:
     def __init__(self, path):
-        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.socket.settimeout(10)
-        self.socket.connect(path)
-        self.pending = b""
+        global _next_connection
+        _next_connection += 1
+        self.id, self.timeout, self.closed = _next_connection, 10, False
+        result = bridge(dict(operation="connect", connection=self.id, path=path))
+        assert not result, result
+    @property
+    def socket(self): return self
+    def settimeout(self, timeout): self.timeout = timeout
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            bridge(dict(operation="close", connection=self.id))
+    def __del__(self):
+        try: self.close()
+        except Exception: pass
     def receive(self):
-        while b"\0" not in self.pending:
-            b = self.socket.recv(4096)
-            if not b: raise EOFError("Varlink peer disconnected")
-            self.pending += b
-            assert len(self.pending) <= 131072
-        frame, self.pending = self.pending.split(b"\0", 1)
-        return json.loads(frame)
+        reply = bridge(dict(operation="receive", connection=self.id, timeout=self.timeout))
+        if reply.get("timeout"): raise socket.timeout()
+        if reply.get("eof"): raise EOFError("tarpc peer disconnected")
+        return reply
     def send(self, method, parameters=None, more=False):
-        self.socket.sendall(json.dumps(dict(method=method, parameters=parameters or {}, **({"more": True} if more else {}))).encode() + b"\0")
+        bridge(dict(operation="send", connection=self.id, method=method.rsplit(".", 1)[-1], parameters=parameters or {}))
     def call(self, method, parameters=None):
-        self.send(method if "." in method else "io.ranet.Kernel." + method, parameters)
+        self.send(method, parameters)
         return self.receive()
 
 def endpoint(address="192.0.2.1", port=13000): return dict(address=address, port=port)
 def sa_id(spi=0x10203, interface=41):
-    return dict(src=endpoint(), dst=endpoint("192.0.2.2"), spi=spi, mark=dict(value=0, mask=0), interfaceId=interface)
+    return dict(src=endpoint(), dst=endpoint("192.0.2.2"), spi=spi, protocol=50, mark=dict(value=0, mask=0), interface_id=interface)
 def sa_config(life=0, inbound=False, update=False):
-    return dict(reqid=42, acquireSequence=0, encryption=dict(id=20, name="", key="00"*20),
-        integrity=dict(id=1024, name="", key=""),
-        lifetime=dict(timeLife=life, timeRekey=max(0,life-1), byteLife="0", byteRekey="0", packetLife="0", packetRekey="0"),
-        replayWindow=128, esn=True, udpEncapsulation=True, outputMark=dict(value=123, mask=0xffffffff),
-        tfc=0, copyDf=True, copyEcn=True, copyDscp=0, inbound=inbound, update=update)
+    return dict(reqid=42, acquire_sequence=0, encryption=dict(id=20, name="", key=[0]*20),
+        integrity=dict(id=1024, name="", key=[]),
+        lifetime=dict(time=dict(life=life, rekey=max(0,life-1), jitter=0),
+                      bytes=dict(life=0, rekey=0, jitter=0), packets=dict(life=0, rekey=0, jitter=0)),
+        mode=2, ipcomp=0, cpi=0, cpu=0xffffffff, hw_offload=0,
+        iptfs_dont_fragment=False, forward_icmp=False, initiator=False,
+        replay_window=128, esn=True, udp_encapsulation=True, output_mark=dict(value=123, mask=0xffffffff),
+        tfc=0, copy_df=True, copy_ecn=True, copy_dscp=0, inbound=inbound, update=update)
 def selector(v6=False):
-    return dict(**{"from": "::" if v6 else "0.0.0.0", "to": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff" if v6 else "255.255.255.255"}, protocol=0, fromPort=0, toPort=65535)
+    return dict(**{"from": "::" if v6 else "0.0.0.0", "to": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff" if v6 else "255.255.255.255"}, kind=8 if v6 else 7, dynamic=False, protocol=0, from_port=0, to_port=65535)
 def policy(interface=41, direction=1, v6=False):
-    return dict(direction=direction, src=selector(v6), dst=selector(v6), mark=dict(value=0,mask=0), interfaceId=interface)
+    return dict(direction=direction, src=selector(v6), dst=selector(v6), mark=dict(value=0,mask=0), interface_id=interface)
 def policy_config(spi=0x10203):
-    return dict(kind=1, priority=1, manualPriority=0, src=endpoint(), dst=endpoint("192.0.2.2"), reqid=42, policyCount=2, espSpi=spi)
+    return dict(kind=1, priority=1, manual_priority=0, src=endpoint(), dst=endpoint("192.0.2.2"), hw_offload=0, pcpu_acquires=False, forward_icmp=False,
+        sa=dict(mode=2, reqid=42, policy_count=2, esp=dict(used=True, spi=spi),
+                ah=dict(used=False, spi=0), ipcomp=dict(transform=0, cpi=0)))
 
 def client(path):
     status = Path("/proc/self/status").read_text()
     assert os.geteuid() == 65534
     for cap in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"]: assert f"{cap}:\t0000000000000000" in status
-    control = Varlink(path)
-    opened = control.call("OpenSession", dict(interfacesUse="", interfacesIgnore=""))
+    control = Rpc(path)
+    opened = control.call("OpenSession", dict(interfaces_use="", interfaces_ignore=""))
     token = opened["parameters"]["token"]
-    watch = Varlink(path); watch.send("io.ranet.Kernel.WatchEvents", dict(token=token), more=True)
+    watch = Rpc(path); watch.send("io.ranet.Kernel.WatchEvents", dict(token=token), more=True)
     assert watch.receive()["parameters"]["event"]["kind"] == "ready"
     print(json.dumps(opened), flush=True)
     for line in sys.stdin:
@@ -82,7 +116,7 @@ def client(path):
                     break
             else: raise AssertionError("event timed out")
         elif req.get("other"):
-            other = Varlink(path); reply = other.call(req["method"], req.get("parameters")); other.socket.close()
+            other = Rpc(path); reply = other.call(req["method"], req.get("parameters")); other.socket.close()
         else: reply = control.call(req["method"], req.get("parameters"))
         print(json.dumps(reply), flush=True)
         if req.get("method") == "CloseSession" and "error" not in reply: break
@@ -135,11 +169,9 @@ def run(binary):
                     "except PermissionError:\n pass\n"
                     "else:\n raise AssertionError('unauthorized client connected')\n", path,
                 ], check=True)
-                if shutil.which("varlinkctl"):
-                    desc = subprocess.check_output(["varlinkctl","introspect",path,"io.ranet.Kernel"],text=True)
-                    assert "InstallSa" in desc and "WatchEvents" in desc
                 client_file = directory / "client.py"; client_file.write_text(Path(__file__).read_text()); client_file.chmod(0o644)
-                child = subprocess.Popen(["setpriv","--reuid=65534","--regid=65534","--clear-groups","--bounding-set=-all","--inh-caps=-all","--ambient-caps=-all",sys.executable,str(client_file),"--client",path], stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+                helper_file = directory / "rpc-client"; shutil.copy2(RPC_HELPER, helper_file); helper_file.chmod(0o755)
+                child = subprocess.Popen(["setpriv","--reuid=65534","--regid=65534","--clear-groups","--bounding-set=-all","--inh-caps=-all","--ambient-caps=-all",sys.executable,str(client_file),"--client",path,str(helper_file)], stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
                 assert "token" in json.loads(child.stdout.readline())["parameters"]
                 assert not states().strip(), "startup must retire untracked SAs"
                 def raw(method=None, parameters=None, **kwargs):
@@ -148,11 +180,11 @@ def run(binary):
                 def rpc(method, **parameters):
                     reply = raw(method, parameters); assert "error" not in reply, reply; return reply.get("parameters",{})
                 def failure(method, err, **parameters):
-                    reply = raw(method,parameters); assert reply == {"error":"io.ranet.Kernel.KernelError","parameters":{"errno":err}}, reply
-                assert raw("OpenSession",dict(interfacesUse="",interfacesIgnore=""),other=True)["error"].endswith("SessionBusy")
+                    reply = raw(method,parameters); assert reply == {"error":"Kernel","parameters":{"errno":err}}, reply
+                assert raw("OpenSession",dict(interfaces_use="",interfaces_ignore=""),other=True)["error"].endswith("SessionBusy")
                 assert raw("FlushSas",other=True)["error"].endswith("InvalidSession")
-                assert raw("UnknownMethod")["error"] == "org.varlink.service.MethodNotFound"
-                assert raw("AllocateSpi",dict(src=endpoint()))["error"] == "org.varlink.service.InvalidParameter"
+                assert raw("UnknownMethod")["error"] == "InvalidRequest"
+                assert raw("AllocateSpi",dict(src=endpoint()))["error"] == "InvalidRequest"
                 rpc("BypassPort",family=2,port=13000); rpc("BypassPort",family=10,port=13000)
                 failure("BypassPort",errno.EINVAL,family=2,port=500)
                 assert len(ip("xfrm","policy","list").split("priority 32")) == 5
@@ -212,7 +244,7 @@ def run(binary):
                 subprocess.run(["ip", "-batch", "-"], input=batch, text=True, check=True)
                 events = json.loads(child.stdout.readline())["parameters"]["events"]
                 assert 0 < len(events) < 50, len(events)
-                assert any(e["kind"] == "roam" and e["addressChanged"] for e in events), events
+                assert any(e["kind"] == "roam" and e["address_changed"] for e in events), events
                 assert rpc("GetInterface", address=endpoint())["interface"] == "underlay"
                 assert rpc("GetInterface", address=endpoint("192.0.2.3"))["interface"] == "underlay"
                 ip("route", "flush", "table", "1234")
@@ -314,13 +346,13 @@ def run(binary):
                 assert tunnel()["ifindex"] != replacement_index
                 assert states() == before_repair, "interface repair must not modify SAs"
                 # Trap policies must forward kernel acquire attributes and
-                # selectors through Varlink for both inner address families.
+                # selectors through tarpc for both inner address families.
                 for family, source, destination in [
                     (socket.AF_INET, "192.0.2.1", "198.18.0.1"),
                     (socket.AF_INET6, "2001:db8:1::1", "2001:db8:3::1"),
                 ]:
                     trap = policy(v6=family == socket.AF_INET6)
-                    config = policy_config(spi=0); config["reqid"] = 44 if family == socket.AF_INET6 else 43
+                    config = policy_config(spi=0); config["sa"]["reqid"] = 44 if family == socket.AF_INET6 else 43
                     rpc("InstallPolicy",id=trap,config=config)
                     flags = ["-6"] if family == socket.AF_INET6 else []
                     ip(*flags, "route", "add", destination, "dev", "ranet00000029", "src", source)
@@ -329,10 +361,10 @@ def run(binary):
                         try: udp.sendto(b"acquire", (destination, 32123))
                         except BlockingIOError: pass  # No SA exists for this reqid yet.
                         acquire = raw(event="acquire")["parameters"]["event"]["acquire"]
-                    assert acquire["reqid"] == config["reqid"] and acquire["sequence"] > 0, acquire
+                    assert acquire["reqid"] == config["sa"]["reqid"] and acquire["sequence"] > 0, acquire
                     for selector, address, port in [(acquire["src"], source, source_port), (acquire["dst"], destination, 32123)]:
                         assert selector["from"] == selector["to"] == address, acquire
-                        assert selector["protocol"] == 17 and selector["fromPort"] == selector["toPort"] == port, acquire
+                        assert selector["protocol"] == 17 and selector["from_port"] == selector["to_port"] == port, acquire
                     ip(*flags, "route", "del", destination)
                     rpc("RemovePolicy",id=trap,config=config)
                 # A specific ICMP code must outrank the type-only policy.
@@ -340,8 +372,8 @@ def run(binary):
                     priorities = []
                     for code in [0, 1]:
                         icmp = policy(v6=v6)
-                        icmp["src"].update(protocol=protocol, fromPort=icmp_type << 8 | code,
-                                           toPort=icmp_type << 8 | code)
+                        icmp["src"].update(protocol=protocol, from_port=icmp_type << 8 | code,
+                                           to_port=icmp_type << 8 | code)
                         config = policy_config(spi=b["spi"])
                         rpc("InstallPolicy",id=icmp,config=config)
                         args = ["src", "::/0" if v6 else "0.0.0.0/0",
@@ -409,8 +441,8 @@ def run(binary):
                 assert len(expected) == 10
                 assert states() == original_states, "policy repair must not modify SAs"
                 unused = rpc("QuerySa",id=b)
-                assert (unused["bytes"], unused["packets"], unused["lastUse"]) == ("0", "0", 0), unused
-                assert rpc("QueryPolicy",id=policy())["lastUse"] == 0
+                assert (unused["bytes"], unused["packets"], unused["last_use"]) == (0, 0, 0), unused
+                assert rpc("QueryPolicy",id=policy())["last_use"] == 0
                 failure("CloseSession",errno.EBUSY)
                 rpc("RemoveSa",id=b)
                 assert [l["ifname"] for l in links()] == ["foreign"], "policies must not keep interfaces alive"
@@ -437,11 +469,11 @@ def run(binary):
                     assert any(l["ifname"] == temporary_name for l in links()) == (attempt == 4)
                 ip("link", "del", temporary_name)
                 # Inbound larval SPI allocation and conversion to an interface SA.
-                spi = rpc("AllocateSpi",src=endpoint(),dst=endpoint("192.0.2.2"),minimum=0xc0000000,maximum=0xcfffffff)["spi"]
+                spi = rpc("AllocateSpi",src=endpoint(),dst=endpoint("192.0.2.2"),protocol=50,minimum=0xc0000000,maximum=0xcfffffff)["spi"]
                 inbound = sa_id(spi=spi,interface=43)
                 rpc("InstallSa",id=inbound,config=sa_config(inbound=True,update=True))
                 rpc("RemoveSa",id=inbound)
-                spi = rpc("AllocateSpi",src=endpoint(),dst=endpoint("192.0.2.2"),minimum=0xc0000000,maximum=0xcfffffff)["spi"]
+                spi = rpc("AllocateSpi",src=endpoint(),dst=endpoint("192.0.2.2"),protocol=50,minimum=0xc0000000,maximum=0xcfffffff)["spi"]
                 inbound = sa_id(spi=spi,interface=43)
                 ip("xfrm", "state", "delete", "dst", inbound["dst"]["address"], "proto", "esp", "spi", spi)
                 rpc("InstallSa",id=inbound,config=sa_config(inbound=True,update=True))
@@ -459,13 +491,13 @@ def run(binary):
                 rpc("CloseSession"); child.wait(timeout=5); assert child.returncode == 0
                 assert not ip("xfrm","policy").strip()
                 # A clean close releases ownership and permits a new session.
-                again = Varlink(path); assert "error" not in again.call("OpenSession",dict(interfacesUse="",interfacesIgnore="")); assert "error" not in again.call("CloseSession"); again.socket.close()
-                excluded = Varlink(path)
-                assert "error" not in excluded.call("OpenSession",dict(interfacesUse="",interfacesIgnore="underlay"))
+                again = Rpc(path); assert "error" not in again.call("OpenSession",dict(interfaces_use="",interfaces_ignore="")); assert "error" not in again.call("CloseSession"); again.socket.close()
+                excluded = Rpc(path)
+                assert "error" not in excluded.call("OpenSession",dict(interfaces_use="",interfaces_ignore="underlay"))
                 assert excluded.call("GetSourceAddress",dict(destination=endpoint("203.0.113.2")))["parameters"]["errno"] == errno.ENETUNREACH
                 assert "error" not in excluded.call("CloseSession"); excluded.socket.close()
-                filtered = Varlink(path)
-                assert "error" not in filtered.call("OpenSession",dict(interfacesUse="",interfacesIgnore="spare"))
+                filtered = Rpc(path)
+                assert "error" not in filtered.call("OpenSession",dict(interfaces_use="",interfaces_ignore="spare"))
                 def listed(which):
                     return {a["address"] for a in filtered.call("ListAddresses",dict(which=which))["parameters"]["addresses"]}
                 # DOWN/IGNORED modify REGULAR; they are not address classes.
@@ -490,15 +522,15 @@ def run(binary):
                 assert "error" not in filtered.call("CloseSession"); filtered.socket.close()
                 # Losing charon preserves active kernel objects, while the
                 # daemon still cleans an interface when its last SA expires.
-                lost = Varlink(path); assert "error" not in lost.call("OpenSession",dict(interfacesUse="",interfacesIgnore=""))
+                lost = Rpc(path); assert "error" not in lost.call("OpenSession",dict(interfaces_use="",interfaces_ignore=""))
                 assert "error" not in lost.call("InstallSa",dict(id=sa_id(spi=0x12345,interface=50),config=sa_config(life=3,inbound=True)))
                 lost.socket.close()
                 assert "0x00012345" in states()
-                probe = Varlink(path)
-                assert probe.call("OpenSession",dict(interfacesUse="",interfacesIgnore=""))["error"].endswith("SessionBusy")
+                probe = Rpc(path)
+                assert probe.call("OpenSession",dict(interfaces_use="",interfaces_ignore=""))["error"].endswith("SessionBusy")
                 probe.socket.close()
                 wait(lambda: [l["ifname"] for l in links()] == ["foreign"])
-                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, address scope/type filtering, multihomed sources and egress-interface exclusions, ICMP policy priorities, policy and interface repair without SA changes, rekey references and teardown, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, immutable SA loss notification, IPv4/IPv6 acquire events, rollback, foreign replacements, larval SPI, hard expiry, namespace cleanup including missing objects, and disconnected-client expiry")
+                print("PASS: socket group authorization and denied nonmember, typed tarpc, IPv4/IPv6 FIB lookups and routing policy, address scope/type filtering, multihomed sources and egress-interface exclusions, ICMP policy priorities, policy and interface repair without SA changes, rekey references and teardown, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, immutable SA loss notification, IPv4/IPv6 acquire events, rollback, foreign replacements, larval SPI, hard expiry, namespace cleanup including missing objects, and disconnected-client expiry")
             except BaseException:
                 log.seek(0); print(log.read(),file=sys.stderr); raise
             finally:
@@ -513,13 +545,13 @@ def run(binary):
             try:
                 wait(lambda: Path(path).exists() or daemon.poll() is not None)
                 assert daemon.poll() is None
-                control = Varlink(path)
+                control = Rpc(path)
                 def call(method, **parameters):
                     reply = control.call(method, parameters)
                     assert "error" not in reply, reply
                     return reply.get("parameters", {})
-                token = call("OpenSession", interfacesUse="", interfacesIgnore="")["token"]
-                watch = Varlink(path)
+                token = call("OpenSession", interfaces_use="", interfaces_ignore="")["token"]
+                watch = Rpc(path)
                 watch.send("io.ranet.Kernel.WatchEvents", dict(token=token), more=True)
                 assert watch.receive()["parameters"]["event"]["kind"] == "ready"
                 def expiries(expected):
@@ -547,7 +579,7 @@ def run(binary):
                    "output-mark", "999", *direction)
                 expiries([a["spi"]])
                 assert f"{a['spi']:08x}" not in states()
-                assert call("QuerySa", id=b)["packets"] == "0"
+                assert call("QuerySa", id=b)["packets"] == 0
                 assert next(link["ifindex"] for link in links() if link["ifname"] == name) == index
                 call("RemoveSa", id=a)
                 ip("xfrm", "state", "delete", "dst", b["dst"]["address"], "proto", "esp", "spi", b["spi"])
@@ -605,27 +637,27 @@ def run(binary):
                 try:
                     wait(lambda: Path(path).exists() or daemon.poll() is not None)
                     assert daemon.poll() is None
-                    control = Varlink(path)
+                    control = Rpc(path)
                     def call(method, **parameters):
                         reply = control.call(method, parameters)
                         assert "error" not in reply, reply
                         return reply.get("parameters", {})
-                    call("OpenSession", interfacesUse="", interfacesIgnore="")
+                    call("OpenSession", interfaces_use="", interfaces_ignore="")
                     assert not ip("xfrm", "policy").strip(), "session startup must remove old policies"
                     owned = sa_id(spi=0x40000 + attempt, interface=61 + attempt)
                     call("InstallSa", id=owned, config=sa_config())
                     allocated = call("AllocateSpi", src=owned["src"], dst=owned["dst"],
-                                     minimum=0xd0000000, maximum=0xdfffffff)["spi"]
+                                     protocol=50,minimum=0xd0000000, maximum=0xdfffffff)["spi"]
                     call("BypassPort", family=socket.AF_INET, port=13000)
                     call("BypassPort", family=socket.AF_INET6, port=13000)
                     for direction in [0, 1, 2]:
-                        call("InstallPolicy", id=policy(interface=owned["interfaceId"], direction=direction),
+                        call("InstallPolicy", id=policy(interface=owned["interface_id"], direction=direction),
                              config=policy_config(spi=owned["spi"]))
                     # A queued request and idle connections must not obstruct
                     # shutdown or install objects after the final reconciliation.
-                    idle = Varlink(path)
+                    idle = Rpc(path)
                     control.send("io.ranet.Kernel.InstallPolicy", dict(
-                        id=policy(interface=owned["interfaceId"], v6=True),
+                        id=policy(interface=owned["interface_id"], v6=True),
                         config=policy_config(spi=owned["spi"])))
                     assert len(links()) == 2
                     assert f"{allocated:08x}" in states() and f"{owned['spi']:08x}" in states()
@@ -656,8 +688,8 @@ def run(binary):
                     wait(lambda: Path(path).exists() or daemon.poll() is not None)
                     assert daemon.poll() is None
                     if clean_close:
-                        control = Varlink(path)
-                        assert "error" not in control.call("OpenSession", dict(interfacesUse="", interfacesIgnore=""))
+                        control = Rpc(path)
+                        assert "error" not in control.call("OpenSession", dict(interfaces_use="", interfaces_ignore=""))
                         assert "error" not in control.call("CloseSession")
                         control.socket.close()
                     # Cleanup must cover untracked kernel objects even if no
@@ -690,8 +722,8 @@ def run(binary):
                 try:
                     wait(lambda: Path(path).exists() or daemon.poll() is not None)
                     assert daemon.poll() is None
-                    control = Varlink(path)
-                    assert "error" not in control.call("OpenSession", dict(interfacesUse="", interfacesIgnore=""))
+                    control = Rpc(path)
+                    assert "error" not in control.call("OpenSession", dict(interfaces_use="", interfaces_ignore=""))
                     assert not ip("xfrm", "policy").strip()
                     if attempt == 0:
                         assert "error" not in control.call("InstallPolicy", dict(id=policy(), config=policy_config()))
@@ -725,9 +757,9 @@ def run(binary):
                 daemons.append(daemon)
                 wait(lambda: Path(path).exists() or daemon.poll() is not None)
                 assert daemon.poll() is None
-                control = Varlink(path)
+                control = Rpc(path)
                 controls.append(control)
-                assert "error" not in control.call("OpenSession", dict(interfacesUse="", interfacesIgnore=""))
+                assert "error" not in control.call("OpenSession", dict(interfaces_use="", interfaces_ignore=""))
                 return daemon, control
             def call(control, method, **parameters):
                 reply = control.call(method, parameters)
@@ -796,5 +828,6 @@ def run(binary):
     print("PASS: configurable numeric ownership group, wrong-kind repair, opaque identity independent of native if_id, crash inventory cleanup, unmanaged settings preserved, and foreign groups untouched")
 
 if __name__ == "__main__":
+    RPC_HELPER = str(Path(sys.argv[-1]).resolve())
     if sys.argv[1] == "--client": client(sys.argv[2])
     else: run(sys.argv[1])

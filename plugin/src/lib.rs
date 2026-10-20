@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! C ABI plugin loaded by an unprivileged charon. Kernel operations use Varlink.
+//! C ABI plugin loaded by an unprivileged charon. Kernel operations use tarpc.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 #[allow(
@@ -23,25 +23,41 @@ mod plugin;
 use ffi::{status_t, status_t_FAILED, status_t_NOT_SUPPORTED, status_t_SUCCESS};
 type Result<T> = std::result::Result<T, status_t>;
 
-// Translate safe Rust RPC errors only at the strongSwan adapter boundary.
+// Translate RPC errors only at the strongSwan adapter boundary.
 trait ClientExt {
-    fn call<P: serde::Serialize, T: serde::de::DeserializeOwned>(
+    fn call<T>(
         &self,
-        method: &str,
-        parameters: &P,
+        future: impl std::future::Future<
+            Output = std::result::Result<
+                kernel_rust_protocol::Result<T>,
+                kernel_rust_protocol::RpcError,
+            >,
+        >,
     ) -> Result<T>;
-    fn empty<P: serde::Serialize>(&self, method: &str, parameters: &P) -> status_t {
-        self.call::<_, kernel_rust_protocol::client::Empty>(method, parameters)
+    fn empty(
+        &self,
+        future: impl std::future::Future<
+            Output = std::result::Result<
+                kernel_rust_protocol::Result<()>,
+                kernel_rust_protocol::RpcError,
+            >,
+        >,
+    ) -> status_t {
+        self.call(future)
             .map_or_else(|status| status, |_| status_t_SUCCESS)
     }
 }
 impl ClientExt for kernel_rust_protocol::client::Client {
-    fn call<P: serde::Serialize, T: serde::de::DeserializeOwned>(
+    fn call<T>(
         &self,
-        method: &str,
-        parameters: &P,
+        future: impl std::future::Future<
+            Output = std::result::Result<
+                kernel_rust_protocol::Result<T>,
+                kernel_rust_protocol::RpcError,
+            >,
+        >,
     ) -> Result<T> {
-        self.request(method, parameters).map_err(|error| {
+        self.request(future).map_err(|error| {
             log(&error.to_string());
             match error.errno {
                 Some(libc::EEXIST) => ffi::status_t_ALREADY_DONE,

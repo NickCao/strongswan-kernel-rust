@@ -9,10 +9,10 @@ let
       ../Cargo.lock
       ../rust-toolchain.toml
       ../COPYING
-      ../io.ranet.Kernel.varlink
       ../src
       ../plugin
       ../protocol
+      ../tests/support/rpc_client.rs
     ];
   };
   toolchain = pkgs.rust-bin.fromRustupToolchainFile ../rust-toolchain.toml;
@@ -72,7 +72,7 @@ let
   common = {
     inherit version src cargoDeps;
     meta = {
-      description = "Rust kernel backend for strongSwan over Varlink";
+      description = "Rust kernel backend for strongSwan over tarpc";
       license = lib.licenses.gpl2Plus;
       platforms = lib.platforms.linux;
     };
@@ -127,6 +127,25 @@ let
     }
   );
 
+  testClient = rustPlatform.buildRustPackage (
+    common
+    // {
+      pname = "kernel-rpc-test-client";
+      cargoBuildFlags = [
+        "--features"
+        "test-client"
+        "--bin"
+        "kernel-rpc-test-client"
+      ];
+      doCheck = false;
+      installPhase = ''
+        runHook preInstall
+        install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/kernel-rpc-test-client "$out/bin/kernel-rpc-test-client"
+        runHook postInstall
+      '';
+    }
+  );
+
   kernelRust = pkgs.symlinkJoin {
     pname = "strongswan-kernel-rust";
     inherit version;
@@ -136,6 +155,7 @@ let
     ];
     passthru = {
       inherit
+        testClient
         strongswan
         headers
         daemon

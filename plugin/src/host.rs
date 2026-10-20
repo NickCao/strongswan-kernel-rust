@@ -5,7 +5,7 @@ use foreign_types::{foreign_type, ForeignType, ForeignTypeRef};
 use kernel_rust_protocol as api;
 use std::{
     ffi::{CStr, CString},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     ptr, slice,
 };
 
@@ -19,6 +19,22 @@ pub unsafe fn string(value: *const libc::c_char) -> Result<String> {
         .to_str()
         .map(str::to_owned)
         .map_err(|_| status_t_FAILED)
+}
+
+pub unsafe fn optional_string(value: *const libc::c_char) -> Result<Option<String>> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        unsafe { string(value) }.map(Some)
+    }
+}
+
+pub unsafe fn label(value: *mut ffi::sec_label_t) -> Result<Option<Vec<u8>>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let bytes = unsafe { chunk_bytes((*value).get_encoding.unwrap()(value)) }?;
+    Ok(Some(bytes.to_vec()))
 }
 
 pub unsafe fn setting_str(key: &CStr, default: &CStr) -> Result<String> {
@@ -107,6 +123,11 @@ foreign_type! {
         type CType = ffi::traffic_selector_t;
         fn drop = destroy_selector;
     }
+
+    pub unsafe type Enumerator {
+        type CType = ffi::enumerator_t;
+        fn drop = destroy_enumerator;
+    }
 }
 
 unsafe fn destroy_host(host: *mut ffi::host_t) {
@@ -119,13 +140,16 @@ unsafe fn destroy_selector(selector: *mut ffi::traffic_selector_t) {
     unsafe { (*selector).destroy.unwrap()(selector) }
 }
 
+unsafe fn destroy_enumerator(enumerator: *mut ffi::enumerator_t) {
+    unsafe { (*enumerator).destroy.unwrap()(enumerator) }
+}
+
 impl Host {
     pub fn parse(value: &api::Endpoint) -> Result<Self> {
-        // Numeric addresses only: never pass a remote string to the resolver.
-        let address: IpAddr = value.address.parse().map_err(|_| status_t_FAILED)?;
-        let port = u16::try_from(value.port).map_err(|_| status_t_FAILED)?;
-        let text = CString::new(address.to_string()).map_err(|_| status_t_FAILED)?;
-        let host = unsafe { ffi::host_create_from_string(text.as_ptr().cast_mut(), port) };
+        let address = SocketAddr::try_from(value).map_err(|_| status_t_FAILED)?;
+        let native = rustix::net::SocketAddrAny::from(address);
+        // SAFETY: the C constructor copies the complete initialized sockaddr.
+        let host = unsafe { ffi::host_create_from_sockaddr(native.as_ptr().cast_mut().cast()) };
         if host.is_null() {
             return Err(status_t_FAILED);
         }
@@ -142,16 +166,17 @@ impl HostRef {
     }
     fn to_endpoint(&self) -> Result<api::Endpoint> {
         let host = self.as_ptr();
-        let (address, port) = unsafe {
-            (
-                address((*host).get_address.unwrap()(host))?,
-                (*host).get_port.unwrap()(host),
+        // SAFETY: charon's live host owns the sockaddr and its initialized
+        // length for this borrow. Read it whole, including IPv6 flow/scope.
+        let native = unsafe {
+            rustix::net::SocketAddrAny::read(
+                (*host).get_sockaddr.unwrap()(host).cast(),
+                *(*host).get_sockaddr_len.unwrap()(host),
             )
         };
-        Ok(api::Endpoint {
-            address: address.to_string(),
-            port: port.into(),
-        })
+        SocketAddr::try_from(native)
+            .map(api::Endpoint::from)
+            .map_err(|_| status_t_FAILED)
     }
 }
 
@@ -163,19 +188,46 @@ pub unsafe fn selector(ts: *mut ffi::traffic_selector_t) -> Result<api::Selector
     unsafe { SelectorRef::from_ptr(ts) }.to_selector()
 }
 
+pub unsafe fn selectors(list: *mut ffi::linked_list_t) -> Result<Option<Vec<api::Selector>>> {
+    if list.is_null() {
+        return Ok(None);
+    }
+    let raw = unsafe { (*list).create_enumerator.unwrap()(list) };
+    if raw.is_null() {
+        return Err(status_t_FAILED);
+    }
+    // SAFETY: the C list lends its elements while we own its enumerator. The
+    // wrapper also destroys the enumerator if converting an element fails.
+    let enumerator = unsafe { Enumerator::from_ptr(raw) };
+    let mut values = Vec::new();
+    loop {
+        let mut value: *mut ffi::traffic_selector_t = ptr::null_mut();
+        if !unsafe { (*raw).enumerate.unwrap()(raw, &mut value) } {
+            break;
+        }
+        values.push(unsafe { selector(value) }?);
+    }
+    drop(enumerator);
+    Ok(Some(values))
+}
+
 impl Selector {
     pub fn parse(value: &api::Selector) -> Result<Self> {
         let from = Host::parse(&api::Endpoint {
-            address: value.from.clone(),
+            address: value.from,
             port: 0,
+            flow_info: 0,
+            scope_id: 0,
         })?;
         let to = Host::parse(&api::Endpoint {
-            address: value.to.clone(),
+            address: value.to,
             port: 0,
+            flow_info: 0,
+            scope_id: 0,
         })?;
-        let protocol = u8::try_from(value.protocol).map_err(|_| status_t_FAILED)?;
-        let first = u16::try_from(value.fromPort).map_err(|_| status_t_FAILED)?;
-        let last = u16::try_from(value.toPort).map_err(|_| status_t_FAILED)?;
+        let protocol = value.protocol;
+        let first = value.from_port;
+        let last = value.to_port;
         if first > last {
             return Err(status_t_FAILED);
         }
@@ -224,19 +276,21 @@ impl SelectorRef {
             return Err(status_t_FAILED);
         }
         Ok(api::Selector {
-            from: from.to_string(),
-            to: to.to_string(),
-            protocol: protocol.into(),
-            fromPort: first.into(),
-            toPort: last.into(),
+            kind: unsafe { (*ts).get_type.unwrap()(ts) },
+            dynamic: unsafe { (*ts).is_dynamic.unwrap()(ts) },
+            from,
+            to,
+            protocol,
+            from_port: first,
+            to_port: last,
         })
     }
 }
 
 pub fn mark(value: ffi::mark_t) -> api::Mark {
     api::Mark {
-        value: value.value.into(),
-        mask: value.mask.into(),
+        value: value.value,
+        mask: value.mask,
     }
 }
 
@@ -251,18 +305,11 @@ pub fn duplicate(value: &str) -> Result<*mut libc::c_char> {
     }
 }
 
-pub unsafe fn unrestricted_interface(value: *const libc::c_char) -> bool {
-    value.is_null() || unsafe { *value == 0 }
-}
-
 pub unsafe fn algorithm(
     id: u16,
     key: ffi::chunk_t,
     kind: ffi::transform_type_t,
 ) -> Result<api::Algorithm> {
-    if key.len > 8192 || (key.len != 0 && key.ptr.is_null()) {
-        return Err(status_t_FAILED);
-    }
     let mut name = ptr::null_mut();
     // SAFETY: the C callback keeps the host kernel interface alive.
     unsafe {
@@ -276,8 +323,8 @@ pub unsafe fn algorithm(
     };
     let bytes = unsafe { chunk_bytes(key) }?;
     Ok(api::Algorithm {
-        id: id.into(),
+        id,
         name,
-        key: hex::encode(bytes),
+        key: bytes.to_vec(),
     })
 }
