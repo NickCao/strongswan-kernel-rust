@@ -79,9 +79,6 @@ impl Ts {
         };
         (self.from_port & mask, mask)
     }
-    pub fn includes(&self, host: &Host) -> bool {
-        self.from.ip <= host.ip && host.ip <= self.to.ip
-    }
     pub fn from_subnet(
         host: Host,
         prefix: u8,

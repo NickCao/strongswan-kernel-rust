@@ -148,7 +148,6 @@ dependencies = [
  "rand",
  "rustix",
  "sd-notify",
- "serde",
  "serde_json",
  "varlink",
  "zeroize",

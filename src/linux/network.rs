@@ -26,7 +26,7 @@ pub struct Link {
     pub mtu: u32,
     pub master: u32,
     pub group: u32,
-    pub xfrm: Option<(u32, u32)>,
+    pub xfrm_if_id: Option<u32>,
 }
 impl Link {
     fn from_message(info: LinkMessage) -> Self {
@@ -37,7 +37,7 @@ impl Link {
             mtu: 0,
             master: 0,
             group: 0,
-            xfrm: None,
+            xfrm_if_id: None,
         };
         for attr in info.attributes {
             match attr {
@@ -49,15 +49,13 @@ impl Link {
                     for info in infos {
                         match info {
                             LinkInfo::Kind(InfoKind::Xfrm) => {
-                                link.xfrm.get_or_insert((0, 0));
+                                link.xfrm_if_id.get_or_insert(0);
                             }
                             LinkInfo::Data(InfoData::Xfrm(attrs)) => {
-                                let (if_id, phys) = link.xfrm.get_or_insert((0, 0));
+                                let if_id = link.xfrm_if_id.get_or_insert(0);
                                 for attr in attrs {
-                                    match attr {
-                                        InfoXfrm::IfId(value) => *if_id = value,
-                                        InfoXfrm::Link(value) => *phys = value,
-                                        _ => (),
+                                    if let InfoXfrm::IfId(value) = attr {
+                                        *if_id = value;
                                     }
                                 }
                             }
@@ -223,7 +221,7 @@ impl Network {
                 let Some(link) = snapshot.links.iter().find(|l| l.index == a.index) else {
                     return false;
                 };
-                if link.xfrm.is_some()
+                if link.xfrm_if_id.is_some()
                     || a.scope >= u8::from(AddressScope::Link)
                     || a.host.ip.is_loopback()
                     || a.host.is_link_local()
@@ -252,7 +250,7 @@ impl Network {
                         && l.flags.contains(LinkFlags::Up)
                         && self.config.usable(&l.name)
                 })?;
-                if link.xfrm.is_some()
+                if link.xfrm_if_id.is_some()
                     || a.scope >= u8::from(AddressScope::Host)
                     || a.prefix == a.host.bits()
                 {
@@ -278,7 +276,9 @@ impl Network {
         Err(absent())
     }
     fn usable_link(&self, link: &Link) -> bool {
-        link.flags.contains(LinkFlags::Up) && link.xfrm.is_none() && self.config.usable(&link.name)
+        link.flags.contains(LinkFlags::Up)
+            && link.xfrm_if_id.is_none()
+            && self.config.usable(&link.name)
     }
     pub fn lookup(
         &mut self,

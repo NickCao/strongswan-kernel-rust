@@ -114,7 +114,7 @@ impl InterfaceKernel for LinuxInterfaces {
             .map(|link| {
                 let id = self.id(link);
                 let handle = InterfaceHandle::from_link(link, id);
-                let config = if let Some((if_id, _)) = link.xfrm {
+                let config = if let Some(if_id) = link.xfrm_if_id {
                     let master = if link.master == 0 {
                         None
                     } else {
@@ -161,7 +161,7 @@ impl InterfaceKernel for LinuxInterfaces {
             .link(handle.index)?
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
         let message = self.settings(spec, handle.index)?;
-        if current.xfrm.is_none() {
+        if current.xfrm_if_id.is_none() {
             // Linux cannot change an interface's kind. Replacement is a
             // backend implementation detail of updating this logical object.
             self.delete(handle)?;
@@ -243,7 +243,7 @@ mod tests {
         let current = net.link(original.index).unwrap().unwrap();
         assert_eq!(current.name, "idx00000008");
         assert_eq!(current.group, 0);
-        assert_eq!(current.xfrm, Some((42, 0)));
+        assert_eq!(current.xfrm_if_id, Some(42));
         assert_eq!(current.mtu, 1300);
 
         // A wrong-type replacement at the same key is repaired by update().

@@ -121,6 +121,7 @@ pub struct PolicySpec {
     pub id: PolicyKey,
     pub config: PolicyConfig,
 }
+#[cfg(test)]
 impl PolicySpec {
     pub fn new(id: &PolicyId, data: &PolicyData) -> io::Result<Self> {
         Ok(PolicyKey::new(id)?.spec(data))

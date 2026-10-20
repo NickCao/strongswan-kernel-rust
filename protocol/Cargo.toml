@@ -7,7 +7,6 @@ license = "GPL-2.0-or-later"
 publish = false
 
 [dependencies]
-libc = "0.2"
 rustix = { version = "1.1", features = ["net"] }
 nix = { version = "0.31", features = ["socket"] }
 serde = { version = "1", features = ["derive"] }
@@ -20,4 +19,5 @@ zeroize = "1.8"
 varlink_generator = "=13.0.0"
 
 [dev-dependencies]
+libc = "0.2"
 tempfile = "3"

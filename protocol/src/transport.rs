@@ -4,7 +4,6 @@ use std::{io, os::unix::net::UnixStream};
 #[derive(Clone, Copy, Debug)]
 pub struct Peer {
     pub uid: u32,
-    pub gid: u32,
     pub pid: i32,
 }
 pub fn peer(stream: &UnixStream) -> io::Result<Peer> {
@@ -13,7 +12,6 @@ pub fn peer(stream: &UnixStream) -> io::Result<Peer> {
     let cred = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)?;
     Ok(Peer {
         uid: cred.uid(),
-        gid: cred.gid(),
         pid: cred.pid(),
     })
 }

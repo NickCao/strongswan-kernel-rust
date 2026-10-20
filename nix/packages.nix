@@ -71,7 +71,6 @@ let
   cargoDeps = rustPlatform.importCargoLock { lockFile = ../Cargo.lock; };
   common = {
     inherit version src cargoDeps;
-    buildInputs = [ pkgs.libcap ];
     meta = {
       description = "Rust kernel backend for strongSwan over Varlink";
       license = lib.licenses.gpl2Plus;
@@ -107,6 +106,8 @@ let
         cargoC
         rustPlatform.bindgenHook
       ];
+      # Included by strongSwan headers when configured with libcap support.
+      buildInputs = [ pkgs.libcap ];
       STRONGSWAN_SOURCE = headers;
       CONFIG_H_DIR = headers;
       doCheck = false; # Host symbols are provided by charon; exercised in the VM test.
