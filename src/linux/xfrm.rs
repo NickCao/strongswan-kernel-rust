@@ -6,6 +6,7 @@ use super::{
     netlink::{Message, Netlink, NlFamily, NlmF, Reply},
     policy::LinuxPolicies,
 };
+use crate::sa::{is_missing, ObservedSa, SaHandle as _, SaKernel, SaSpec, SaState, SaUsage, Sas};
 use crate::{
     backend::{endpoint, rpc_selector},
     error::invalid,
@@ -13,9 +14,9 @@ use crate::{
     policy::Policies,
     rpc_api as rpc,
 };
-use netlink_packet_core::{DefaultNla, Emitable, NlasIterator, Parseable};
+use netlink_packet_core::{DefaultNla, Emitable, Nla, NlasIterator, Parseable};
 use netlink_packet_xfrm::{self as packet, XfrmAttrs as Attr, XfrmMessage};
-use std::{collections::HashSet, io, net::IpAddr};
+use std::io;
 
 // Linux 6.10 added this attribute; use the packet crate's extension mechanism
 // until it has a dedicated variant. Values are XFRM_SA_DIR_IN/OUT.
@@ -167,14 +168,12 @@ fn int_algorithm(id: u16) -> Option<(&'static str, Option<u32>)> {
     })
 }
 
-pub struct Xfrm {
+pub struct LinuxSas {
     socket: Netlink,
-    pub sas: HashSet<crate::model::SaId>,
-    allocations: HashSet<(IpAddr, IpAddr, u32, u8)>,
     pub sa_dir: bool,
     pub lastused: bool,
 }
-impl Xfrm {
+impl LinuxSas {
     pub fn new() -> io::Result<Self> {
         // The service's ProcSubset=pid sandbox hides global /proc files.
         let uname = rustix::system::uname();
@@ -186,23 +185,21 @@ impl Xfrm {
         let version = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
         Ok(Self {
             socket: Netlink::new(NlFamily::Xfrm)?,
-            sas: HashSet::new(),
-            allocations: HashSet::new(),
             sa_dir: version >= (6, 10),
             lastused: version >= (6, 2),
         })
     }
-    pub fn features(&self) -> u32 {
+    fn feature_flags(&self) -> u32 {
         KERNEL_ESP_V3_TFC
             | KERNEL_REQUIRE_UDP_ENCAPSULATION
             | KERNEL_POLICY_SPI
             | KERNEL_ACQUIRE_SEQ
             | if self.lastused { KERNEL_SA_USE_TIME } else { 0 }
     }
-    pub fn allocate(
+    fn allocate_spi(
         &mut self,
-        src: Host,
-        dst: Host,
+        src: &Host,
+        dst: &Host,
         proto: u8,
         min: u32,
         max: u32,
@@ -239,17 +236,10 @@ impl Xfrm {
                 if spi == 0 {
                     return Err(invalid());
                 }
-                self.allocations.insert((src.ip, dst.ip, spi, proto));
                 return Ok(spi);
             }
         }
         Err(invalid())
-    }
-    fn owned(&self, id: &crate::model::SaId) -> bool {
-        self.sas.contains(&id.key())
-            || self
-                .allocations
-                .contains(&(id.src.ip, id.dst.ip, id.spi, id.proto))
     }
     fn sa_message(&self, id: &SaId, data: &AddSa<'_>) -> io::Result<XfrmMessage> {
         let mut flags = packet::XFRM_STATE_AF_UNSPEC;
@@ -386,117 +376,228 @@ impl Xfrm {
         })
     }
 
-    pub fn add_sa(&mut self, id: &crate::model::SaId, data: &AddSa<'_>) -> io::Result<()> {
-        if id.proto != 50 || id.if_id == 0 {
-            return Err(unsupported());
-        }
-        if data.update && !self.owned(id) {
-            return Err(missing());
-        }
-        let request = self.sa_message(id, data)?;
-        let result = self.socket.ack(&message(NlmF::ACK, &request));
-        match (result, request) {
-            (Err(error), XfrmMessage::UpdateSa(sa))
-                if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) =>
-            {
-                self.socket
-                    .ack(&message(NlmF::ACK, &XfrmMessage::AddSa(sa)))?
-            }
-            (result, _) => result?,
-        }
-        self.sas.insert(id.key());
-        self.allocations
-            .remove(&(id.src.ip, id.dst.ip, id.spi, id.proto));
-        Ok(())
-    }
-    fn read_sa(&mut self, id: &SaId) -> io::Result<packet::state::ModifyMessage> {
-        if !self.owned(id) {
-            return Err(missing());
-        }
+    fn read(&mut self, id: &SaId) -> io::Result<packet::state::ModifyMessage> {
         self.socket
             .request(&message(
                 NlmF::empty(),
-                &XfrmMessage::GetSa(packet::state::DelGetMessage {
-                    user_sa_id: sa_id(id),
-                    nlas: id_attrs(id.mark, id.if_id),
-                }),
+                &XfrmMessage::GetSa(native_request(id)),
             ))?
             .into_iter()
             .find(|reply| reply.kind == NEWSA)
             .ok_or_else(missing)
             .and_then(|reply| sa_reply(&reply))
     }
-    pub fn query_sa(&mut self, id: &SaId) -> io::Result<(u64, u64, u64)> {
-        let sa = self.read_sa(id)?;
-        let last = if self.lastused {
-            sa.nlas.iter().find_map(|attr| match attr {
-                Attr::LastUsed(time) => Some(*time),
-                _ => None,
-            })
-        } else {
-            None
+    fn observe(
+        &self,
+        mut sa: packet::state::ModifyMessage,
+    ) -> io::Result<ObservedSa<SaHandle, Configuration>> {
+        let info = &sa.user_sa_info;
+        let mut mark = Mark::default();
+        let mut if_id = 0;
+        for attr in &sa.nlas {
+            match attr {
+                Attr::IfId(value) => if_id = *value,
+                Attr::Mark(value) => {
+                    mark = Mark {
+                        value: value.value & value.mask,
+                        mask: value.mask,
+                    }
+                }
+                _ => (),
+            }
         }
-        .unwrap_or(0);
-        let lifetime = sa.user_sa_info.lifetime_cur;
-        Ok((lifetime.bytes, lifetime.packets, monotonic_use_time(last)?))
-    }
-    fn delete_one(&mut self, id: &SaId) -> io::Result<()> {
-        if !self.owned(id) {
-            return Err(missing());
-        }
-        let request = XfrmMessage::DeleteSa(packet::state::DelGetMessage {
-            user_sa_id: sa_id(id),
-            nlas: id_attrs(id.mark, id.if_id),
-        });
-        match self.socket.ack(&message(NlmF::ACK, &request)) {
-            Ok(()) => (),
-            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => (),
-            Err(error) => return Err(error),
-        }
-        self.sas.remove(&id.key());
-        self.allocations
-            .remove(&(id.src.ip, id.dst.ip, id.spi, id.proto));
-        Ok(())
-    }
-    pub fn delete_sa(&mut self, id: &crate::model::SaId) -> io::Result<()> {
-        self.delete_one(id)
-    }
-    pub fn flush_sas(&mut self) -> io::Result<()> {
-        // strongSwan's RPC flush removes only this session's tracked states.
-        let ids: Vec<_> = self
-            .sas
-            .iter()
-            .cloned()
-            .chain(
-                self.allocations
-                    .iter()
-                    .map(|(src, dst, spi, proto)| crate::model::SaId {
-                        src: Host { ip: *src, port: 0 },
-                        dst: Host { ip: *dst, port: 0 },
-                        spi: *spi,
-                        proto: *proto,
-                        mark: Mark::default(),
-                        if_id: 0,
-                    }),
+        let id = SaId {
+            src: host(info.family, info.saddr, 0)?,
+            dst: host(info.family, info.id.daddr, 0)?,
+            spi: info.id.spi,
+            proto: info.id.proto,
+            mark,
+            if_id,
+        };
+        let has_transform = sa.nlas.iter().any(|attr| {
+            matches!(
+                attr,
+                Attr::EncryptionAlg(_)
+                    | Attr::EncryptionAlgAead(_)
+                    | Attr::AuthenticationAlg(_)
+                    | Attr::AuthenticationAlgTrunc(_)
+                    | Attr::CompressionAlg(_)
             )
-            .collect();
-        for id in ids {
-            self.delete_one(&id)?;
-        }
-        Ok(())
+        });
+        let state = if has_transform {
+            SaState::Installed
+        } else if info.seq != 0 || info.id.spi == 0 {
+            SaState::Acquiring
+        } else {
+            SaState::Larval
+        };
+        let last = if self.lastused {
+            sa.nlas
+                .iter()
+                .find_map(|attr| match attr {
+                    Attr::LastUsed(value) => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let usage = SaUsage {
+            bytes: info.lifetime_cur.bytes,
+            packets: info.lifetime_cur.packets,
+            last_use: monotonic_use_time(last)?,
+        };
+        let created_at = info.lifetime_cur.add_time;
+        let supported =
+            state == SaState::Installed && info.mode == packet::XFRM_MODE_TUNNEL && id.proto == 50;
+        // Keep static settings only. The kernel's canonical representation
+        // resolves algorithm aliases/default ICV lengths at first installation.
+        // Subsequent inventories never change that desired snapshot.
+        sa.user_sa_info.lifetime_cur = Default::default();
+        sa.user_sa_info.stats = Default::default();
+        sa.user_sa_info.seq = 0;
+        sa.nlas.retain_mut(|attr| match attr {
+            // AUTH is a redundant compatibility copy of AUTH_TRUNC in dumps.
+            Attr::AuthenticationAlg(_)
+            | Attr::ReplayState(_)
+            | Attr::LastUsed(_)
+            | Attr::LifetimeBytes(_)
+            | Attr::ReplayThreshold(_)
+            | Attr::EventTimeThreshold(_)
+            | Attr::MappingTimeThreshold(_)
+            | Attr::Pad() => false,
+            Attr::ReplayStateEsn(replay) => {
+                replay.seq = 0;
+                replay.oseq = 0;
+                replay.seq_hi = 0;
+                replay.oseq_hi = 0;
+                replay.bmp.fill(0);
+                true
+            }
+            _ => true,
+        });
+        sa.nlas.sort_by_key(Nla::kind);
+        Ok(ObservedSa {
+            handle: SaHandle(id),
+            state,
+            created_at,
+            usage,
+            config: supported.then_some(Configuration(sa)),
+        })
     }
-    /// Orderly daemon shutdown owns the entire namespace's XFRM state table,
-    /// including larval reservations and states absent from our bookkeeping.
-    pub fn flush_all_sas(&mut self) -> io::Result<()> {
+}
+
+/// Opaque native key: unlike policies, Linux SAs have no assigned index.
+/// SPI protocols use destination/SPI/protocol/family/mark; address-based
+/// transforms additionally require the source address. if_id is configuration,
+/// not a distinct GETSA/DELSA lookup namespace.
+pub struct SaHandle(SaId);
+impl crate::sa::SaHandle for SaHandle {
+    fn id(&self) -> &SaId {
+        &self.0
+    }
+}
+
+/// Static canonical settings only. No Debug implementation: this includes keys.
+#[derive(PartialEq, Eq)]
+pub struct Configuration(packet::state::ModifyMessage);
+
+fn native_request(id: &SaId) -> packet::state::DelGetMessage {
+    let mut nlas = id_attrs(id.mark, 0);
+    if ![50, 51, 108].contains(&id.proto) {
+        nlas.push(Attr::SrcAddr(packet::Address::from_ip(&id.src.ip)));
+    }
+    packet::state::DelGetMessage {
+        user_sa_id: sa_id(id),
+        nlas,
+    }
+}
+
+impl SaKernel for LinuxSas {
+    type Handle = SaHandle;
+    type Config = Configuration;
+    fn features(&self) -> u32 {
+        self.feature_flags()
+    }
+    fn allocate(
+        &mut self,
+        src: &Host,
+        dst: &Host,
+        proto: u8,
+        min: u32,
+        max: u32,
+    ) -> io::Result<u32> {
+        self.allocate_spi(src, dst, proto, min, max)
+    }
+    fn list(&mut self) -> io::Result<Vec<ObservedSa<SaHandle, Configuration>>> {
+        // A GETSA dump takes only optional filter attributes, not the fixed
+        // usersa_id record required for a single-object GETSA request.
+        let replies = self.socket.request(&Message {
+            kind: packet::XFRM_MSG_GETSA,
+            flags: NlmF::DUMP,
+            payload: Vec::new(),
+        })?;
+        replies
+            .iter()
+            .filter(|reply| reply.kind == NEWSA)
+            .map(|reply| self.observe(sa_reply(reply)?))
+            .collect()
+    }
+    fn get(&mut self, id: &SaId) -> io::Result<ObservedSa<SaHandle, Configuration>> {
+        let sa = self.read(id)?;
+        self.observe(sa)
+    }
+    fn create(&mut self, spec: &SaSpec<'_>) -> io::Result<ObservedSa<SaHandle, Configuration>> {
+        if spec.id.proto != 50 || spec.id.if_id == 0 {
+            return Err(unsupported());
+        }
+        let mut request = self.sa_message(spec.id, spec.config)?;
+        if spec.config.update {
+            // UPDSA is only for maturation of a larval reservation. In
+            // particular, never apply it to an already established SA.
+            match self.get(spec.id) {
+                Ok(current) if current.state != SaState::Installed => (),
+                Ok(_) => return Err(io::Error::from_raw_os_error(libc::EEXIST)),
+                Err(error) if is_missing(&error) => {
+                    if let XfrmMessage::UpdateSa(sa) = request {
+                        request = XfrmMessage::AddSa(sa);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        match self.socket.ack(&message(NlmF::ACK, &request)) {
+            Err(error) if is_missing(&error) && spec.config.update => {
+                // It may expire between GETSA and the maturation request.
+                // The controller has verified this is still first installation.
+                if let XfrmMessage::UpdateSa(sa) = request {
+                    self.socket
+                        .ack(&message(NlmF::ACK, &XfrmMessage::AddSa(sa)))?;
+                } else {
+                    return Err(error);
+                }
+            }
+            result => result?,
+        }
+        self.get(spec.id)
+    }
+    fn delete(&mut self, handle: &SaHandle) -> io::Result<()> {
+        match self.socket.ack(&message(
+            NlmF::ACK,
+            &XfrmMessage::DeleteSa(native_request(handle.id())),
+        )) {
+            Err(error) if is_missing(&error) => Ok(()),
+            result => result,
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
         self.socket.ack(&message(
             NlmF::ACK,
             &XfrmMessage::FlushSa(packet::state::FlushMessage::default()),
-        ))?;
-        self.sas.clear();
-        self.allocations.clear();
-        Ok(())
+        ))
     }
 }
+
 fn nonzero(v: u64) -> u64 {
     if v == 0 {
         u64::MAX
@@ -505,122 +606,192 @@ fn nonzero(v: u64) -> u64 {
     }
 }
 
-impl Xfrm {
-    pub fn event(
-        &mut self,
-        message: &Reply,
-        policies: &Policies<LinuxPolicies>,
-    ) -> io::Result<Option<rpc::Event>> {
-        let bytes = &message.payload;
-        let mut event = rpc::Event {
-            kind: rpc::Event_kind::ready,
-            expiry: None,
-            acquire: None,
-            mapping: None,
-            addressChanged: None,
-        };
-        match message.kind {
-            packet::XFRM_MSG_ACQUIRE => {
-                let packet::AcquireMessage { acquire, nlas } =
-                    packet::AcquireMessage::parse(bytes.as_slice()).map_err(io::Error::other)?;
-                let reqid = nlas
-                    .iter()
-                    .find_map(|attr| match attr {
-                        Attr::Template(templates) => {
-                            templates.first().map(|template| template.reqid)
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                let if_id = nlas
-                    .iter()
-                    .find_map(|attr| match attr {
-                        Attr::IfId(id) => Some(*id),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                if !policies.contains_reqid(if_id, reqid) {
-                    return Ok(None);
-                }
-                event.kind = rpc::Event_kind::acquire;
-                event.acquire = Some(rpc::Acquire {
-                    reqid: reqid.into(),
-                    src: rpc_selector(selector_ts(&acquire.selector, true)?),
-                    dst: rpc_selector(selector_ts(&acquire.selector, false)?),
-                    sequence: acquire.seq.into(),
-                });
+pub fn event(
+    message: &Reply,
+    sas: &mut Sas<LinuxSas>,
+    policies: &Policies<LinuxPolicies>,
+) -> io::Result<Option<rpc::Event>> {
+    let bytes = &message.payload;
+    let mut event = rpc::Event {
+        kind: rpc::Event_kind::ready,
+        expiry: None,
+        acquire: None,
+        mapping: None,
+        addressChanged: None,
+    };
+    match message.kind {
+        packet::XFRM_MSG_ACQUIRE => {
+            let packet::AcquireMessage { acquire, nlas } =
+                packet::AcquireMessage::parse(bytes.as_slice()).map_err(io::Error::other)?;
+            let reqid = nlas
+                .iter()
+                .find_map(|attr| match attr {
+                    Attr::Template(templates) => templates.first().map(|template| template.reqid),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let if_id = nlas
+                .iter()
+                .find_map(|attr| match attr {
+                    Attr::IfId(id) => Some(*id),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            if !policies.contains_reqid(if_id, reqid) {
+                return Ok(None);
             }
-            packet::XFRM_MSG_EXPIRE => {
-                // ExpireMessage omits trailing attributes in this crate version.
-                // Parse its typed fixed record and use the crate's NLA parser
-                // for the interface ID and mark needed to identify our SA.
-                let expire = packet::UserExpire::parse(bytes).map_err(io::Error::other)?;
-                let sa = expire.state;
-                let dst = host(sa.family, sa.id.daddr, 0)?;
-                let src = host(sa.family, sa.saddr, 0)?;
-                let mut mark = Mark::default();
-                let mut if_id = 0;
-                for nla in NlasIterator::new(&bytes[expire.buffer_len()..]) {
-                    let attr =
-                        Attr::parse(&nla.map_err(io::Error::other)?).map_err(io::Error::other)?;
-                    match attr {
-                        Attr::IfId(id) => if_id = id,
-                        Attr::Mark(value) => {
-                            mark = Mark {
-                                value: value.value,
-                                mask: value.mask,
-                            }
+            event.kind = rpc::Event_kind::acquire;
+            event.acquire = Some(rpc::Acquire {
+                reqid: reqid.into(),
+                src: rpc_selector(selector_ts(&acquire.selector, true)?),
+                dst: rpc_selector(selector_ts(&acquire.selector, false)?),
+                sequence: acquire.seq.into(),
+            });
+        }
+        packet::XFRM_MSG_EXPIRE => {
+            // ExpireMessage omits trailing attributes in this crate version.
+            // Parse its typed fixed record and use the crate's NLA parser
+            // for the interface ID and mark needed to identify our SA.
+            let expire = packet::UserExpire::parse(bytes).map_err(io::Error::other)?;
+            let sa = expire.state;
+            let dst = host(sa.family, sa.id.daddr, 0)?;
+            let src = host(sa.family, sa.saddr, 0)?;
+            let mut mark = Mark::default();
+            let mut if_id = 0;
+            for nla in NlasIterator::new(&bytes[expire.buffer_len()..]) {
+                let attr =
+                    Attr::parse(&nla.map_err(io::Error::other)?).map_err(io::Error::other)?;
+                match attr {
+                    Attr::IfId(id) => if_id = id,
+                    Attr::Mark(value) => {
+                        mark = Mark {
+                            value: value.value,
+                            mask: value.mask,
                         }
-                        _ => (),
+                    }
+                    _ => (),
+                }
+            }
+            let id = SaId {
+                src,
+                dst: dst.clone(),
+                spi: sa.id.spi,
+                proto: sa.id.proto,
+                mark,
+                if_id,
+            }
+            .key();
+            let hard = expire.hard != 0;
+            if !sas.expire(&id, hard) {
+                return Ok(None);
+            }
+            event.kind = rpc::Event_kind::expire;
+            event.expiry = Some(rpc::Expiry {
+                protocol: sa.id.proto.into(),
+                spi: sa.id.spi.into(),
+                destination: endpoint(dst),
+                hard,
+            });
+        }
+        packet::XFRM_MSG_MAPPING => {
+            let mapping = packet::UserMapping::parse(bytes).map_err(io::Error::other)?;
+            let spi = mapping.id.spi;
+            let family = mapping.id.family;
+            let dst = host(family, mapping.id.daddr, 0)?;
+            if mapping.id.proto != 50
+                || !sas
+                    .ids()
+                    .any(|id| id.dst.ip == dst.ip && id.spi == spi && id.proto == 50)
+            {
+                return Ok(None);
+            }
+            let remote = host(family, mapping.new_saddr, mapping.new_sport)?;
+            event.kind = rpc::Event_kind::mapping;
+            event.mapping = Some(rpc::Mapping {
+                spi: spi.into(),
+                destination: endpoint(dst),
+                remote: endpoint(remote),
+            });
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some(event))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshots_ignore_packet_state_but_detect_managed_configuration_drift() {
+        let backend = LinuxSas::new().unwrap();
+        let sa = packet::state::ModifyMessage {
+            user_sa_info: packet::UserSaInfo {
+                family: libc::AF_INET as u16,
+                saddr: packet::Address::from_ip(&"192.0.2.1".parse().unwrap()),
+                id: packet::Id {
+                    daddr: packet::Address::from_ip(&"192.0.2.2".parse().unwrap()),
+                    spi: 0x10203,
+                    proto: 50,
+                },
+                mode: packet::XFRM_MODE_TUNNEL,
+                reqid: 42,
+                ..Default::default()
+            },
+            nlas: vec![
+                Attr::EncryptionAlgAead(packet::AlgAead {
+                    alg_name: algorithm("rfc4106(gcm(aes))").unwrap(),
+                    alg_key: vec![0; 20],
+                    alg_key_len: 160,
+                    alg_icv_len: 128,
+                }),
+                Attr::IfId(41),
+                Attr::ReplayStateEsn(packet::ReplayEsn {
+                    bmp_len: 4,
+                    replay_window: 128,
+                    bmp: vec![0; 4],
+                    ..Default::default()
+                }),
+            ],
+        };
+        let expected = backend.observe(sa.clone()).unwrap().config;
+        let mut running = sa.clone();
+        running.user_sa_info.lifetime_cur.bytes = 1000;
+        running.user_sa_info.lifetime_cur.packets = 10;
+        running.user_sa_info.stats.replay = 2;
+        running.user_sa_info.seq = 123;
+        running.nlas.push(Attr::LastUsed(0));
+        running.nlas.push(Attr::ReplayThreshold(10));
+        if let Attr::ReplayStateEsn(replay) = &mut running.nlas[2] {
+            replay.seq = 9;
+            replay.oseq = 12;
+            replay.seq_hi = 1;
+            replay.oseq_hi = 2;
+            replay.bmp.fill(u32::MAX);
+        }
+        running.nlas.reverse();
+        let observed = backend.observe(running).unwrap();
+        assert!(observed.config == expected);
+        assert_eq!(observed.usage.packets, 10);
+        for mutation in 0..6 {
+            let mut drifted = sa.clone();
+            match mutation {
+                0 => drifted.user_sa_info.reqid += 1,
+                1 => drifted.user_sa_info.flags ^= packet::XFRM_STATE_NOECN,
+                2 => drifted.user_sa_info.lifetime_cfg.hard_add_expires_seconds = 100,
+                3 => {
+                    if let Attr::EncryptionAlgAead(algorithm) = &mut drifted.nlas[0] {
+                        algorithm.alg_key[0] = 1;
                     }
                 }
-                let id = SaId {
-                    src,
-                    dst: dst.clone(),
-                    spi: sa.id.spi,
-                    proto: sa.id.proto,
-                    mark,
-                    if_id,
+                4 => {
+                    if let Attr::ReplayStateEsn(replay) = &mut drifted.nlas[2] {
+                        replay.replay_window = 64;
+                    }
                 }
-                .key();
-                if !self.sas.contains(&id) {
-                    return Ok(None);
-                }
-                let hard = expire.hard != 0;
-                if hard {
-                    self.sas.remove(&id);
-                }
-                event.kind = rpc::Event_kind::expire;
-                event.expiry = Some(rpc::Expiry {
-                    protocol: sa.id.proto.into(),
-                    spi: sa.id.spi.into(),
-                    destination: endpoint(dst),
-                    hard,
-                });
+                _ => drifted.nlas.push(Attr::MarkVal(999)),
             }
-            packet::XFRM_MSG_MAPPING => {
-                let mapping = packet::UserMapping::parse(bytes).map_err(io::Error::other)?;
-                let spi = mapping.id.spi;
-                let family = mapping.id.family;
-                let dst = host(family, mapping.id.daddr, 0)?;
-                if mapping.id.proto != 50
-                    || !self
-                        .sas
-                        .iter()
-                        .any(|id| id.dst.ip == dst.ip && id.spi == spi && id.proto == 50)
-                {
-                    return Ok(None);
-                }
-                let remote = host(family, mapping.new_saddr, mapping.new_sport)?;
-                event.kind = rpc::Event_kind::mapping;
-                event.mapping = Some(rpc::Mapping {
-                    spi: spi.into(),
-                    destination: endpoint(dst),
-                    remote: endpoint(remote),
-                });
-            }
-            _ => return Ok(None),
+            assert!(backend.observe(drifted).unwrap().config != expected);
         }
-        Ok(Some(event))
     }
 }

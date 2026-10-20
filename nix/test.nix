@@ -213,6 +213,11 @@ in
     def spis(machine):
         return set(re.findall(r"spi (0x[0-9a-f]+)", machine.succeed("ip xfrm state")))
 
+    def matched_value(pattern, text):
+        match = re.search(pattern, text)
+        assert match is not None, text
+        return match[1]
+
     def policy_specs(machine):
         return set(re.split(r"(?=^src )", machine.succeed("ip xfrm policy list nosock"), flags=re.M)[1:])
 
@@ -477,6 +482,65 @@ in
                 assert all(link["master"] == interface_settings[peer - 1][2]
                            and "MULTICAST" in link["flags"] for link in links(machine))
 
+        for mutation in ["inbound", "outbound", "flush", "drift", "rekey-flush"]:
+            with subtest(name + ": SA " + mutation + " recovers through fresh CHILD negotiation"):
+                old_spis = [spis(machine) for machine in machines]
+                ike_ids = [matched_value(r"\buniqueid=(\d+)", ctl(machine, "--list-sas --raw"))
+                           for machine in machines]
+                pids = [property(machine, "strongswan-swanctl.service", "MainPID")
+                        for machine in machines]
+                if mutation == "rekey-flush":
+                    # Hold the peer's replies long enough to lose the old SAs
+                    # while a real rekey exchange is in flight.
+                    right.succeed("tc qdisc add dev eth1 root netem delay 500ms")
+                    ctl(left, "--rekey --child net")
+                try:
+                    if mutation in ["flush", "rekey-flush"]:
+                        left.succeed("ip xfrm state flush")
+                    else:
+                        blocks = re.split(r"(?=^src )", left.succeed("ip xfrm state"), flags=re.M)[1:]
+                        direction = "in" if mutation == "inbound" else "out"
+                        state = next(block for block in blocks if "dir " + direction in block)
+                        destination = matched_value(r"^src \S+ dst (\S+)", state)
+                        spi = matched_value(r"\bspi (0x[0-9a-f]+)", state)
+                        if mutation != "drift":
+                            left.succeed(f"ip xfrm state delete dst {destination} proto esp spi {spi}")
+                        else:
+                            # UPDSA preserves running crypto state but changes
+                            # the output mark. Our backend must retire it.
+                            source = matched_value(r"^src (\S+)", state)
+                            if algorithm == "rfc4106(gcm(aes))":
+                                crypto = "aead 'rfc4106(gcm(aes))' 0x" + "00" * 20 + " 128"
+                            else:
+                                crypto = ("enc 'cbc(aes)' 0x" + "00" * 16
+                                          + " auth-trunc 'hmac(sha256)' 0x" + "00" * 32 + " 128")
+                            left.succeed(
+                                f"ip xfrm state update src {source} dst {destination} proto esp spi {spi} "
+                                f"mode tunnel {crypto} encap espinudp 13000 13000 0.0.0.0 "
+                                "output-mark 999 dir out"
+                            )
+                    for attempt in range(150):
+                        current = [spis(machine) for machine in machines]
+                        if all(len(now) >= 2 and not now.intersection(old)
+                               for now, old in zip(current, old_spis)):
+                            break
+                        time.sleep(0.1)
+                    else:
+                        raise AssertionError("lost/drifted SAs did not get replaced")
+                    for peer, machine in enumerate(machines, 1):
+                        assert property(machine, "strongswan-swanctl.service", "MainPID") == pids[peer - 1]
+                        assert matched_value(r"\buniqueid=(\d+)", ctl(machine, "--list-sas --raw")) == ike_ids[peer - 1]
+                        interface = next(iter(original_indices[peer - 1]))
+                        wait_interface(machine, peer, interface)
+                        wait_overlay_config(machine, peer, interface)
+                        ping_overlay(machine, peer)
+                        if mutation == "flush" and peer == 1:
+                            assert indices(machine)[interface] != original_indices[0][interface]
+                        original_indices[peer - 1] = indices(machine)
+                finally:
+                    if mutation == "rekey-flush":
+                        right.succeed("tc qdisc del dev eth1 root")
+
         with subtest(name + ": removing the final SA removes its interface"):
             ctl(left, "--terminate --ike tunnel")
             for peer, machine in enumerate(machines, 1):
@@ -565,15 +629,20 @@ in
         assert_stopped(left, "strongswan-swanctl.service")
         left.succeed("test ! -e /run/strongswan && test ! -e /run/charon-kernel")
 
-    with subtest("a fresh strongSwan session retires global policy leftovers"):
+    with subtest("a fresh strongSwan session retires global policy and SA leftovers"):
         left.succeed(
             "ip xfrm policy add src 203.0.113.0/24 dst 203.0.114.0/24 "
             "dev lo dir out mark 0x123 mask 0xfff if_id 77 action block"
         )
         assert "203.0.113.0/24" in left.succeed("ip xfrm policy list nosock")
+        left.succeed(
+            "ip xfrm state add src 192.0.2.1 dst 192.0.2.2 proto esp spi 0x77777 "
+            "mode tunnel aead 'rfc4106(gcm(aes))' 0x" + "00" * 20 + " 128"
+        )
         left.succeed("systemctl reset-failed && systemctl start strongswan-swanctl.service")
         left.wait_for_unit("strongswan-swanctl.service")
         assert "kernel-rust" in ctl(left, "--stats")
+        assert not spis(left)
         remaining = policy_specs(left)
         assert all("priority 32" in policy and "proto udp" in policy
                    and "if_id" not in policy for policy in remaining), remaining

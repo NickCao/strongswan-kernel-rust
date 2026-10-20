@@ -141,6 +141,7 @@ def run(binary):
                 client_file = directory / "client.py"; client_file.write_text(Path(__file__).read_text()); client_file.chmod(0o644)
                 child = subprocess.Popen(["setpriv","--reuid=65534","--regid=65534","--clear-groups","--bounding-set=-all","--inh-caps=-all","--ambient-caps=-all",sys.executable,str(client_file),"--client",path], stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
                 assert "token" in json.loads(child.stdout.readline())["parameters"]
+                assert not states().strip(), "startup must retire untracked SAs"
                 def raw(method=None, parameters=None, **kwargs):
                     child.stdin.write(json.dumps(dict(method=method,parameters=parameters or {},**kwargs))+"\n"); child.stdin.flush()
                     line = child.stdout.readline(); assert line, "client exited"; return json.loads(line)
@@ -228,12 +229,19 @@ def run(binary):
                 rpc("InstallSa",id=b,config=sa_config())
                 rpc("RemoveSa",id=a)
                 assert next(l for l in links() if l["ifname"] == "ranet00000029")["ifindex"] == index
-                # A tracked SA that vanished in the kernel can be installed
-                # again through the update-to-add retry without losing xfrmi.
+                # Loss retires an established SA exactly once. An update must
+                # never reinstall old keys with reset packet/replay state.
                 ip("xfrm", "state", "delete", "src", b["src"]["address"], "dst", b["dst"]["address"],
                    "proto", "esp", "spi", b["spi"])
-                rpc("InstallSa",id=b,config=sa_config(update=True))
-                assert next(l for l in links() if l["ifname"] == "ranet00000029")["ifindex"] == index
+                event = raw(event="expire")["parameters"]["event"]["expiry"]
+                assert event["hard"] and event["spi"] == b["spi"], event
+                wait(lambda: [l["ifname"] for l in links()] == ["foreign"])
+                failure("InstallSa", errno.ENOENT, id=b, config=sa_config(update=True))
+                rpc("RemoveSa", id=b)  # strongSwan may acknowledge an already retired SA.
+                b = sa_id(spi=0x10206)
+                rpc("InstallSa", id=b, config=sa_config())
+                assert next(l for l in links() if l["ifname"] == "ranet00000029")["ifindex"] != index
+                index = next(l for l in links() if l["ifname"] == "ranet00000029")["ifindex"]
                 # Interface repair uses recorded SA ownership, independently
                 # of policies and without changing the installed SAs.
                 name = "ranet00000029"
@@ -433,6 +441,12 @@ def run(binary):
                 inbound = sa_id(spi=spi,interface=43)
                 rpc("InstallSa",id=inbound,config=sa_config(inbound=True,update=True))
                 rpc("RemoveSa",id=inbound)
+                spi = rpc("AllocateSpi",src=endpoint(),dst=endpoint("192.0.2.2"),minimum=0xc0000000,maximum=0xcfffffff)["spi"]
+                inbound = sa_id(spi=spi,interface=43)
+                ip("xfrm", "state", "delete", "dst", inbound["dst"]["address"], "proto", "esp", "spi", spi)
+                rpc("InstallSa",id=inbound,config=sa_config(inbound=True,update=True))
+                failure("InstallSa",errno.EEXIST,id=inbound,config=sa_config(inbound=True,update=True))
+                rpc("RemoveSa",id=inbound)
                 expiring = sa_id(spi=0x10205,interface=44)
                 rpc("InstallSa",id=expiring,config=sa_config(life=3,inbound=True))
                 event = raw(event="expire")["parameters"]["event"]
@@ -441,7 +455,7 @@ def run(binary):
                     assert raw(event="expire")["parameters"]["event"]["expiry"]["hard"]
                 wait(lambda: [l["ifname"] for l in links()] == ["foreign"])
                 rpc("FlushSas")
-                assert "0x0000aaaa" in states() and "0x000102" not in states(), states()
+                assert not states().strip(), states()
                 rpc("CloseSession"); child.wait(timeout=5); assert child.returncode == 0
                 assert not ip("xfrm","policy").strip()
                 # A clean close releases ownership and permits a new session.
@@ -484,12 +498,98 @@ def run(binary):
                 assert probe.call("OpenSession",dict(interfacesUse="",interfacesIgnore=""))["error"].endswith("SessionBusy")
                 probe.socket.close()
                 wait(lambda: [l["ifname"] for l in links()] == ["foreign"])
-                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, address scope/type filtering, multihomed sources and egress-interface exclusions, ICMP policy priorities, policy and interface repair without SA changes, rekey references and teardown, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, update-to-add retry, IPv4/IPv6 acquire events, rollback, foreign replacements, larval SPI, hard expiry, scoped cleanup including missing objects, and disconnected-client expiry")
+                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, address scope/type filtering, multihomed sources and egress-interface exclusions, ICMP policy priorities, policy and interface repair without SA changes, rekey references and teardown, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, immutable SA loss notification, IPv4/IPv6 acquire events, rollback, foreign replacements, larval SPI, hard expiry, namespace cleanup including missing objects, and disconnected-client expiry")
             except BaseException:
                 log.seek(0); print(log.read(),file=sys.stderr); raise
             finally:
                 if child and child.poll() is None: child.kill(); child.wait()
                 daemon.terminate(); daemon.wait(timeout=5)
+
+    with tempfile.TemporaryDirectory(prefix="kernel-rust-sa-audit-") as d:
+        path = str(Path(d) / "kernel.sock")
+        with open(Path(d) / "daemon.log", "w+") as log:
+            daemon = subprocess.Popen([binary, "--socket", path], stdout=log, stderr=log)
+            control = watch = None
+            try:
+                wait(lambda: Path(path).exists() or daemon.poll() is not None)
+                assert daemon.poll() is None
+                control = Varlink(path)
+                def call(method, **parameters):
+                    reply = control.call(method, parameters)
+                    assert "error" not in reply, reply
+                    return reply.get("parameters", {})
+                token = call("OpenSession", interfacesUse="", interfacesIgnore="")["token"]
+                watch = Varlink(path)
+                watch.send("io.ranet.Kernel.WatchEvents", dict(token=token), more=True)
+                assert watch.receive()["parameters"]["event"]["kind"] == "ready"
+                def expiries(expected):
+                    found = []
+                    deadline = time.monotonic() + 10
+                    while len(found) < len(expected) and time.monotonic() < deadline:
+                        event = watch.receive()["parameters"]["event"]
+                        if event["kind"] == "expire":
+                            assert event["expiry"]["hard"], event
+                            found.append(event["expiry"]["spi"])
+                    assert set(found) == set(expected) and len(found) == len(expected), found
+                a, b = sa_id(spi=0x70001, interface=80), sa_id(spi=0x70002, interface=80)
+                for id in [a, b]:
+                    call("InstallSa", id=id, config=sa_config())
+                name = "ranet00000050"
+                index = next(link["ifindex"] for link in links() if link["ifname"] == name)
+                ip("route", "add", "203.0.120.1/32", "dev", name)
+                # A real in-place native update changes managed configuration.
+                # The daemon must delete it and expire it, never repair it.
+                direction = ["dir", "out"] if "dir out" in states() else []
+                ip("xfrm", "state", "update", "src", a["src"]["address"],
+                   "dst", a["dst"]["address"], "proto", "esp", "spi", a["spi"],
+                   "mode", "tunnel", "aead", "rfc4106(gcm(aes))", "0x" + "00" * 20, "128",
+                   "encap", "espinudp", "13000", "13000", "0.0.0.0", "if_id", "80",
+                   "output-mark", "999", *direction)
+                expiries([a["spi"]])
+                assert f"{a['spi']:08x}" not in states()
+                assert call("QuerySa", id=b)["packets"] == "0"
+                assert next(link["ifindex"] for link in links() if link["ifname"] == name) == index
+                call("RemoveSa", id=a)
+                ip("xfrm", "state", "delete", "dst", b["dst"]["address"], "proto", "esp", "spi", b["spi"])
+                expiries([b["spi"]])
+                wait(lambda: all(link["ifname"] != name for link in links()))
+                assert not ip("route", "show", "203.0.120.1/32").strip()
+                # Loss of both directions and a large inventory produces one
+                # expiry per SA, without overflowing the bounded event queue.
+                bulk = []
+                for number in range(300):
+                    id = sa_id(spi=0x71000 + number, interface=81)
+                    if number % 2:
+                        id["src"], id["dst"] = id["dst"], id["src"]
+                    call("InstallSa", id=id, config=sa_config(inbound=bool(number % 2)))
+                    bulk.append(id["spi"])
+                ip("xfrm", "state", "flush")
+                expiries(bulk)
+                wait(lambda: [link["ifname"] for link in links()] == ["foreign"])
+                time.sleep(5.2)  # A second audit must neither reinstall nor notify again.
+                assert not states().strip()
+                watch.socket.settimeout(0.1)
+                try:
+                    while True:
+                        assert watch.receive()["parameters"]["event"]["kind"] != "expire"
+                except socket.timeout:
+                    pass
+                watch.socket.settimeout(10)
+                # Unsolicited established SAs are namespace-owned and pruned.
+                ip("xfrm", "state", "add", "src", "192.0.2.10", "dst", "192.0.2.11",
+                   "proto", "esp", "spi", "0x7ffff", "mode", "tunnel", "aead",
+                   "rfc4106(gcm(aes))", "0x" + "00" * 20, "128")
+                wait(lambda: not states().strip())
+                call("CloseSession")
+                daemon.terminate(); assert daemon.wait(timeout=10) == 0
+            except BaseException:
+                log.seek(0); print(log.read(), file=sys.stderr); raise
+            finally:
+                for connection in [control, watch]:
+                    if connection: connection.socket.close()
+                if daemon.poll() is None:
+                    daemon.kill(); daemon.wait()
+    print("PASS: immutable SA drift/loss retirement, overlapping interface references, route withdrawal, 300-SA flush notifications without replay or duplicates, and unsolicited state cleanup")
 
     foreign_policy = ["src", "203.0.113.0/24", "dst", "203.0.114.0/24",
                       "dir", "out", "if_id", "77"]
@@ -610,8 +710,8 @@ def run(binary):
                         daemon.kill(); daemon.wait()
     print("PASS: fresh sessions retire all global policy leftovers after daemon SIGKILL without persisted ownership records")
 
-    # Group membership survives daemon crashes. Reuse recognizable interfaces,
-    # remove every unwanted owned kind, and preserve interfaces in other groups.
+    # Group membership survives daemon crashes. A fresh session retires the
+    # previous session's SAs and interfaces, preserving other ownership groups.
     with tempfile.TemporaryDirectory(prefix="kernel-rust-inventory-") as d:
         directory = Path(d)
         with open(directory / "daemon.log", "w+") as log:
@@ -657,12 +757,12 @@ def run(binary):
                 second = sa_id(spi=0x50001, interface=70)
                 call(control, "InstallSa", id=second, config=sa_config())
                 recovered = next(link for link in owned() if link["ifname"] == "resume00000046")
-                assert recovered["ifindex"] == original, recovered
+                assert recovered["ifindex"] != original, recovered
                 assert recovered["mtu"] == 1400 and {"UP", "MULTICAST"} <= set(recovered["flags"]), recovered
                 assert int(str(recovered["linkinfo"]["info_data"]["if_id"]), 0) == 70, recovered
-                assert recovered["ifalias"] == "retained-after-crash" and recovered["txqlen"] == 321, recovered
+                assert not recovered.get("ifalias"), recovered
                 assert not any(link["ifname"] == "owned-orphan" for link in inventory())
-                assert "0x00050000" in states(), "interface discovery must not adopt or remove old SAs"
+                assert "0x00050000" not in states(), "fresh sessions must retire old SAs"
                 # A known ID with the wrong kind is updated; Linux replaces it.
                 ip("link", "add", "resume00000047", "group", 17229, "type", "dummy")
                 third = sa_id(spi=0x50002, interface=71)
@@ -671,7 +771,7 @@ def run(binary):
                 assert repaired["linkinfo"]["info_kind"] == "xfrm", repaired
                 assert control.call("InstallSa", dict(id=sa_id(spi=0x50003, interface=72), config=sa_config()))["parameters"]["errno"] == errno.EEXIST
                 assert next(link for link in inventory() if link["ifname"] == "resume00000048")["linkinfo"]["info_kind"] == "dummy"
-                before_sas = states()
+                assert states().strip()
                 daemon.kill(); assert daemon.wait(timeout=5) == -signal.SIGKILL
                 control.socket.close()
                 ip("link", "add", "owned-bridge", "group", 17229, "type", "bridge")
@@ -679,7 +779,7 @@ def run(binary):
                 daemon, control = start(2)
                 call(control, "CloseSession")
                 assert not owned(), "empty desired state must remove all discovered owned kinds"
-                assert states() == before_sas, "interface crash cleanup must leave SAs unchanged"
+                assert not states().strip(), "startup must clean SAs left by a crash"
                 assert any(link["ifname"] == "resume00000048" for link in inventory())
                 assert any(link["ifname"] == "foreign" for link in links())
                 daemon.terminate(); assert daemon.wait(timeout=5) == 0
@@ -693,7 +793,7 @@ def run(binary):
                 for daemon in daemons:
                     if daemon.poll() is None:
                         daemon.kill(); daemon.wait()
-    print("PASS: configurable numeric ownership group, wrong-kind repair, opaque identity independent of native if_id, crash inventory reuse and cleanup, unmanaged settings preserved, and foreign groups untouched")
+    print("PASS: configurable numeric ownership group, wrong-kind repair, opaque identity independent of native if_id, crash inventory cleanup, unmanaged settings preserved, and foreign groups untouched")
 
 if __name__ == "__main__":
     if sys.argv[1] == "--client": client(sys.argv[2])

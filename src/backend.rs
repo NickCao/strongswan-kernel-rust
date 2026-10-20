@@ -2,16 +2,17 @@
 use crate::{
     error::invalid,
     interfaces::Interfaces,
-    linux::{interfaces::LinuxInterfaces, network::Network, policy::LinuxPolicies, xfrm::Xfrm},
+    linux::{interfaces::LinuxInterfaces, network::Network, policy::LinuxPolicies, xfrm::LinuxSas},
     model::*,
     policy::Policies,
     rpc_api as rpc,
+    sa::{SaChanges, Sas},
 };
 use std::{collections::HashSet, io};
 use zeroize::Zeroizing;
 
 pub struct Backend {
-    pub xfrm: Xfrm,
+    pub sas: Sas<LinuxSas>,
     pub net: Network,
     pub policies: Policies<LinuxPolicies>,
     interfaces: Interfaces<LinuxInterfaces>,
@@ -35,7 +36,7 @@ impl Backend {
             interfaces_ignore,
         };
         Ok(Self {
-            xfrm: Xfrm::new()?,
+            sas: Sas::new(LinuxSas::new()?),
             net,
             policies: Policies::new(LinuxPolicies::new()?),
             interfaces: Interfaces::new(
@@ -46,13 +47,22 @@ impl Backend {
         })
     }
     fn desired_interfaces(&self) -> HashSet<u32> {
-        self.xfrm.sas.iter().map(|sa| sa.if_id).collect()
+        self.sas.ids().map(|sa| sa.if_id).collect()
     }
     pub fn cleanup_interfaces(&mut self) -> io::Result<()> {
         self.interfaces.remove_unused(&self.desired_interfaces())
     }
     pub fn reconcile_interfaces(&mut self) -> io::Result<()> {
         self.interfaces.reconcile(&self.desired_interfaces())
+    }
+    pub fn reconcile_sas(&mut self) -> io::Result<SaChanges> {
+        let mut changes = self.sas.reconcile()?;
+        // Release the failed tunnel's interface before asking strongSwan to
+        // recover, so routing daemons can immediately choose another tunnel.
+        if let Err(error) = self.cleanup_interfaces() {
+            changes.cleanup_error.get_or_insert(error);
+        }
+        Ok(changes)
     }
     pub fn install_sa(&mut self, id: rpc::SaId, config: rpc::SaConfig) -> io::Result<()> {
         let id = sa_id(id)?;
@@ -98,30 +108,30 @@ impl Backend {
             return Err(invalid());
         }
         self.interfaces.ensure(id.if_id)?;
-        let result = self.xfrm.add_sa(&id, &data);
+        let result = self.sas.install(&id, &data);
         let cleanup = self.cleanup_interfaces();
         result.and(cleanup)
     }
     pub fn remove_sa(&mut self, id: rpc::SaId) -> io::Result<()> {
-        let result = self.xfrm.delete_sa(&sa_id(id)?);
+        let result = self.sas.remove(&sa_id(id)?);
         let cleanup = self.cleanup_interfaces();
         result.and(cleanup)
     }
     pub fn flush_sas(&mut self) -> io::Result<()> {
-        let result = self.xfrm.flush_sas();
+        let result = self.sas.clear();
         let cleanup = self.cleanup_interfaces();
         result.and(cleanup)
     }
     pub fn shutdown(&mut self) -> io::Result<()> {
         self.policies.clear();
         let policies = self.policies.reconcile();
-        let sas = self.xfrm.flush_all_sas();
+        let sas = self.sas.clear();
         let interfaces = self.interfaces.reconcile(&HashSet::new());
         policies.and(sas).and(interfaces)
     }
     pub fn close(&mut self) -> io::Result<()> {
         // Remove bypasses only after all tunnel objects are gone.
-        if !self.xfrm.sas.is_empty() || self.policies.has_tunnel_policies() {
+        if !self.sas.is_empty() || self.policies.has_tunnel_policies() {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
         self.flush_sas()?;

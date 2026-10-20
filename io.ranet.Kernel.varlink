@@ -39,11 +39,12 @@ method CloseSession() -> ()
 method WatchEvents(token: string) -> (event: Event)
 
 method AllocateSpi(src: Endpoint, dst: Endpoint, minimum: int, maximum: int) -> (spi: int)
+# Established SAs are immutable. update completes a known SPI reservation only.
 method InstallSa(id: SaId, config: SaConfig) -> ()
 # lastUse is CLOCK_MONOTONIC seconds, or zero if unused/unavailable.
 method QuerySa(id: SaId) -> (bytes: string, packets: string, lastUse: int)
 method RemoveSa(id: SaId) -> ()
-# Flushes only objects owned by this daemon session.
+# Owns and flushes the namespace's whole XFRM state table, including reservations.
 method FlushSas() -> ()
 method InstallPolicy(id: PolicyId, config: PolicyConfig) -> ()
 # lastUse uses the same monotonic clock as QuerySa.

@@ -2,7 +2,10 @@
 use crate::{
     backend::{self, Backend},
     error::invalid,
-    linux::netlink::{Netlink, NlFamily, Notifications},
+    linux::{
+        netlink::{Netlink, NlFamily, Notifications},
+        xfrm,
+    },
     rpc_api::*,
     transport,
 };
@@ -81,8 +84,8 @@ pub struct Session {
     pid: i32,
     token: String,
     backend: Mutex<Backend>,
-    events: SyncSender<Option<Event>>,
-    receiver: Mutex<Option<Receiver<Option<Event>>>>,
+    events: SyncSender<Option<Vec<Event>>>,
+    receiver: Mutex<Option<Receiver<Option<Vec<Event>>>>>,
     connected: AtomicBool,
     closed: AtomicBool,
     roam: AtomicU8,
@@ -159,7 +162,11 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
         }
         if matches!(
             r.kind,
-            netlink_packet_xfrm::XFRM_MSG_NEWPOLICY
+            netlink_packet_xfrm::XFRM_MSG_NEWSA
+                | netlink_packet_xfrm::XFRM_MSG_UPDSA
+                | netlink_packet_xfrm::XFRM_MSG_DELSA
+                | netlink_packet_xfrm::XFRM_MSG_FLUSHSA
+                | netlink_packet_xfrm::XFRM_MSG_NEWPOLICY
                 | netlink_packet_xfrm::XFRM_MSG_UPDPOLICY
                 | netlink_packet_xfrm::XFRM_MSG_DELPOLICY
                 | netlink_packet_xfrm::XFRM_MSG_FLUSHPOLICY
@@ -173,8 +180,8 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
             if session.closed.load(Ordering::Acquire) {
                 return;
             }
-            let Backend { xfrm, policies, .. } = &mut *backend;
-            let result = xfrm.event(&r, policies);
+            let Backend { sas, policies, .. } = &mut *backend;
+            let result = xfrm::event(&r, sas, policies);
             if let Err(e) = backend.cleanup_interfaces() {
                 eprintln!("kernel-daemon: interface cleanup: {e}");
             }
@@ -182,7 +189,7 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
         };
         match result {
             Ok(Some(event)) if session.connected.load(Ordering::Acquire) => {
-                if session.events.try_send(Some(event)).is_err() {
+                if session.events.try_send(Some(vec![event])).is_err() {
                     session.fail();
                 }
             }
@@ -208,11 +215,40 @@ fn repair_loop(session: Arc<Session>, wakeup: Receiver<()>) {
         if Instant::now() < next_audit {
             continue;
         }
-        // Keep this lock through both the inventory and its repairs.
+        // Keep this lock through inventory, retirement and policy/link repairs.
         // Install/delete/rekey requests use this same lock.
         let mut backend = session.backend.lock().unwrap();
         if !session.connected.load(Ordering::Acquire) || session.closed.load(Ordering::Acquire) {
             break;
+        }
+        match backend.reconcile_sas() {
+            Ok(changes) => {
+                if let Some(error) = changes.cleanup_error {
+                    eprintln!("kernel-daemon: SA cleanup: {error}");
+                }
+                // One bounded queue entry per inventory, so a flush of
+                // hundreds of SAs cannot overflow the queue with expirations.
+                let events: Vec<_> = changes
+                    .expired
+                    .into_iter()
+                    .map(|id| Event {
+                        kind: Event_kind::expire,
+                        expiry: Some(Expiry {
+                            protocol: id.proto.into(),
+                            spi: id.spi.into(),
+                            destination: backend::endpoint(id.dst),
+                            hard: true,
+                        }),
+                        acquire: None,
+                        mapping: None,
+                        addressChanged: None,
+                    })
+                    .collect();
+                if !events.is_empty() && session.events.try_send(Some(events)).is_err() {
+                    session.fail();
+                }
+            }
+            Err(error) => eprintln!("kernel-daemon: SA inventory: {error}"),
         }
         if let Err(error) = backend.reconcile_interfaces() {
             eprintln!("kernel-daemon: interface reconciliation: {error}");
@@ -287,12 +323,14 @@ impl VarlinkInterface for Service {
                 interfaces_use,
                 interfaces_ignore,
             )?;
-            // Retire global policy leftovers before accepting new desired
-            // state. SA reconciliation and restart cleanup remain separate.
+            // Retire namespace-owned leftovers before accepting new desired
+            // state. No established SA or old key is adopted after a restart.
             backend.policies.reconcile()?;
-            let (xfrm_socket, xfrm) = Netlink::subscribe(NlFamily::Xfrm, 1 | 2 | 8 | 128)?;
+            backend.sas.clear()?;
+            backend.reconcile_interfaces()?;
+            let (xfrm_socket, xfrm) = Netlink::subscribe(NlFamily::Xfrm, 1 | 2 | 4 | 8 | 128)?;
             let token = hex::encode(rand::random::<[u8; 32]>());
-            let features = backend.xfrm.features().into();
+            let features = backend.sas.features().into();
             let (tx, rx) = mpsc::sync_channel(256);
             let (repair_wakeup, repair_receiver) = mpsc::sync_channel(1);
             let s = Arc::new(Session {
@@ -374,13 +412,15 @@ impl VarlinkInterface for Service {
         let mut next_roam = Instant::now() + ROAM_DELAY;
         while s.connected.load(Ordering::Acquire) && !s.closed.load(Ordering::Acquire) {
             match receiver.recv_timeout(next_roam.saturating_duration_since(Instant::now())) {
-                Ok(Some(event)) => {
-                    if s.closed.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if let Err(e) = call.reply(event) {
-                        s.fail();
-                        return Err(e);
+                Ok(Some(events)) => {
+                    for event in events {
+                        if s.closed.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if let Err(e) = call.reply(event) {
+                            s.fail();
+                            return Err(e);
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -429,7 +469,7 @@ impl VarlinkInterface for Service {
                 if src.family() != dst.family() || min < 256 || min > max {
                     return Err(invalid());
                 }
-                b.xfrm.allocate(src, dst, 50, min, max)
+                b.sas.allocate(src, dst, 50, min, max)
             },
             |c: &mut dyn Call_AllocateSpi, spi: u32| c.reply(spi.into())
         )
@@ -462,11 +502,11 @@ impl VarlinkInterface for Service {
             self,
             call,
             b,
-            b.xfrm.query_sa(&backend::sa_id(id)?),
-            |c: &mut dyn Call_QuerySa, (bytes, packets, last): (u64, u64, u64)| c.reply(
-                bytes.to_string(),
-                packets.to_string(),
-                last as i64
+            b.sas.query(&backend::sa_id(id)?),
+            |c: &mut dyn Call_QuerySa, usage: crate::sa::SaUsage| c.reply(
+                usage.bytes.to_string(),
+                usage.packets.to_string(),
+                usage.last_use as i64
             )
         )
     }

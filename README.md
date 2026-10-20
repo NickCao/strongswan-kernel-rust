@@ -9,12 +9,12 @@ netlink backend. Netlink transport uses `neli`; typed network and XFRM payloads
 use `netlink-packet-route` and `netlink-packet-xfrm`. The canonical API is
 [io.ranet.Kernel.varlink](io.ranet.Kernel.varlink).
 
-The daemon exclusively owns **all global XFRM policies in its network
-namespace**, including policies for other transform protocols. Every policy
-absent from desired state is removed. Run other policy managers in a separate
-network namespace. Orderly daemon shutdown also flushes the namespace's entire
-XFRM state table, including larval SPI reservations, so SA management is also
-exclusive to the daemon. Per-socket policies remain owned by their sockets.
+The daemon exclusively owns **all global XFRM policies and the XFRM state table
+in its network namespace**, including objects for other transform protocols.
+Unwanted installed states and global policies are removed. Run other IPsec
+managers in a separate network namespace. Session startup, `FlushSas`, and
+orderly daemon shutdown flush the entire state table, including larval SPI
+reservations. Per-socket policies remain owned by their sockets.
 
 The scope follows [ranet's VICI configuration](https://github.com/NickCao/ranet/blob/b0e52359f7c5816263f83cd5f12065945c5e4eaa/src/vici.rs):
 tunnel-mode ESP, nonzero XFRM interface IDs, forced UDP encapsulation, high
@@ -441,18 +441,17 @@ The daemon serves one charon session at a time. An independently authenticated
 second connection from the same PID/UID carries Varlink streaming events.
 A clean close requires all tunnel SAs/policies removed, cleans larval SPI
 reservations and all remaining global policies, and permits a new session.
-The `FlushSas` RPC remains restricted to session-owned objects. Flushing tunnel policies
-clears their desired references and reconciles the whole policy table,
+The `FlushSas` RPC clears desired SAs and flushes the whole state table. Flushing
+tunnel policies clears their desired references and reconciles the whole policy table,
 preserving desired IKE port bypasses until close. Opening a new session first
-reconciles global policies against an empty desired set, removing leftovers
-from previous daemon runs before accepting new policy requests.
+reconciles global policies against an empty desired set, flushes old SAs and SPI
+reservations, and removes owned interfaces before accepting new requests.
 
 On SIGTERM or SIGINT, the daemon stops accepting requests and disables session
 mutations and repairs. It clears desired policies, including IKE bypasses, and
 runs a final policy and interface reconciliation against empty desired sets.
 It also flushes the entire XFRM state table, including untracked SAs and larval
-SPI reservations. This is shutdown cleanup; periodic SA reconciliation remains
-unimplemented. Cleanup also runs if no session opened or the last one closed.
+SPI reservations. Cleanup also runs if no session opened or the last one closed.
 Policy ownership covers the entire global table; interface ownership is
 discovered from the configured link group. Interfaces outside that group remain
 untouched. Failed deletions remain discoverable for retries. Cleanup runs
@@ -462,8 +461,8 @@ Orderly strongSwan shutdown normally removes its SAs before closing the session.
 SIGKILL, aborts and daemon crashes bypass shutdown cleanup.
 
 While the session is connected, missing or changed desired policies are repaired
-from the current desired policy records, including IKE port bypasses. Policy
-and link notifications are coalesced over 100 ms, and an audit runs every five
+from the current desired policy records, including IKE port bypasses.
+SA, policy and link notifications are coalesced over 100 ms, and an audit runs every five
 seconds to catch missed notifications. An external `ip xfrm policy flush` is therefore
 recoverable without replacing SAs or interfaces. Unchanged policies are not
 rewritten; kernel-assigned indices, usage counters, timestamps, attribute order
@@ -473,9 +472,9 @@ deletion, so a pending repair cannot restore an obsolete rekey template or a
 policy that strongSwan has removed. Unsolicited global policies are deleted,
 including native policy configurations outside the supported model.
 
-Linux implementations live under `src/linux/`: policy and interface trait
-implementations are in `policy.rs` and `interfaces.rs`, alongside the XFRM SA,
-network discovery and Netlink support modules. Shared controllers, traits and
+Linux implementations live under `src/linux/`: SA, policy and interface trait
+implementations are in `xfrm.rs`, `policy.rs` and `interfaces.rs`, alongside
+network discovery and Netlink support. Shared controllers, traits and
 model types remain at the top level.
 
 The policy controller in `src/policy.rs` keeps desired policies and shared
@@ -546,8 +545,8 @@ logical identity or previous XFRM settings. Updating reads the current link only
 to decide whether in-place repair or replacement is needed. Moving a link out
 of the reserved group excludes it from subsequent listings. Repairs modify only
 managed attributes; user aliases, addresses, queue lengths, unrelated flags and
-other unmanaged settings are preserved during in-place updates. SA handling
-and network discovery remain Linux-specific.
+other unmanaged settings are preserved during in-place updates. Network
+discovery remains Linux-specific.
 
 Recreated links lose their unmanaged settings, including addresses and routes,
 which must be reapplied by the external network configuration; the daemon only
@@ -555,21 +554,51 @@ restores managed link settings. This also applies to replacement after renaming.
 The NixOS test exercises this with systemd-networkd managing tunnel addresses
 and routes while preserving the daemon-managed master attachment.
 
-External changes to kernel SAs are not automatically reconciled.
-An external `ip xfrm state flush` can leave SA ownership records
-out of sync with the kernel. Missing SAs produce query errors without
-triggering recovery, and interface cleanup still follows recorded SA
-ownership, so an interface is still desired while stale SA records refer to it.
-A successful rekey or teardown may clear some drift, but there is no guarantee
-of eventual reconciliation for these objects. Reestablish the affected
-CHILD_SAs through strongSwan to recover missing SAs.
+The SA controller in `src/sa.rs` treats established SAs as immutable. Its
+`SaKernel` trait provides inventory, direct lookup, first installation,
+deletion, SPI allocation and bulk flush, with no established-SA update method.
+`LinuxSas` keeps only its Netlink connection and kernel capabilities. Native
+handles use the destination/SPI/protocol/family/mark lookup key (and source for
+address-based transforms); Linux has no SA index. Interface IDs are observed
+configuration, not separate GETSA/DELSA lookup namespaces.
+
+After successful synchronous installation, the controller retains a canonical
+snapshot of managed configuration, including crypto keys, and the observed
+installation time. Snapshots normalize kernel algorithm aliases/defaults and
+attribute order. They exclude usage counters, error statistics, acquire
+sequence IDs, last-use times and live replay/sequence state. Keys are never
+returned over RPC or logged, and snapshots are not persisted. Querying usage
+reads one SA without dumping the table.
+
+A successful inventory retires missing or changed SAs and deletes drifted or
+unwanted installed states. It emits one hard-expiry notification per retired
+SA; strongSwan's IKEv2 expiry path negotiates a fresh CHILD_SA, normally retaining
+the IKE_SA. The daemon never repairs or recreates an established SA, and never
+restores old keys with reset packet state. Failed/interrupted inventories do
+not imply loss. Audits and installation/deletion share one lock. Retirement
+notifications are batched so a large state flush does not overflow the event
+queue; failed native cleanup is retried independently of notification delivery.
+
+The final retired SA releases its interface immediately, withdrawing its routes
+so BIRD can select another tunnel. Remaining SAs, including overlapping rekeys,
+keep shared interfaces alive. Network configuration restores addresses/routes
+when fresh SAs create an interface again. An external `ip xfrm state flush`
+therefore triggers fresh negotiation, rather than silent SA reinstallation.
+
+Larval SPI reservations remain distinct from established SAs. `update` is
+accepted only to complete a recorded reservation; update-to-add is allowed if
+that reservation expired before first installation. A repeated installation of
+an established SA is rejected. Kernel acquisition placeholders remain until
+their normal kernel timeout; startup, explicit flush and shutdown also clear
+these objects, including ones without an addressable SPI. Live packet state is
+not mirrored or restored by reconciliation.
 
 If charon or its event connection disappears unexpectedly, installed tunnel
 objects are preserved and replacement sessions are rejected. Hard expiry
 still releases the last SA's interface. Interface ownership survives daemon
-restarts through the reserved group: a new session can reuse recognizable links
-or remove leftovers through reconciliation. Global policy leftovers are removed
-when a new session opens. This does not recover desired SAs or established IKE
+restarts through the reserved group. A new session retires old SAs, SPI
+reservations, global policies and owned interfaces before installing fresh
+resources. This does not recover desired SAs or established IKE
 sessions. Automatic full restart recovery is not implemented. Endpoint or
 encapsulation migration requires reestablishing the SAs. This
 is an experimental backend with a coordinated restart requirement: stop
@@ -581,14 +610,13 @@ Full crash recovery is deferred. Proposed follow-up work is:
 - If charon crashes while the daemon survives, retire the failed session,
   stop its repairs, and remove the namespace's SAs, policies and larval SPI
   reservations along with daemon-owned interfaces. Accept a replacement session
-  only after cleanup succeeds. Once an SA reconciliation controller exists,
-  use it for shutdown cleanup in place of the direct state-table flush.
+  only after cleanup succeeds. The SA controller already provides the bulk
+  cleanup used at orderly shutdown and session startup.
 - If the daemon crashes, systemd already stops charon, but the kernel objects
   can outlive both processes. Interfaces are discoverable by group, and all
-  global policies are owned and retired at session startup. SA and
-  SPI-reservation leftovers still need cleanup at startup before accepting a
-  replacement session; currently the full state-table flush runs only on
-  orderly daemon shutdown.
+  global policies and SAs are owned and retired at session startup. This cleanup
+  is implemented; automatic coordination outside the supplied systemd module
+  and recovery of a disconnected client remain future work.
 - Reload connection configuration and negotiate fresh IKE/CHILD_SAs after
   cleanup. Preserving established SAs across crashes is outside this proposal.
 
@@ -629,10 +657,16 @@ selection and egress-interface exclusions, ICMP policy priorities, policy
 deletion/modification/flush repair, unsolicited global policy cleanup, policy
 cleanup after daemon SIGKILL, interface recreation and settings repair,
 index reuse and ownership conflicts, numeric group ownership across native link
-types, crash inventory reuse and cleanup, native if_id drift independent of
+types, crash inventory cleanup, native if_id drift independent of
 logical identity, preservation of unmanaged settings, rekey references and teardown, validation,
-interface rollback, foreign objects, overlapping SAs, scoped flushes (including missing policies),
-larval allocation, hard expiry, and expiry after losing the client. The tunnel tests use
+interface rollback, foreign objects, overlapping SAs, policy flushes (including missing policies),
+SA loss and configuration drift retirement, route withdrawal, 300-SA flush
+notifications, unwanted state cleanup, larval maturation including an expired
+reservation, hard expiry, and expiry after losing the client. The NixOS tunnel
+tests additionally exercise inbound/outbound state deletion, full state flush,
+native configuration drift and loss during rekey with AES-GCM and AES-CBC/HMAC;
+new SPIs and working traffic must return without replacing the IKE session or
+charon process. The tunnel tests use
 capability-free charons, Ed25519 raw public keys, ranet's wildcard IPv4/IPv6
 selectors, high ports, output marks, traffic counters, actual rekeying with
 stable interface indices, and final-SA interface deletion. The ABI test uses

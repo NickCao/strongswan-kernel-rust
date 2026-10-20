@@ -12,6 +12,7 @@ pub mod interfaces;
 pub mod linux;
 pub mod model;
 pub mod policy;
+pub mod sa;
 pub mod transport;
 pub use kernel_rust_protocol as rpc_api;
 
