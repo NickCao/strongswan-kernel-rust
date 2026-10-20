@@ -113,6 +113,14 @@ impl Backend {
         let cleanup = self.cleanup_interfaces();
         result.and(cleanup)
     }
+    pub fn shutdown(&mut self) -> io::Result<()> {
+        self.policies.clear();
+        let policies = self.policies.reconcile();
+        let interfaces = self.interfaces.reconcile(&HashSet::new());
+        // SA and SPI-reservation cleanup will join this path when their
+        // ownership and reconciliation are managed by a controller too.
+        policies.and(interfaces)
+    }
     pub fn close(&mut self) -> io::Result<()> {
         // Remove bypasses only after all tunnel objects are gone.
         if !self.xfrm.sas.is_empty() || self.policies.has_tunnel_policies() {

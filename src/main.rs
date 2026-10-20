@@ -7,9 +7,14 @@ use charon_kernel_daemon::{
     transport,
 };
 use clap::Parser;
+use nix::sys::{
+    signal::Signal,
+    signalfd::{SfdFlags, SignalFd},
+};
+use rustix::event::{poll, PollFd, PollFlags};
 use std::{
     io,
-    os::unix::net::UnixStream,
+    os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -110,21 +115,57 @@ fn run() -> io::Result<()> {
     } = Args::parse();
     rustix::process::umask(rustix::fs::Mode::from_bits_retain(0o077));
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)?;
+    // Block before creating any workers so they inherit the mask. signalfd
+    // delivers termination requests to the main loop in normal Rust context.
+    let mask = Signal::SIGINT | Signal::SIGTERM;
+    mask.thread_block()?;
+    let signals = SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)?;
     let listener = transport::listen(&path, gid)?;
+    listener.set_nonblocking(true)?;
     eprintln!(
         "kernel-daemon: Varlink listening on {} with socket group {gid}",
         path.display()
     );
-    let server = Arc::new(Server {
-        active: Mutex::new(None),
-        prefix,
-        master_device,
-        mtu,
-    });
+    let server = Arc::new(Server::new(prefix, master_device, mtu));
+    let result = serve(&listener, &signals, &server);
+    let cleanup = server.shutdown();
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
+    if let Err(error) = &cleanup {
+        eprintln!("kernel-daemon: shutdown cleanup: {error}");
+    }
+    result.and(cleanup)
+}
+fn serve(listener: &UnixListener, signals: &SignalFd, server: &Arc<Server>) -> io::Result<()> {
     sd_notify::notify(&[sd_notify::NotifyState::Ready])?;
     let pending = Arc::new(AtomicUsize::new(0));
-    for socket in listener.incoming() {
-        let socket = socket?;
+    loop {
+        let mut ready = [
+            PollFd::new(listener, PollFlags::IN),
+            PollFd::new(signals, PollFlags::IN),
+        ];
+        match poll(&mut ready, None) {
+            Err(rustix::io::Errno::INTR) => continue,
+            result => result?,
+        };
+        if ready[1].revents().contains(PollFlags::IN) && signals.read_signal()?.is_some() {
+            eprintln!("kernel-daemon: shutting down");
+            return Ok(());
+        }
+        if !ready[0].revents().contains(PollFlags::IN) {
+            continue;
+        }
+        let socket = match listener.accept() {
+            Ok((socket, _)) => socket,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
         let peer = transport::peer(&socket)?;
         // The filesystem socket's 0660 mode authorizes the connecting process,
         // including its supplementary groups. SO_PEERCRED only reports its
@@ -144,7 +185,6 @@ fn run() -> io::Result<()> {
             pending.fetch_sub(1, Ordering::AcqRel);
         });
     }
-    Ok(())
 }
 fn main() {
     if let Err(e) = run() {

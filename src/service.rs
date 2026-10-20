@@ -26,10 +26,37 @@ const ROUTE_CHANGED: u8 = 1;
 const ADDRESS_CHANGED: u8 = 2;
 
 pub struct Server {
-    pub active: Mutex<Option<Arc<Session>>>,
+    active: Mutex<Option<Arc<Session>>>,
+    stopping: AtomicBool,
     pub prefix: String,
     pub master_device: Option<String>,
     pub mtu: u32,
+}
+impl Server {
+    pub fn new(prefix: String, master_device: Option<String>, mtu: u32) -> Self {
+        Self {
+            active: Mutex::new(None),
+            stopping: AtomicBool::new(false),
+            prefix,
+            master_device,
+            mtu,
+        }
+    }
+    pub fn shutdown(&self) -> io::Result<()> {
+        let session = {
+            let active = self.active.lock().unwrap();
+            self.stopping.store(true, Ordering::Release);
+            active.clone()
+        };
+        if let Some(session) = session {
+            session.stop_workers();
+            let _ = session.control.shutdown(std::net::Shutdown::Both);
+            // Any in-flight mutation finishes before the final reconciliation.
+            // Requests and event workers recheck closed after taking this lock.
+            session.backend.lock().unwrap().shutdown()?;
+        }
+        Ok(())
+    }
 }
 pub struct Session {
     uid: u32,
@@ -51,6 +78,15 @@ impl Session {
         self.connected.store(false, Ordering::Release);
         let _ = self.repair_wakeup.try_send(());
         let _ = self.control.shutdown(std::net::Shutdown::Both);
+    }
+    fn stop_workers(&self) {
+        self.connected.store(false, Ordering::Release);
+        self.closed.store(true, Ordering::Release);
+        let _ = self.repair_wakeup.try_send(());
+        // Dropping the routers wakes the notification workers. WatchEvents
+        // and the repair worker are woken separately below and above.
+        self.event_sockets.lock().unwrap().take();
+        let _ = self.events.try_send(None);
     }
 }
 pub struct Service {
@@ -116,6 +152,9 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
         }
         let result = {
             let mut backend = session.backend.lock().unwrap();
+            if session.closed.load(Ordering::Acquire) {
+                return;
+            }
             let Backend { xfrm, policies, .. } = &mut *backend;
             let result = xfrm.event(&r, policies);
             if let Err(e) = backend.cleanup_interfaces() {
@@ -173,6 +212,9 @@ macro_rules! request {
             Some(s) if s.connected.load(Ordering::Acquire) && !s.closed.load(Ordering::Acquire) => {
                 let result = {
                     let mut guard = s.backend.lock().unwrap();
+                    if !s.connected.load(Ordering::Acquire) || s.closed.load(Ordering::Acquire) {
+                        return $call.reply_invalid_session();
+                    }
                     let $b = &mut *guard;
                     if s.network_changed.swap(false, Ordering::Acquire) {
                         $b.net.invalidate();
@@ -205,6 +247,9 @@ impl VarlinkInterface for Service {
             return call.reply_invalid_parameter("OpenSession".into());
         }
         let mut active = self.server.active.lock().unwrap();
+        if self.server.stopping.load(Ordering::Acquire) {
+            return call.reply_invalid_session();
+        }
         if active.is_some() || self.control.lock().unwrap().is_some() {
             return call.reply_session_busy();
         }
@@ -266,15 +311,7 @@ impl VarlinkInterface for Service {
             {
                 b.close()?;
                 let s = self.control.lock().unwrap().as_ref().unwrap().clone();
-                s.connected.store(false, Ordering::Release);
-                s.closed.store(true, Ordering::Release);
-                let _ = s.repair_wakeup.try_send(());
-                // Dropping the neli routers stops their receive threads and
-                // closes the notification streams, waking our event workers.
-                s.event_sockets.lock().unwrap().take();
-                // Wake WatchEvents immediately so clean, rapid restarts do not
-                // exhaust the bounded connection slots waiting for its timeout.
-                let _ = s.events.try_send(None);
+                s.stop_workers();
                 *self.server.active.lock().unwrap() = None;
                 Ok(())
             },

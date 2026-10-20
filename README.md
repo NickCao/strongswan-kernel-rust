@@ -431,6 +431,17 @@ reservations and IKE bypass policies, and permits a new session. Flushes are
 restricted to session-owned objects; flushing tunnel policies preserves IKE
 port bypasses until close.
 
+On SIGTERM or SIGINT, the daemon stops accepting requests and disables session
+mutations and repairs. It clears desired policies, including IKE bypasses, and
+runs a final policy and interface reconciliation against empty desired sets.
+Ownership handles are retained until deletion succeeds, so unrelated objects
+remain untouched and failed deletions can be retried. Cleanup runs explicitly
+before exit; errors are reported and cause a nonzero exit status. Signals are
+received through `nix::sys::signalfd` in the main loop, outside signal handlers.
+SAs and larval SPI reservations are left unchanged until SA reconciliation is
+implemented. Orderly strongSwan shutdown still removes its SAs before closing
+the session. SIGKILL, aborts and daemon crashes bypass the final reconciliation.
+
 While the session is connected, missing or changed owned policies are repaired
 from the current desired policy records, including IKE port bypasses. Policy
 and link notifications are coalesced over 100 ms, and an audit runs every five
@@ -447,8 +458,9 @@ implementations are in `policy.rs` and `interfaces.rs`, alongside the XFRM SA,
 network discovery and Netlink support modules. Shared controllers, traits and
 model types remain at the top level.
 
-The policy controller in `src/policy.rs` owns desired policies and shared
-references. It canonicalizes identities, selects the winning strongSwan
+The policy controller in `src/policy.rs` keeps desired policies and shared
+references separate from ownership handles. It canonicalizes identities,
+selects the winning strongSwan
 `PolicyData` reference and resolves its effective priority and protection
 template into a `PolicySpec`. Its `PolicyKernel` trait provides
 list/get/create/update/delete operations with opaque handles and normalized
@@ -509,8 +521,8 @@ Crash recovery is deferred. Proposed follow-up work is:
 - If charon crashes while the daemon survives, retire the failed session,
   stop its repairs, and remove its owned SAs, policies, larval SPI
   reservations, IKE bypasses and interfaces. Accept a replacement session
-  only after cleanup succeeds. Graceful daemon shutdown must wait for this
-  cleanup, including when systemd stops the daemon after charon exits.
+  only after cleanup succeeds. Extend the final shutdown reconciliation to
+  SAs and SPI reservations once they have a reconciliation controller.
 - If the daemon crashes, systemd already stops charon, but the kernel objects
   can outlive both processes. Recovery needs ownership information that
   survives a daemon restart, such as a journal of object identities and

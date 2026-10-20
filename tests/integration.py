@@ -9,6 +9,7 @@ import os
 import re
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -462,6 +463,65 @@ def run(binary):
             finally:
                 if child and child.poll() is None: child.kill(); child.wait()
                 daemon.terminate(); daemon.wait(timeout=5)
+
+    foreign_policy = ["src", "203.0.113.0/24", "dst", "203.0.114.0/24",
+                      "dir", "out", "if_id", "77"]
+    ip("xfrm", "policy", "add", *foreign_policy, "priority", "1234", "action", "block")
+    expected_policies = ip("xfrm", "policy")
+    for attempt, (signum, disconnect) in enumerate([
+        (signal.SIGTERM, False), (signal.SIGINT, False), (signal.SIGTERM, True),
+    ]):
+        with tempfile.TemporaryDirectory(prefix="kernel-rust-shutdown-") as d:
+            path = str(Path(d) / "kernel.sock")
+            with open(Path(d) / "daemon.log", "w+") as log:
+                daemon = subprocess.Popen([binary, "--socket", path], stdout=log, stderr=log)
+                control = None
+                try:
+                    wait(lambda: Path(path).exists() or daemon.poll() is not None)
+                    assert daemon.poll() is None
+                    control = Varlink(path)
+                    def call(method, **parameters):
+                        reply = control.call(method, parameters)
+                        assert "error" not in reply, reply
+                        return reply.get("parameters", {})
+                    call("OpenSession", interfacesUse="", interfacesIgnore="")
+                    owned = sa_id(spi=0x40000 + attempt, interface=61 + attempt)
+                    call("InstallSa", id=owned, config=sa_config())
+                    allocated = call("AllocateSpi", src=owned["src"], dst=owned["dst"],
+                                     minimum=0xd0000000, maximum=0xdfffffff)["spi"]
+                    call("BypassPort", family=socket.AF_INET, port=13000)
+                    call("BypassPort", family=socket.AF_INET6, port=13000)
+                    for direction in [0, 1, 2]:
+                        call("InstallPolicy", id=policy(interface=owned["interfaceId"], direction=direction),
+                             config=policy_config(spi=owned["spi"]))
+                    # A queued request and idle connections must not obstruct
+                    # shutdown or install objects after the final reconciliation.
+                    idle = Varlink(path)
+                    control.send("io.ranet.Kernel.InstallPolicy", dict(
+                        id=policy(interface=owned["interfaceId"], v6=True),
+                        config=policy_config(spi=owned["spi"])))
+                    assert len(links()) == 2
+                    before_sas = states()
+                    if disconnect:
+                        control.socket.close()
+                    daemon.send_signal(signum)
+                    assert daemon.wait(timeout=10) == 0
+                    idle.socket.close()
+                    assert ip("xfrm", "policy") == expected_policies
+                    assert [link["ifname"] for link in links()] == ["foreign"]
+                    assert states() == before_sas, "shutdown must leave SAs and SPI reservations unchanged"
+                    for spi in [owned["spi"], allocated]:
+                        ip("xfrm", "state", "delete", "src", owned["src"]["address"],
+                           "dst", owned["dst"]["address"], "proto", "esp", "spi", spi)
+                except BaseException:
+                    log.seek(0); print(log.read(), file=sys.stderr); raise
+                finally:
+                    if control:
+                        control.socket.close()
+                    if daemon.poll() is None:
+                        daemon.kill(); daemon.wait()
+    ip("xfrm", "policy", "delete", *foreign_policy)
+    print("PASS: SIGTERM/SIGINT reconcile policies and interfaces to empty with active or disconnected clients, preserve foreign objects, and leave SAs and SPI reservations unchanged")
 
 if __name__ == "__main__":
     if sys.argv[1] == "--client": client(sys.argv[2])

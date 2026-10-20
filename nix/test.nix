@@ -498,6 +498,24 @@ in
         assert property(left, "strongswan-swanctl.service", "MainPID") != previous
         assert "kernel-rust" in ctl(left, "--stats")
 
+    with subtest("daemon SIGTERM cleans reconciled resources with an active strongSwan tunnel"):
+        for machine, config_file in zip(machines, [proposals[0][1], proposals[0][2]]):
+            ctl(machine, "--load-all --noprompt --file " + config_file)
+        assert "established" in ctl(left, "--initiate --child net")
+        retained = spis(left)
+        assert retained and links(left)
+        left.succeed("systemctl kill --signal=TERM --kill-whom=main charon-kernel.service")
+        assert_stopped(left, "charon-kernel.service")
+        assert property(left, "charon-kernel.service", "ExecMainStatus") == "0"
+        assert_stopped(left, "strongswan-swanctl.service")
+        assert not links(left)
+        assert not left.succeed("ip xfrm policy list nosock").strip()
+        assert spis(left) == retained, "SA shutdown cleanup is deferred until SA reconciliation"
+        # Remove intentionally retained SAs in this isolated VM before restart.
+        left.succeed("ip xfrm state flush")
+        left.succeed("systemctl start strongswan-swanctl.service")
+        assert "kernel-rust" in ctl(left, "--stats")
+
     with subtest("strongSwan exiting without a stop job stops the unused backend"):
         right.succeed("systemctl kill --signal=TERM --kill-whom=main strongswan-swanctl.service")
         assert_stopped(right, "strongswan-swanctl.service")

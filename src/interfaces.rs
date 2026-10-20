@@ -185,6 +185,13 @@ mod tests {
             Ok(())
         }
         fn delete(&mut self, handle: &u64) -> io::Result<()> {
+            if self
+                .objects
+                .iter()
+                .any(|entry| entry.handle == *handle && self.reject.contains(&entry.config.id))
+            {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
             self.objects.retain(|entry| entry.handle != *handle);
             Ok(())
         }
@@ -295,5 +302,28 @@ mod tests {
             .objects
             .iter()
             .any(|entry| entry.config == interfaces.spec(41)));
+    }
+
+    #[test]
+    fn empty_desired_set_retries_deletions_and_preserves_foreign_interfaces() {
+        let mut interfaces = controller();
+        interfaces.ensure(41).unwrap();
+        interfaces.ensure(42).unwrap();
+        interfaces.kernel.objects.push(ObservedInterface {
+            handle: 999,
+            config: interfaces.spec(99),
+        });
+        interfaces.kernel.reject.insert(41);
+        assert!(interfaces.reconcile(&HashSet::new()).is_err());
+        assert_eq!(interfaces.owned.len(), 1);
+        assert_eq!(interfaces.kernel.objects.len(), 2);
+        let writes = interfaces.kernel.writes;
+        interfaces.kernel.reject.clear();
+        interfaces.reconcile(&HashSet::new()).unwrap();
+        interfaces.reconcile(&HashSet::new()).unwrap();
+        assert!(interfaces.owned.is_empty());
+        assert_eq!(interfaces.kernel.objects.len(), 1);
+        assert_eq!(interfaces.kernel.objects[0].handle, 999);
+        assert_eq!(interfaces.kernel.writes, writes);
     }
 }
