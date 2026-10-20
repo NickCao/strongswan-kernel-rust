@@ -21,16 +21,11 @@ impl Backend {
         prefix: String,
         master_device: Option<String>,
         mtu: u32,
+        interface_group: u32,
         interfaces_use: String,
         interfaces_ignore: String,
     ) -> io::Result<Self> {
-        if prefix.is_empty()
-            || prefix.len() + 8 >= libc::IFNAMSIZ
-            || !prefix
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            || !(1280..=65535).contains(&mtu)
-        {
+        if !(1280..=65535).contains(&mtu) {
             return Err(invalid());
         }
         let mut net = Network::new()?;
@@ -43,7 +38,11 @@ impl Backend {
             xfrm: Xfrm::new()?,
             net,
             policies: Policies::new(LinuxPolicies::new()?),
-            interfaces: Interfaces::new(LinuxInterfaces::new()?, prefix, master_device, mtu),
+            interfaces: Interfaces::new(
+                LinuxInterfaces::new(prefix, interface_group)?,
+                master_device,
+                mtu,
+            ),
         })
     }
     fn desired_interfaces(&self) -> HashSet<u32> {

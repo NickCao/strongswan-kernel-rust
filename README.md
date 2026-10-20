@@ -33,8 +33,13 @@ up **before its first SA is installed**. Its default MTU is 1400. Every SA
 using that ID shares the interface, including inbound/outbound SAs and old/new
 SAs during rekeying. Removing or hard-expiring the final SA deletes the
 interface. A failed first installation rolls it back. Policies alone do not
-retain an interface. Preexisting or foreign interfaces are not adopted or deleted.
-`--ifname-prefix` and `--mtu` change the naming prefix and MTU. Interfaces
+retain an interface. Linux link group **17227** is reserved for daemon-owned
+interfaces; `--interface-group` selects a different nonzero numeric group.
+Every interface in that group is owned, regardless of its native type or name.
+Interfaces outside it are not adopted or deleted. Group membership persists
+across daemon restarts and needs no entry in iproute2's group names file.
+Independent daemon instances in one network namespace must reserve distinct
+groups. `--ifname-prefix` and `--mtu` change the naming prefix and MTU. Interfaces
 have multicast enabled. `--master-device NAME` attaches them to an existing
 master, such as a VRF, before installing the first SA. Without this option,
 the standalone daemon leaves them unattached. The master remains owned by
@@ -72,6 +77,7 @@ services.charon-kernel = {
   enable = true;
   mtu = 1400;
   interfaceNamePrefix = "ranet";
+  interfaceGroup = 17227;
   masterDevice = "gravity";
 };
 ```
@@ -165,7 +171,7 @@ It checks plugin discovery from the system profile, socket authorization,
 the kernel RPC contract regressions in an isolated network namespace,
 AES-GCM and AES-CBC/HMAC, TFC padding, encrypted IPv4/IPv6 traffic,
 SA use times that age while idle and reset after traffic, rekeying without
-interface replacement, final-SA cleanup, configurable interface names/MTUs,
+interface replacement, final-SA cleanup, configurable interface names/MTUs/groups,
 default and custom VRF masters, multicast flags, VRF-routed IPv4/IPv6 traffic,
 VICI responsiveness with 200 connections and continuous BGP-style route updates,
 VICI access from a separate dynamic controller, coordinated stop/restart,
@@ -434,7 +440,8 @@ port bypasses until close.
 On SIGTERM or SIGINT, the daemon stops accepting requests and disables session
 mutations and repairs. It clears desired policies, including IKE bypasses, and
 runs a final policy and interface reconciliation against empty desired sets.
-Ownership handles are retained until deletion succeeds, so unrelated objects
+Policy ownership handles are retained until deletion succeeds; interface
+ownership is discovered from the configured link group. Unrelated objects
 remain untouched and failed deletions can be retried. Cleanup runs explicitly
 before exit; errors are reported and cause a nonzero exit status. Signals are
 received through `nix::sys::signalfd` in the main loop, outside signal handlers.
@@ -475,23 +482,46 @@ backend can reuse the controller without implementing reconciliation or
 strongSwan reference selection.
 
 The interface controller in `src/interfaces.rs` derives desired interfaces from
-the current SA ownership records, grouped by interface ID. It recreates missing
-interfaces and restores their configured name, MTU, master, UP and multicast
-settings. Unchanged links are left alone. Repairs share the policy worker and
+the current SA ownership records, grouped by interface ID. `InterfaceSpec`
+contains an opaque logical `InterfaceId` and an `InterfaceConfig` with the
+SA binding (`if_id`), MTU, master, UP and multicast settings. The caller currently
+assigns the same numeric value to the logical identity and SA binding, but they
+are separate concepts: backends configure XFRM from `config.if_id`, never by
+interpreting the logical ID. Missing interfaces are created and changed settings
+are repaired. Unchanged links do not call `update()`. Repairs share the policy worker and
 backend lock, so deleting the final SA or rolling back a failed installation
 cannot race with recreation. Policies alone do not keep interfaces alive.
 Repairs stop when the session disconnects; hard expiry still removes unused
 interfaces.
 
 Its separate `InterfaceKernel` trait provides only list/create/update/delete
-operations. Listing returns normalized `ObservedInterface` values, containing
-current configuration and an opaque handle. The controller tracks ownership,
-compares settings and decides repairs. `LinuxInterfaces` implements CRUD using
-typed route Netlink messages. Its handles contain the interface index, XFRM
-interface ID and underlying link index, and are checked before updates or
-deletion. Conflicting interfaces are left untouched. These are identity checks,
-not kernel lifetime references: a replacement reusing all handle fields cannot
-be distinguished. SA handling and network discovery remain Linux-specific.
+operations. Listing returns every backend-owned object as an `ObservedInterface`
+with optional configuration and an opaque handle. The handle's `id()` returns
+its logical identity, when known; `needs_reconcile()` reports drift in
+backend-managed settings such as naming. Both methods inspect the captured
+snapshot without I/O. The controller updates matching desired IDs, creates
+missing ones, and deletes unidentified, undesired or duplicate owned objects.
+An unrepresentable configuration with a known desired ID is passed to
+`update()`; the backend chooses in-place repair or replacement.
+
+`LinuxInterfaces` implements CRUD using typed route Netlink messages and owns
+group membership and naming. Names encode the opaque logical ID; a backend-local
+association cache preserves that identity through renames while the daemon is
+running. A fresh backend can discover recognizable names in its group after a
+crash, independently of native `if_id` drift. If a name was changed before a
+crash, or the configured prefix changes, the identity may be unrecognizable:
+the owned object is then deleted and recreated when needed. Wrong native types
+with recognizable identities are replaced inside `update()`. The shared
+controller keeps no separate interface ownership map.
+
+Linux handles capture the interface index and native XFRM identity, alongside
+the logical ID and backend-managed name observation. Updates and deletion check
+the current object and group membership. These are checks, not kernel lifetime
+references: a replacement reusing all checked fields cannot be distinguished.
+Moving a link out of the reserved group releases ownership. Repairs modify only
+managed attributes; user aliases, addresses, queue lengths, unrelated flags and
+other unmanaged settings are preserved during in-place updates. SA handling
+and network discovery remain Linux-specific.
 
 Recreated links need their addresses and routes reapplied by the external
 network configuration; the daemon only restores link settings. The
@@ -509,14 +539,17 @@ CHILD_SAs through strongSwan to recover missing SAs.
 
 If charon or its event connection disappears unexpectedly, installed tunnel
 objects are preserved and replacement sessions are rejected. Hard expiry
-still releases the last SA's interface. Automatic restart reconciliation
-and ownership persistence across daemon restarts are not implemented. Endpoint
+still releases the last SA's interface. Interface ownership survives daemon
+restarts through the reserved group: a new session can reuse recognizable links
+or remove leftovers through reconciliation. This does not recover desired SAs
+or established IKE sessions. Policy and SA ownership persistence and automatic
+full restart recovery are not implemented. Endpoint
 or encapsulation migration requires reestablishing the SAs. This
 is an experimental backend with a coordinated restart requirement: stop
 protected traffic before removing leftover objects and restarting the pair.
 Routes through deleted interfaces disappear with the links.
 
-Crash recovery is deferred. Proposed follow-up work is:
+Full crash recovery is deferred. Proposed follow-up work is:
 
 - If charon crashes while the daemon survives, retire the failed session,
   stop its repairs, and remove its owned SAs, policies, larval SPI
@@ -524,7 +557,8 @@ Crash recovery is deferred. Proposed follow-up work is:
   only after cleanup succeeds. Extend the final shutdown reconciliation to
   SAs and SPI reservations once they have a reconciliation controller.
 - If the daemon crashes, systemd already stops charon, but the kernel objects
-  can outlive both processes. Recovery needs ownership information that
+  can outlive both processes. Interface ownership is already marked by group;
+  SA, policy and SPI-reservation recovery still needs ownership information that
   survives a daemon restart, such as a journal of object identities and
   pending mutations, without encryption keys. Its storage must survive
   service cleanup and DynamicUser changes. Startup would resolve interrupted
@@ -565,7 +599,9 @@ standard introspection (also with varlinkctl when installed), a
 capability-free client, address scope/type filtering, multihomed source
 selection and egress-interface exclusions, ICMP policy priorities, policy
 deletion/modification/flush repair, interface recreation and settings repair,
-index reuse and ownership conflicts, rekey references and teardown, validation,
+index reuse and ownership conflicts, numeric group ownership across native link
+types, crash inventory reuse and cleanup, native if_id drift independent of
+logical identity, preservation of unmanaged settings, rekey references and teardown, validation,
 interface rollback, foreign objects, overlapping SAs, scoped flushes (including missing policies),
 larval allocation, hard expiry, and expiry after losing the client. The tunnel tests use
 capability-free charons, Ed25519 raw public keys, ranet's wildcard IPv4/IPv6

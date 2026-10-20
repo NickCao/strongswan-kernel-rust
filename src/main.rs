@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 use charon_kernel_daemon::{
     error::invalid,
+    linux::interfaces::{name_prefix, DEFAULT_INTERFACE_GROUP},
     rpc_api,
     service::{Server, Service},
     transport,
@@ -35,8 +36,11 @@ struct Args {
     #[arg(long, default_value = "0", value_name = "NAME|GID", value_parser = group_id)]
     group: u32,
     /// Prefix for daemon-owned XFRM interface names.
-    #[arg(long, default_value = "ranet", value_parser = interface_prefix)]
+    #[arg(long, default_value = "ranet", value_parser = name_prefix)]
     ifname_prefix: String,
+    /// Numeric link group reserved for daemon-owned interfaces.
+    #[arg(long, default_value_t = DEFAULT_INTERFACE_GROUP, value_parser = clap::value_parser!(u32).range(1..))]
+    interface_group: u32,
     /// Master device for daemon-owned XFRM interfaces.
     #[arg(long, value_name = "NAME", value_parser = interface_name)]
     master_device: Option<String>,
@@ -52,17 +56,6 @@ fn group_id(value: &str) -> Result<u32, String> {
         .map_err(|error| error.to_string())?
         .map(|group| group.gid.as_raw())
         .ok_or_else(|| format!("unknown group {value:?}"))
-}
-fn interface_prefix(value: &str) -> Result<String, String> {
-    if value.is_empty()
-        || value.len() + 8 >= libc::IFNAMSIZ
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        return Err("expected 1–7 ASCII letters, digits, underscores, or hyphens".into());
-    }
-    Ok(value.to_owned())
 }
 fn interface_name(value: &str) -> Result<String, String> {
     if value.is_empty() || value.len() >= libc::IFNAMSIZ || value.contains('\0') {
@@ -110,6 +103,7 @@ fn run() -> io::Result<()> {
         socket: path,
         group: gid,
         ifname_prefix: prefix,
+        interface_group,
         master_device,
         mtu,
     } = Args::parse();
@@ -126,7 +120,7 @@ fn run() -> io::Result<()> {
         "kernel-daemon: Varlink listening on {} with socket group {gid}",
         path.display()
     );
-    let server = Arc::new(Server::new(prefix, master_device, mtu));
+    let server = Arc::new(Server::new(prefix, master_device, mtu, interface_group));
     let result = serve(&listener, &signals, &server);
     let cleanup = server.shutdown();
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);

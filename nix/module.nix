@@ -61,6 +61,15 @@ in
       default = "ranet";
       description = "Interface name prefix, followed by the XFRM interface ID as eight hexadecimal digits.";
     };
+    interfaceGroup = lib.mkOption {
+      type = lib.types.ints.between 1 4294967295;
+      default = 17227;
+      description = ''
+        Numeric Linux link group reserved for this daemon. Every interface in
+        this group is owned by the backend, regardless of its interface type.
+        Independent instances in the same network namespace need distinct groups.
+      '';
+    };
     masterDevice = lib.mkOption {
       type = lib.types.str;
       default = "gravity";
@@ -117,6 +126,8 @@ in
           (toString cfg.mtu)
           "--ifname-prefix"
           cfg.interfaceNamePrefix
+          "--interface-group"
+          (toString cfg.interfaceGroup)
           "--master-device"
           cfg.masterDevice
         ];

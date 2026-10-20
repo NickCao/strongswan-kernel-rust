@@ -31,15 +31,22 @@ pub struct Server {
     pub prefix: String,
     pub master_device: Option<String>,
     pub mtu: u32,
+    pub interface_group: u32,
 }
 impl Server {
-    pub fn new(prefix: String, master_device: Option<String>, mtu: u32) -> Self {
+    pub fn new(
+        prefix: String,
+        master_device: Option<String>,
+        mtu: u32,
+        interface_group: u32,
+    ) -> Self {
         Self {
             active: Mutex::new(None),
             stopping: AtomicBool::new(false),
             prefix,
             master_device,
             mtu,
+            interface_group,
         }
     }
     pub fn shutdown(&self) -> io::Result<()> {
@@ -265,6 +272,7 @@ impl VarlinkInterface for Service {
                 self.server.prefix.clone(),
                 self.server.master_device.clone(),
                 self.server.mtu,
+                self.server.interface_group,
                 interfaces_use,
                 interfaces_ignore,
             )?;

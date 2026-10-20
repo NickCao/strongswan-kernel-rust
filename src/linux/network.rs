@@ -25,6 +25,7 @@ pub struct Link {
     pub flags: LinkFlags,
     pub mtu: u32,
     pub master: u32,
+    pub group: u32,
     pub xfrm: Option<(u32, u32)>,
 }
 impl Link {
@@ -35,6 +36,7 @@ impl Link {
             name: String::new(),
             mtu: 0,
             master: 0,
+            group: 0,
             xfrm: None,
         };
         for attr in info.attributes {
@@ -42,6 +44,7 @@ impl Link {
                 LinkAttribute::IfName(name) => link.name = name,
                 LinkAttribute::Mtu(mtu) => link.mtu = mtu,
                 LinkAttribute::Controller(master) => link.master = master,
+                LinkAttribute::Group(group) => link.group = group,
                 LinkAttribute::LinkInfo(infos) => {
                     for info in infos {
                         match info {

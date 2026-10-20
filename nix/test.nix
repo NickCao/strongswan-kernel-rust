@@ -62,6 +62,7 @@ let
       // lib.optionalAttrs (peer == 2) {
         mtu = 1380;
         interfaceNamePrefix = "gn";
+        interfaceGroup = 17228;
         masterDevice = master;
       };
       virtualisation = {
@@ -197,6 +198,7 @@ in
 
     machines = [left, right]
     interface_settings = [("ranet", 1400, "gravity"), ("gn", 1380, "overlay")]
+    interface_groups = [17227, 17228]
     capability_fields = ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"]
 
     def ctl(machine, arguments):
@@ -248,6 +250,7 @@ in
             current = links(machine)
             if (len(current) == 1 and current[0]["ifname"] == interface
                     and current[0]["mtu"] == mtu and current[0].get("master") == master
+                    and int(current[0].get("group", 0)) == interface_groups[peer - 1]
                     and {"UP", "MULTICAST"} <= set(current[0]["flags"])):
                 return current[0]
             time.sleep(0.1)
@@ -369,6 +372,7 @@ in
                 assert len(current) == 1 and current[0]["ifname"] == name_out, current
                 assert current[0]["mtu"] == mtu and {"UP", "MULTICAST"} <= set(current[0]["flags"]), current
                 assert current[0]["master"] == master, current
+                assert int(current[0].get("group", 0)) == interface_groups[peer - 1], current
                 original_indices.append(indices(machine))
                 wait_overlay_config(machine, peer, name_out)
             for peer, machine in enumerate(machines, 1):
@@ -401,11 +405,14 @@ in
             expected_policies = [policy_specs(machine) for machine in machines]
             for peer, machine in enumerate(machines, 1):
                 interface = next(iter(original_indices[peer - 1]))
+                machine.succeed(f"ip link set dev {interface} alias user-managed txqueuelen 123 promisc on")
                 machine.succeed(f"ip link set dev {interface} nomaster")
                 machine.succeed(f"ip link set dev {interface} down mtu 1280 multicast off")
             for peer, machine in enumerate(machines, 1):
                 interface = next(iter(original_indices[peer - 1]))
-                wait_interface(machine, peer, interface)
+                repaired = wait_interface(machine, peer, interface)
+                assert repaired["ifalias"] == "user-managed" and repaired["txqlen"] == 123, repaired
+                assert "PROMISC" in repaired["flags"], repaired
                 assert indices(machine) == original_indices[peer - 1]
                 assert spis(machine) == original_spis[peer - 1]
                 assert policy_specs(machine) == expected_policies[peer - 1]

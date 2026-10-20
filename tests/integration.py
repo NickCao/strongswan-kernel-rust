@@ -94,7 +94,7 @@ def run(binary):
     assert os.stat("/proc/self/ns/net").st_ino != os.stat("/proc/1/ns/net").st_ino, "use unshare --net"
     binary = str(Path(binary).resolve())
     def ip(*args): return subprocess.check_output(["ip", *map(str,args)], text=True)
-    def links(): return json.loads(ip("-j", "-d", "link", "show", "type", "xfrm"))
+    def links(): return json.loads(ip("-j", "-d", "-N", "link", "show", "type", "xfrm"))
     def states(): return ip("xfrm", "state")
     def wait(predicate):
         for _ in range(200):
@@ -243,12 +243,24 @@ def run(binary):
                 def configured():
                     link = tunnel()
                     return (link is not None and link["mtu"] == 1400
+                            and int(link.get("group", 0)) == 17227
+                            and int(str(link["linkinfo"]["info_data"]["if_id"]), 0) == 41
                             and {"UP", "MULTICAST"} <= set(link["flags"])
                             and not link.get("master"))
                 before_repair = states()
+                # Attributes outside the managed spec survive in-place repair.
+                ip("link", "set", name, "alias", "user-managed", "txqueuelen", 123,
+                   "promisc", "on", "allmulticast", "on")
+                ip("addr", "add", "198.18.41.1/32", "dev", name)
+                def extras_preserved():
+                    link = tunnel()
+                    assert link["ifalias"] == "user-managed" and link["txqlen"] == 123, link
+                    assert {"PROMISC", "ALLMULTI"} <= set(link["flags"]), link
+                    assert "198.18.41.1/32" in ip("-o", "addr", "show", "dev", name)
                 ip("link", "set", name, "down", "mtu", 1280, "multicast", "off")
                 wait(configured)
                 assert tunnel()["ifindex"] == index
+                extras_preserved()
                 ip("link", "add", "accidental", "type", "vrf", "table", "5678")
                 ip("link", "set", "accidental", "up")
                 ip("link", "set", name, "master", "accidental")
@@ -256,15 +268,22 @@ def run(binary):
                 ip("link", "set", name, "name", "renamed")
                 wait(configured)
                 assert tunnel()["ifindex"] == index
+                extras_preserved()
+                # The opaque logical identity remains 41 while native if_id
+                # drifts. Repair reads if_id from configuration, not identity.
+                ip("link", "set", name, "type", "xfrm", "if_id", 66)
+                wait(configured)
+                assert tunnel()["ifindex"] == index
+                extras_preserved()
                 ip("link", "del", name)
                 wait(configured)
                 assert tunnel()["ifindex"] != index
                 index = tunnel()["ifindex"]
 
-                # Changing the XFRM identity invalidates our old handle. The
-                # conflicting interface must not be adopted or modified, even
-                # after explicitly reusing its old index. A foreign interface
-                # holding ID 41 prevents recreation while we replace the link.
+                # Leaving the ownership group releases an interface. A foreign
+                # replacement stays untouched even when its index is reused.
+                # A foreign interface holding ID 41 blocks recreation meanwhile.
+                ip("link", "set", name, "group", 0)
                 ip("link", "set", name, "type", "xfrm", "if_id", 66)
                 ip("link", "add", "guard41", "type", "xfrm", "if_id", 41)
                 ip("link", "del", name)
@@ -394,6 +413,7 @@ def run(binary):
                     rpc("InstallSa", id=temporary, config=sa_config())
                     temporary_name = "ranet0000003c"
                     if attempt == 4:
+                        ip("link", "set", temporary_name, "group", 0)
                         ip("link", "set", temporary_name, "type", "xfrm", "if_id", 160)
                     else:
                         ip("link", "del", temporary_name)
@@ -522,6 +542,93 @@ def run(binary):
                         daemon.kill(); daemon.wait()
     ip("xfrm", "policy", "delete", *foreign_policy)
     print("PASS: SIGTERM/SIGINT reconcile policies and interfaces to empty with active or disconnected clients, preserve foreign objects, and leave SAs and SPI reservations unchanged")
+
+    # Group membership survives daemon crashes. Reuse recognizable interfaces,
+    # remove every unwanted owned kind, and preserve interfaces in other groups.
+    with tempfile.TemporaryDirectory(prefix="kernel-rust-inventory-") as d:
+        directory = Path(d)
+        with open(directory / "daemon.log", "w+") as log:
+            daemons, controls = [], []
+            def start(attempt):
+                path = str(directory / f"kernel-{attempt}.sock")
+                daemon = subprocess.Popen([
+                    binary, "--socket", path, "--ifname-prefix", "resume",
+                    "--interface-group", "17229",
+                ], stdout=log, stderr=log)
+                daemons.append(daemon)
+                wait(lambda: Path(path).exists() or daemon.poll() is not None)
+                assert daemon.poll() is None
+                control = Varlink(path)
+                controls.append(control)
+                assert "error" not in control.call("OpenSession", dict(interfacesUse="", interfacesIgnore=""))
+                return daemon, control
+            def call(control, method, **parameters):
+                reply = control.call(method, parameters)
+                assert "error" not in reply, reply
+                return reply.get("parameters", {})
+            def inventory():
+                return json.loads(ip("-j", "-d", "-N", "link"))
+            def owned():
+                return [link for link in inventory() if int(link.get("group", 0)) == 17229]
+            try:
+                daemon, control = start(0)
+                first = sa_id(spi=0x50000, interface=70)
+                call(control, "InstallSa", id=first, config=sa_config())
+                original = owned()[0]["ifindex"]
+                ip("link", "set", "resume00000046", "alias", "retained-after-crash", "txqueuelen", 321)
+                daemon.kill(); assert daemon.wait(timeout=5) == -signal.SIGKILL
+                control.socket.close()
+                assert owned()[0]["ifindex"] == original and "0x00050000" in states()
+                # The native if_id can drift independently of the encoded
+                # opaque logical identity. Restart must restore the desired one.
+                ip("link", "set", "resume00000046", "type", "xfrm", "if_id", 170)
+                ip("link", "set", "resume00000046", "down", "mtu", 1280, "multicast", "off")
+                ip("link", "add", "owned-orphan", "group", 17229, "type", "dummy")
+                ip("link", "add", "resume00000048", "group", 17230, "type", "dummy")
+
+                daemon, control = start(1)
+                second = sa_id(spi=0x50001, interface=70)
+                call(control, "InstallSa", id=second, config=sa_config())
+                recovered = next(link for link in owned() if link["ifname"] == "resume00000046")
+                assert recovered["ifindex"] == original, recovered
+                assert recovered["mtu"] == 1400 and {"UP", "MULTICAST"} <= set(recovered["flags"]), recovered
+                assert int(str(recovered["linkinfo"]["info_data"]["if_id"]), 0) == 70, recovered
+                assert recovered["ifalias"] == "retained-after-crash" and recovered["txqlen"] == 321, recovered
+                assert not any(link["ifname"] == "owned-orphan" for link in inventory())
+                assert "0x00050000" in states(), "interface discovery must not adopt or remove old SAs"
+                # A known ID with the wrong kind is updated; Linux replaces it.
+                ip("link", "add", "resume00000047", "group", 17229, "type", "dummy")
+                third = sa_id(spi=0x50002, interface=71)
+                call(control, "InstallSa", id=third, config=sa_config())
+                repaired = next(link for link in owned() if link["ifname"] == "resume00000047")
+                assert repaired["linkinfo"]["info_kind"] == "xfrm", repaired
+                assert control.call("InstallSa", dict(id=sa_id(spi=0x50003, interface=72), config=sa_config()))["parameters"]["errno"] == errno.EEXIST
+                assert next(link for link in inventory() if link["ifname"] == "resume00000048")["linkinfo"]["info_kind"] == "dummy"
+                before_sas = states()
+                daemon.kill(); assert daemon.wait(timeout=5) == -signal.SIGKILL
+                control.socket.close()
+                ip("link", "add", "owned-bridge", "group", 17229, "type", "bridge")
+
+                daemon, control = start(2)
+                call(control, "CloseSession")
+                assert not owned(), "empty desired state must remove all discovered owned kinds"
+                assert states() == before_sas, "interface crash cleanup must leave SAs unchanged"
+                assert any(link["ifname"] == "resume00000048" for link in inventory())
+                assert any(link["ifname"] == "foreign" for link in links())
+                daemon.terminate(); assert daemon.wait(timeout=5) == 0
+                for sa in [first, second, third]:
+                    ip("xfrm", "state", "delete", "src", sa["src"]["address"],
+                       "dst", sa["dst"]["address"], "proto", "esp", "spi", sa["spi"])
+                ip("link", "del", "resume00000048")
+            except BaseException:
+                log.seek(0); print(log.read(), file=sys.stderr); raise
+            finally:
+                for control in controls:
+                    control.socket.close()
+                for daemon in daemons:
+                    if daemon.poll() is None:
+                        daemon.kill(); daemon.wait()
+    print("PASS: configurable numeric ownership group, wrong-kind repair, opaque identity independent of native if_id, crash inventory reuse and cleanup, unmanaged settings preserved, and foreign groups untouched")
 
 if __name__ == "__main__":
     if sys.argv[1] == "--client": client(sys.argv[2])
