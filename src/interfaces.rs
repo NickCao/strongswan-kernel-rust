@@ -58,7 +58,7 @@ pub trait InterfaceHandle {
 /// CRUD for tunnel interfaces. Handles identify objects independently of their
 /// mutable settings. Listing returns only backend-owned objects, including
 /// leftovers discovered after restart. Backends own naming and ownership rules
-/// and validate ownership and handles before modifying an object.
+/// and define the native key used to target mutations.
 pub trait InterfaceKernel: Send {
     type Handle: InterfaceHandle;
 
@@ -66,12 +66,12 @@ pub trait InterfaceKernel: Send {
     /// Create only: an existing object must not be replaced. Existing owned
     /// interfaces are discovered via list() and updated by the controller.
     fn create(&mut self, spec: &InterfaceSpec) -> io::Result<Self::Handle>;
-    /// Achieve this configuration for the same logical ID. The backend chooses
-    /// in-place repair or replacement. Handles are snapshots: callers must list
+    /// Achieve this configuration for the object identified by the handle.
+    /// The backend chooses in-place repair or replacement. Callers must list
     /// again before reusing a handle after a potentially replacing update.
     fn update(&mut self, handle: &Self::Handle, spec: &InterfaceSpec) -> io::Result<()>;
-    /// An already absent object counts as successfully deleted. A replacement
-    /// object that does not match the handle must be left untouched.
+    /// An already absent object counts as successfully deleted. The handle's
+    /// native key determines the object targeted by this operation.
     fn delete(&mut self, handle: &Self::Handle) -> io::Result<()>;
 }
 

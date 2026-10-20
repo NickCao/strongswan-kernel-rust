@@ -36,8 +36,8 @@ interface. A failed first installation rolls it back. Policies alone do not
 retain an interface. Linux link group **17227** is reserved for daemon-owned
 interfaces; `--interface-group` selects a different nonzero numeric group.
 Every interface in that group is owned, regardless of its native type or name.
-Interfaces outside it are not adopted or deleted. Group membership persists
-across daemon restarts and needs no entry in iproute2's group names file.
+Group membership selects the interfaces returned by the ownership inventory.
+It persists across daemon restarts and needs no entry in iproute2's group names file.
 Independent daemon instances in one network namespace must reserve distinct
 groups. `--ifname-prefix` and `--mtu` change the naming prefix and MTU. Interfaces
 have multicast enabled. `--master-device NAME` attaches them to an existing
@@ -517,11 +517,13 @@ with recognizable identities are replaced inside `update()`. Neither the
 backend nor the shared controller keeps an interface association or ownership
 cache.
 
-Linux handles capture the interface index and native XFRM identity, alongside
-the logical ID decoded from the name. Updates and deletion check
-the current object and group membership. These are checks, not kernel lifetime
-references: a replacement reusing all checked fields cannot be distinguished.
-Moving a link out of the reserved group releases ownership. Repairs modify only
+Linux handles contain the interface index and the logical ID decoded from the
+name. The index is the native primary key: updates and deletion target the
+current interface at that index, including after index reuse. Group membership
+selects ownership during listing; mutations do not recheck group membership,
+logical identity or previous XFRM settings. Updating reads the current link only
+to decide whether in-place repair or replacement is needed. Moving a link out
+of the reserved group excludes it from subsequent listings. Repairs modify only
 managed attributes; user aliases, addresses, queue lengths, unrelated flags and
 other unmanaged settings are preserved during in-place updates. SA handling
 and network discovery remain Linux-specific.
@@ -588,6 +590,9 @@ network namespaces and leave the caller's network namespace untouched:
 
 ```sh
 unshare --net -- python3 tests/integration.py target/release/charon-kernel-daemon
+# Direct backend checks, including mutations through an index reused by the kernel:
+unshare --net -- cargo test --locked -p charon-kernel-daemon \
+    linux::interfaces::tests::mutations_target_the_current_interface_at_the_handle_index -- --ignored
 unshare --net -- python3 tests/plugin.py /tmp/strongswan-install
 unshare --net -- python3 tests/tunnel.py /tmp/strongswan-install \
     --vici-python /path/to/strongswan/src/libcharon/plugins/vici/python

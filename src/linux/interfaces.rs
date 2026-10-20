@@ -33,14 +33,12 @@ pub fn name_prefix(value: &str) -> Result<String, String> {
 pub struct InterfaceHandle {
     index: u32,
     id: Option<InterfaceId>,
-    xfrm: Option<(u32, u32)>,
 }
 impl InterfaceHandle {
     fn from_link(link: &Link, id: Option<InterfaceId>) -> Self {
         Self {
             index: link.index,
             id,
-            xfrm: link.xfrm,
         }
     }
 }
@@ -66,12 +64,6 @@ impl LinuxInterfaces {
             prefix,
             group,
         })
-    }
-
-    fn current(&mut self, handle: &InterfaceHandle) -> io::Result<Option<Link>> {
-        Ok(self.net.link(handle.index)?.filter(|link| {
-            link.group == self.group && link.xfrm == handle.xfrm && self.id(link) == handle.id
-        }))
     }
 
     fn name(&self, id: InterfaceId) -> String {
@@ -160,17 +152,14 @@ impl InterfaceKernel for LinuxInterfaces {
         Ok(InterfaceHandle {
             index: network::index(&self.name(spec.id))?,
             id: Some(spec.id),
-            xfrm: Some((spec.config.if_id, 0)),
         })
     }
 
     fn update(&mut self, handle: &InterfaceHandle, spec: &InterfaceSpec) -> io::Result<()> {
-        if handle.id != Some(spec.id) {
-            return Err(invalid());
-        }
         let current = self
-            .current(handle)?
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
+            .net
+            .link(handle.index)?
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
         let message = self.settings(spec, handle.index)?;
         if current.xfrm.is_none() {
             // Linux cannot change an interface's kind. Replacement is a
@@ -185,9 +174,6 @@ impl InterfaceKernel for LinuxInterfaces {
     }
 
     fn delete(&mut self, handle: &InterfaceHandle) -> io::Result<()> {
-        if self.current(handle)?.is_none() {
-            return Ok(());
-        }
         let mut message = LinkMessage::default();
         message.header.index = handle.index;
         match self
@@ -198,5 +184,107 @@ impl InterfaceKernel for LinuxInterfaces {
             Err(error) if error.raw_os_error() == Some(libc::ENODEV) => Ok(()),
             Err(error) => Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interfaces::InterfaceHandle as _;
+    use std::{fs, process::Command};
+
+    fn ip(args: &[&str]) {
+        let output = Command::new("ip").args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires root in a disposable network namespace"]
+    fn mutations_target_the_current_interface_at_the_handle_index() {
+        assert_eq!(nix::unistd::Uid::effective().as_raw(), 0);
+        assert_ne!(
+            fs::read_link("/proc/self/ns/net").unwrap(),
+            fs::read_link("/proc/1/ns/net").unwrap(),
+            "run with unshare --net"
+        );
+        let mut kernel = LinuxInterfaces::new("idx".into(), DEFAULT_INTERFACE_GROUP).unwrap();
+        let mut net = Network::new().unwrap();
+        let mut spec = InterfaceSpec {
+            id: "00000007".parse().unwrap(),
+            config: InterfaceConfig {
+                if_id: 41,
+                mtu: 1400,
+                master: None,
+                up: true,
+                multicast: true,
+            },
+        };
+        let original = kernel.create(&spec).unwrap();
+        // The index remains the key after group, name and native settings change.
+        ip(&[
+            "link",
+            "set",
+            "idx00000007",
+            "group",
+            "0",
+            "name",
+            "changed",
+        ]);
+        ip(&["link", "set", "changed", "type", "xfrm", "if_id", "66"]);
+        assert!(kernel.list().unwrap().is_empty());
+        spec.id = "00000008".parse().unwrap();
+        spec.config.if_id = 42;
+        spec.config.mtu = 1300;
+        kernel.update(&original, &spec).unwrap();
+        let current = net.link(original.index).unwrap().unwrap();
+        assert_eq!(current.name, "idx00000008");
+        assert_eq!(current.group, 0);
+        assert_eq!(current.xfrm, Some((42, 0)));
+        assert_eq!(current.mtu, 1300);
+
+        // A wrong-type replacement at the same key is repaired by update().
+        ip(&["link", "del", "idx00000008"]);
+        ip(&[
+            "link",
+            "add",
+            "replacement",
+            "index",
+            &original.index.to_string(),
+            "type",
+            "dummy",
+        ]);
+        kernel.update(&original, &spec).unwrap();
+        let recreated = kernel.list().unwrap().pop().unwrap();
+        assert_eq!(recreated.handle.id(), Some(spec.id));
+        assert_eq!(recreated.config, Some(spec.config));
+        ip(&[
+            "link",
+            "set",
+            "idx00000008",
+            "group",
+            "0",
+            "name",
+            "released",
+        ]);
+        kernel.delete(&recreated.handle).unwrap();
+        assert!(net.link(recreated.handle.index).unwrap().is_none());
+        kernel.delete(&recreated.handle).unwrap();
+
+        // Deletion also uses the index directly when the kernel reuses it.
+        ip(&[
+            "link",
+            "add",
+            "reused",
+            "index",
+            &recreated.handle.index.to_string(),
+            "type",
+            "dummy",
+        ]);
+        kernel.delete(&recreated.handle).unwrap();
+        assert!(net.link(recreated.handle.index).unwrap().is_none());
     }
 }
