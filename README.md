@@ -431,6 +431,21 @@ reservations and IKE bypass policies, and permits a new session. Flushes are
 restricted to session-owned objects; flushing tunnel policies preserves IKE
 port bypasses until close.
 
+External changes to kernel SAs, policies, or XFRM interfaces are not
+automatically reconciled. The daemon tracks ownership in memory without
+periodically comparing it with kernel state, and does not handle external
+SA/policy deletion or flush notifications. Commands such as
+`ip xfrm state flush` or `ip xfrm policy flush` can leave those records out
+of sync with the kernel. Missing SAs produce query errors without triggering
+recovery, and interface cleanup still follows the recorded SA ownership.
+An externally deleted XFRM interface is not automatically recreated.
+
+A successful rekey may replace missing SAs or refresh related policies, and
+teardown can clear stale ownership records. These lifecycle operations do
+not guarantee eventual reconciliation; mismatches can persist indefinitely.
+For missing SAs or policies, tear down and reestablish the affected CHILD_SAs
+through strongSwan.
+
 If charon or its event connection disappears unexpectedly, installed tunnel
 objects are preserved and replacement sessions are rejected. Hard expiry
 still releases the last SA's interface. Automatic restart reconciliation
