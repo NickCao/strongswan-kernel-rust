@@ -37,10 +37,41 @@ fn selector(id: &PolicyKey) -> packet::Selector {
     }
 }
 
-/// Policies are identified by selectors/direction/mark/interface ID, as before.
-/// Kernel-assigned policy indices are not ownership or configuration fields.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PolicyHandle(PolicyKey);
+/// The kernel index is the native key, never an ownership marker. XFRM also
+/// requires mark, interface ID and type qualifiers for index lookups.
+#[derive(Clone, Debug)]
+pub struct PolicyHandle {
+    index: u32,
+    id: Option<PolicyKey>,
+    mark: Mark,
+    if_id: u32,
+    policy_type: u8,
+}
+impl crate::policy::PolicyHandle for PolicyHandle {
+    fn id(&self) -> Option<&PolicyKey> {
+        self.id.as_ref()
+    }
+}
+impl PolicyHandle {
+    fn request(&self) -> packet::policy::DelGetMessage {
+        let mut nlas = id_attrs(self.mark, self.if_id);
+        if self.policy_type != 0 {
+            nlas.push(Attr::PolicyType(packet::UserPolicyType {
+                ptype: self.policy_type,
+                ..Default::default()
+            }));
+        }
+        packet::policy::DelGetMessage {
+            user_policy_id: packet::UserPolicyId {
+                index: self.index,
+                // The bottom three index bits encode the native direction.
+                direction: (self.index & 7) as u8,
+                ..Default::default()
+            },
+            nlas,
+        }
+    }
+}
 
 pub struct LinuxPolicies {
     socket: Netlink,
@@ -131,6 +162,20 @@ impl LinuxPolicies {
             nlas: id_attrs(id.mark, id.if_id),
         }
     }
+    fn read(
+        &mut self,
+        request: packet::policy::DelGetMessage,
+    ) -> io::Result<ObservedPolicy<PolicyHandle>> {
+        let reply = self
+            .socket
+            .request(&message(NlmF::empty(), &XfrmMessage::GetPolicy(request)))?
+            .into_iter()
+            .find(|reply| reply.kind == packet::XFRM_MSG_NEWPOLICY)
+            .ok_or_else(missing)?;
+        let policy = packet::policy::ModifyMessage::parse(reply.payload.as_slice())
+            .map_err(io::Error::other)?;
+        Self::observed(policy)
+    }
 
     fn configuration(
         id: &PolicyKey,
@@ -173,7 +218,7 @@ impl LinuxPolicies {
     }
     fn observed(policy: packet::policy::ModifyMessage) -> io::Result<ObservedPolicy<PolicyHandle>> {
         let info = &policy.user_policy_info;
-        let (mut mark, mut if_id) = (Mark::default(), 0);
+        let (mut mark, mut if_id, mut policy_type) = (Mark::default(), 0, 0);
         for attr in &policy.nlas {
             match attr {
                 Attr::Mark(value) => {
@@ -183,14 +228,30 @@ impl LinuxPolicies {
                     }
                 }
                 Attr::IfId(value) => if_id = *value,
+                Attr::PolicyType(value) => policy_type = value.ptype,
                 _ => (),
             }
         }
-        let id = Self::selector_key(&info.selector, info.direction, mark, if_id)?;
+        let representable = info.selector.ifindex == 0
+            && info.selector.user == 0
+            && policy_type == 0
+            && !policy
+                .nlas
+                .iter()
+                .any(|attr| matches!(attr, Attr::SecurityContext(_)));
+        let id = representable
+            .then(|| Self::selector_key(&info.selector, info.direction, mark, if_id).ok())
+            .flatten();
+        let config = id.as_ref().and_then(|id| Self::configuration(id, &policy));
         Ok(ObservedPolicy {
-            handle: PolicyHandle(id.clone()),
-            config: Self::configuration(&id, &policy),
-            id,
+            handle: PolicyHandle {
+                index: info.index,
+                id,
+                mark,
+                if_id,
+                policy_type,
+            },
+            config,
             last_use: monotonic_use_time(info.lifetime_cur.use_time)?,
         })
     }
@@ -231,49 +292,36 @@ impl PolicyKernel for LinuxPolicies {
             }
             let policy = packet::policy::ModifyMessage::parse(reply.payload.as_slice())
                 .map_err(io::Error::other)?;
-            let info = &policy.user_policy_info;
-            // Other interface/user selectors, security labels and policy
-            // tables are separate scopes; our CRUD API addresses main policies.
-            if info.selector.ifindex != 0
-                || info.selector.user != 0
-                || policy.nlas.iter().any(|attr| {
-                    matches!(
-                        attr,
-                        Attr::SecurityContext(_)
-                            | Attr::PolicyType(packet::UserPolicyType { ptype: 1.., .. })
-                    )
-                })
-            {
+            // Per-socket policies belong to the socket and cannot be managed
+            // through global CRUD. Their directions are offset beyond 0..=2.
+            if policy.user_policy_info.direction > 2 {
                 continue;
             }
             observed.push(Self::observed(policy)?);
         }
         Ok(observed)
     }
-    fn get(&mut self, handle: &PolicyHandle) -> io::Result<ObservedPolicy<PolicyHandle>> {
-        let request = XfrmMessage::GetPolicy(Self::policy_id(&handle.0));
-        let reply = self
-            .socket
-            .request(&message(NlmF::empty(), &request))?
-            .into_iter()
-            .find(|reply| reply.kind == packet::XFRM_MSG_NEWPOLICY)
-            .ok_or_else(missing)?;
-        let policy = packet::policy::ModifyMessage::parse(reply.payload.as_slice())
-            .map_err(io::Error::other)?;
-        Self::observed(policy)
+    fn get(&mut self, id: &PolicyKey) -> io::Result<ObservedPolicy<PolicyHandle>> {
+        self.read(Self::policy_id(id))
     }
     fn create(&mut self, spec: &PolicySpec) -> io::Result<PolicyHandle> {
         self.socket.ack(&Self::policy_message(spec, false))?;
-        Ok(PolicyHandle(spec.id.clone()))
+        Ok(self.get(&spec.id)?.handle)
     }
     fn update(&mut self, handle: &PolicyHandle, spec: &PolicySpec) -> io::Result<()> {
-        if handle.0 != spec.id {
-            return Err(invalid());
+        let current = self.read(handle.request())?;
+        if current.handle.id.as_ref() != Some(&spec.id) {
+            // Linux updates locate policies by selectors, not by index.
+            // Replacing this native object lets update() repair identities
+            // outside the supported model without touching a different index.
+            self.delete(handle)?;
+            self.create(spec)?;
+            return Ok(());
         }
         self.socket.ack(&Self::policy_message(spec, true))
     }
     fn delete(&mut self, handle: &PolicyHandle) -> io::Result<()> {
-        let request = XfrmMessage::DeletePolicy(Self::policy_id(&handle.0));
+        let request = XfrmMessage::DeletePolicy(handle.request());
         match self.socket.ack(&message(NlmF::ACK, &request)) {
             Ok(()) => Ok(()),
             Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
@@ -289,8 +337,128 @@ mod tests {
     use super::*;
     use crate::linux::xfrm::selector_ts;
     use crate::model::{PolicyData, PolicyId, Ts};
+    use crate::policy::PolicyHandle as _;
     use netlink_packet_core::Emitable;
     use std::collections::HashSet;
+
+    #[test]
+    #[ignore = "requires root in a disposable network namespace"]
+    fn global_inventory_and_mutations_use_native_policy_indices() {
+        assert_eq!(nix::unistd::Uid::effective().as_raw(), 0);
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            std::fs::read_link("/proc/1/ns/net").unwrap(),
+            "run with unshare --net"
+        );
+        let mut kernel = LinuxPolicies::new().unwrap();
+        let mut spec = PolicySpec {
+            id: PolicyKey {
+                src: "192.0.2.0/24".parse().unwrap(),
+                dst: "198.51.100.0/24".parse().unwrap(),
+                src_port: 0,
+                src_port_mask: 0,
+                dst_port: 0,
+                dst_port_mask: 0,
+                protocol: 0,
+                dir: 1,
+                mark: Mark {
+                    value: 0x123,
+                    mask: 0xfff,
+                },
+                if_id: 41,
+            },
+            config: PolicyConfig {
+                priority: 100,
+                block: true,
+                template: None,
+            },
+        };
+        let handle = kernel.create(&spec).unwrap();
+        assert_ne!(handle.index, 0);
+        assert_eq!(handle.id(), Some(&spec.id));
+        // The index is unique, but omitting XFRM's extra addressing qualifiers
+        // cannot retrieve a marked policy bound to a nonzero interface ID.
+        let mut bare = handle.request();
+        bare.nlas.clear();
+        assert!(is_missing(&kernel.read(bare).unwrap_err()));
+        assert_eq!(
+            kernel.read(handle.request()).unwrap().handle.index,
+            handle.index
+        );
+        spec.config.priority = 200;
+        kernel.update(&handle, &spec).unwrap();
+        let current = kernel.get(&spec.id).unwrap();
+        assert_eq!(current.handle.index, handle.index);
+        assert_eq!(current.config.as_ref(), Some(&spec.config));
+
+        // Replace the native object at the same index with a different logical
+        // identity. Deletion still targets that index, not the stale selector.
+        kernel.delete(&handle).unwrap();
+        let mut replacement = spec.clone();
+        replacement.id.dst = "203.0.113.0/24".parse().unwrap();
+        let mut native = LinuxPolicies::policy_spec(&replacement);
+        native.user_policy_info.index = handle.index;
+        kernel
+            .socket
+            .ack(&message(NlmF::ACK, &XfrmMessage::AddPolicy(native)))
+            .unwrap();
+        assert_eq!(
+            kernel.get(&replacement.id).unwrap().handle.index,
+            handle.index
+        );
+        kernel.delete(&handle).unwrap();
+        assert!(kernel.list().unwrap().is_empty());
+        kernel.delete(&handle).unwrap();
+
+        // Unknown identities must remain in inventory so empty desired state
+        // deletes them too, including native selector scopes we never create.
+        let mut native = LinuxPolicies::policy_spec(&spec);
+        native.user_policy_info.selector.user = 1234;
+        kernel
+            .socket
+            .ack(&message(NlmF::ACK, &XfrmMessage::AddPolicy(native)))
+            .unwrap();
+        let unknown = kernel.list().unwrap().pop().unwrap();
+        assert!(unknown.handle.id().is_none() && unknown.config.is_none());
+        // update() chooses replacement when the native selector cannot be
+        // represented; the reconciler need not understand Linux's limitation.
+        kernel.update(&unknown.handle, &spec).unwrap();
+        assert_eq!(
+            kernel.get(&spec.id).unwrap().config.as_ref(),
+            Some(&spec.config)
+        );
+        // Sub policies share the global inventory but need their own type
+        // qualifier when deleting by index, even with identical selectors.
+        let mut sub = LinuxPolicies::policy_spec(&spec);
+        sub.nlas.push(Attr::PolicyType(packet::UserPolicyType {
+            ptype: 1,
+            ..Default::default()
+        }));
+        kernel
+            .socket
+            .ack(&message(NlmF::ACK, &XfrmMessage::AddPolicy(sub)))
+            .unwrap();
+        let inventory = kernel.list().unwrap();
+        assert_eq!(inventory.len(), 2);
+        let sub = inventory
+            .iter()
+            .find(|entry| entry.handle.policy_type == 1)
+            .unwrap();
+        assert!(sub.handle.id().is_none());
+        kernel.delete(&sub.handle).unwrap();
+        assert_eq!(
+            kernel.get(&spec.id).unwrap().config.as_ref(),
+            Some(&spec.config)
+        );
+        let mut policies = crate::policy::Policies::new(kernel);
+        policies.reconcile().unwrap();
+        // A fresh backend discovers the table without a retained handle map.
+        assert!(LinuxPolicies::new().unwrap().list().unwrap().is_empty());
+    }
+
+    fn is_missing(error: &io::Error) -> bool {
+        error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+    }
 
     #[test]
     fn observations_ignore_usage_metadata_but_preserve_configuration_changes() {

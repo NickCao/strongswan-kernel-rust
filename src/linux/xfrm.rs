@@ -462,7 +462,7 @@ impl Xfrm {
         self.delete_one(id)
     }
     pub fn flush_sas(&mut self) -> io::Result<()> {
-        // Never issue XFRM_MSG_FLUSHSA: there may be unrelated IPsec users.
+        // strongSwan's RPC flush removes only this session's tracked states.
         let ids: Vec<_> = self
             .sas
             .iter()
@@ -483,6 +483,17 @@ impl Xfrm {
         for id in ids {
             self.delete_one(&id)?;
         }
+        Ok(())
+    }
+    /// Orderly daemon shutdown owns the entire namespace's XFRM state table,
+    /// including larval reservations and states absent from our bookkeeping.
+    pub fn flush_all_sas(&mut self) -> io::Result<()> {
+        self.socket.ack(&message(
+            NlmF::ACK,
+            &XfrmMessage::FlushSa(packet::state::FlushMessage::default()),
+        ))?;
+        self.sas.clear();
+        self.allocations.clear();
         Ok(())
     }
 }

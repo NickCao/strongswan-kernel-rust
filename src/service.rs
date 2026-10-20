@@ -61,6 +61,17 @@ impl Server {
             // Any in-flight mutation finishes before the final reconciliation.
             // Requests and event workers recheck closed after taking this lock.
             session.backend.lock().unwrap().shutdown()?;
+        } else {
+            // Ownership is namespace-wide even without an open charon session.
+            Backend::new(
+                self.prefix.clone(),
+                self.master_device.clone(),
+                self.mtu,
+                self.interface_group,
+                String::new(),
+                String::new(),
+            )?
+            .shutdown()?;
         }
         Ok(())
     }
@@ -268,7 +279,7 @@ impl VarlinkInterface for Service {
             // startup are retained and invalidate it on the next request.
             let (route_socket, route) =
                 Netlink::subscribe(NlFamily::Route, 1 | 0x10 | 0x100 | 0x40 | 0x400)?;
-            let backend = Backend::new(
+            let mut backend = Backend::new(
                 self.server.prefix.clone(),
                 self.server.master_device.clone(),
                 self.server.mtu,
@@ -276,6 +287,9 @@ impl VarlinkInterface for Service {
                 interfaces_use,
                 interfaces_ignore,
             )?;
+            // Retire global policy leftovers before accepting new desired
+            // state. SA reconciliation and restart cleanup remain separate.
+            backend.policies.reconcile()?;
             let (xfrm_socket, xfrm) = Netlink::subscribe(NlFamily::Xfrm, 1 | 2 | 8 | 128)?;
             let token = hex::encode(rand::random::<[u8; 32]>());
             let features = backend.xfrm.features().into();

@@ -523,9 +523,7 @@ in
         assert_stopped(left, "strongswan-swanctl.service")
         assert not links(left)
         assert not left.succeed("ip xfrm policy list nosock").strip()
-        assert spis(left) == retained, "SA shutdown cleanup is deferred until SA reconciliation"
-        # Remove intentionally retained SAs in this isolated VM before restart.
-        left.succeed("ip xfrm state flush")
+        assert not spis(left), "daemon shutdown must flush the XFRM state table"
         left.succeed("systemctl start strongswan-swanctl.service")
         assert "kernel-rust" in ctl(left, "--stats")
 
@@ -566,5 +564,20 @@ in
         assert_stopped(left, "charon-kernel.service")
         assert_stopped(left, "strongswan-swanctl.service")
         left.succeed("test ! -e /run/strongswan && test ! -e /run/charon-kernel")
+
+    with subtest("a fresh strongSwan session retires global policy leftovers"):
+        left.succeed(
+            "ip xfrm policy add src 203.0.113.0/24 dst 203.0.114.0/24 "
+            "dev lo dir out mark 0x123 mask 0xfff if_id 77 action block"
+        )
+        assert "203.0.113.0/24" in left.succeed("ip xfrm policy list nosock")
+        left.succeed("systemctl reset-failed && systemctl start strongswan-swanctl.service")
+        left.wait_for_unit("strongswan-swanctl.service")
+        assert "kernel-rust" in ctl(left, "--stats")
+        remaining = policy_specs(left)
+        assert all("priority 32" in policy and "proto udp" in policy
+                   and "if_id" not in policy for policy in remaining), remaining
+        left.succeed("systemctl stop strongswan-swanctl.service")
+        assert_empty(left)
   '';
 }

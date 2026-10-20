@@ -130,35 +130,41 @@ impl PolicySpec {
 #[derive(Clone, Debug)]
 pub struct ObservedPolicy<H> {
     pub handle: H,
-    pub id: PolicyKey,
-    /// None if native configuration cannot be represented by our supported
-    /// model. The controller repairs such entries only if it owns the handle.
+    /// None if native configuration cannot be represented by our model.
+    /// A known desired identity is still repaired through update().
     pub config: Option<PolicyConfig>,
     /// Last use in CLOCK_MONOTONIC seconds, or zero if unused/unavailable.
     pub last_use: u64,
 }
 
-/// Policy CRUD with normalized observations and opaque device handles. Policy
-/// identity, priority selection and reconciliation belong to the controller.
+/// Logical identity captured by inventory, without device I/O.
+pub trait PolicyHandle {
+    fn id(&self) -> Option<&PolicyKey>;
+}
+
+/// CRUD for backend-owned policies, including leftovers after restart. The
+/// backend defines ownership and the native keys used to target mutations.
+/// Reference selection, desired configuration and repair belong to the caller.
 pub trait PolicyKernel: Send {
-    type Handle: Clone + Eq;
+    type Handle: PolicyHandle;
     fn list(&mut self) -> io::Result<Vec<ObservedPolicy<Self::Handle>>>;
-    fn get(&mut self, handle: &Self::Handle) -> io::Result<ObservedPolicy<Self::Handle>>;
-    /// Create only: an existing policy must not be adopted or replaced.
+    /// Look up a logical identity directly, including its usage and native
+    /// handle, without requiring a full inventory for every strongSwan query.
+    fn get(&mut self, id: &PolicyKey) -> io::Result<ObservedPolicy<Self::Handle>>;
+    /// Create only. Existing owned policies are discovered by get()/list().
     fn create(&mut self, spec: &PolicySpec) -> io::Result<Self::Handle>;
-    /// Update the object identified by this handle without changing its
-    /// identity. A backend may upsert when its native API preserves the handle;
-    /// otherwise a missing object returns NotFound.
+    /// Achieve this configuration for the object identified by the handle.
+    /// The backend chooses in-place repair or replacement. Obtain a fresh
+    /// handle before addressing the object again after an update.
     fn update(&mut self, handle: &Self::Handle, spec: &PolicySpec) -> io::Result<()>;
-    /// An already absent object counts as successfully deleted. A replacement
-    /// object that does not match the handle must be left untouched.
+    /// An already absent object counts as successfully deleted. The native
+    /// key determines which object is targeted, including after key reuse.
     fn delete(&mut self, handle: &Self::Handle) -> io::Result<()>;
 }
 
 pub struct Policies<K: PolicyKernel> {
     kernel: K,
     policies: HashMap<PolicyKey, Vec<PolicyData>>,
-    owned: HashMap<PolicyKey, K::Handle>,
     bypasses: Vec<(PolicyId, PolicyData)>,
 }
 impl<K: PolicyKernel> Policies<K> {
@@ -166,19 +172,26 @@ impl<K: PolicyKernel> Policies<K> {
         Self {
             kernel,
             policies: HashMap::new(),
-            owned: HashMap::new(),
             bypasses: Vec::new(),
         }
     }
-    fn update(kernel: &mut K, handle: &K::Handle, spec: &PolicySpec) -> io::Result<K::Handle> {
-        match kernel.update(handle, spec) {
-            Ok(()) => Ok(handle.clone()),
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ESRCH) =>
-            {
-                kernel.create(spec)
-            }
+    fn repair(
+        kernel: &mut K,
+        current: &ObservedPolicy<K::Handle>,
+        spec: &PolicySpec,
+    ) -> io::Result<()> {
+        if current.config.as_ref() == Some(&spec.config) {
+            return Ok(());
+        }
+        match kernel.update(&current.handle, spec) {
+            Err(error) if is_missing(&error) => kernel.create(spec).map(|_| ()),
+            result => result,
+        }
+    }
+    fn ensure(&mut self, spec: &PolicySpec) -> io::Result<()> {
+        match self.kernel.get(&spec.id) {
+            Ok(current) => Self::repair(&mut self.kernel, &current, spec),
+            Err(error) if is_missing(&error) => self.kernel.create(spec).map(|_| ()),
             Err(error) => Err(error),
         }
     }
@@ -197,12 +210,7 @@ impl<K: PolicyKernel> Policies<K> {
             }
         }
         if pos == 0 {
-            let spec = key.spec(&data);
-            let handle = match self.owned.get(&key).cloned() {
-                Some(handle) => Self::update(&mut self.kernel, &handle, &spec)?,
-                None => self.kernel.create(&spec)?,
-            };
-            self.owned.insert(key.clone(), handle);
+            self.ensure(&key.spec(&data))?;
         }
         uses.insert(pos, data);
         self.policies.insert(key, uses);
@@ -211,17 +219,18 @@ impl<K: PolicyKernel> Policies<K> {
     pub fn delete_policy(&mut self, id: &PolicyId, data: &PolicyData) -> io::Result<()> {
         let key = PolicyKey::new(id)?;
         let mut uses = self.policies.get(&key).ok_or_else(missing)?.clone();
-        let handle = self.owned[&key].clone();
         let pos = uses.iter().position(|p| p == data).ok_or_else(missing)?;
         uses.remove(pos);
         if uses.is_empty() {
-            self.kernel.delete(&handle)?;
-            self.owned.remove(&key);
+            match self.kernel.get(&key) {
+                Ok(current) => self.kernel.delete(&current.handle)?,
+                Err(error) if is_missing(&error) => (),
+                Err(error) => return Err(error),
+            }
             self.policies.remove(&key);
         } else {
             if pos == 0 {
-                let handle = Self::update(&mut self.kernel, &handle, &key.spec(&uses[0]))?;
-                self.owned.insert(key.clone(), handle);
+                self.ensure(&key.spec(&uses[0]))?;
             }
             self.policies.insert(key, uses);
         }
@@ -232,15 +241,15 @@ impl<K: PolicyKernel> Policies<K> {
         if !self.policies.contains_key(&key) {
             return Err(missing());
         }
-        Ok(self.kernel.get(&self.owned[&key])?.last_use)
+        Ok(self.kernel.get(&key)?.last_use)
     }
     pub fn contains_reqid(&self, if_id: u32, reqid: u32) -> bool {
         self.policies
             .iter()
             .any(|(key, uses)| key.if_id == if_id && uses.iter().any(|data| data.reqid == reqid))
     }
-    /// Clear the desired set, retaining ownership until reconciliation deletes
-    /// each object. Failed deletions can be retried without resurrection.
+    /// Clear desired state. Backend inventory retains unwanted objects for
+    /// deletion retries, including after a controller restart.
     pub fn clear(&mut self) {
         self.policies.clear();
         self.bypasses.clear();
@@ -248,46 +257,33 @@ impl<K: PolicyKernel> Policies<K> {
     /// The caller holds the same lock as add/delete throughout observation and
     /// repair, so no stale desired snapshot can outlive a deletion.
     pub fn reconcile(&mut self) -> io::Result<()> {
-        let obsolete: Vec<_> = self
-            .owned
-            .keys()
-            .filter(|id| !self.policies.contains_key(id))
-            .cloned()
-            .collect();
+        let mut inventory = self.kernel.list()?;
+        // Prefer a representable entry when several native objects claim the
+        // same logical identity, as with interface inventory.
+        inventory.sort_by_key(|entry| entry.config.is_none());
+        let mut observed = HashMap::new();
         let mut first_error = None;
-        for id in obsolete {
-            match self.kernel.delete(&self.owned[&id]) {
-                Ok(()) => {
-                    self.owned.remove(&id);
-                }
-                Err(error) => {
-                    first_error.get_or_insert(error);
+        for entry in inventory {
+            if let Some(id) = entry
+                .handle
+                .id()
+                .filter(|id| self.policies.contains_key(*id))
+            {
+                if let std::collections::hash_map::Entry::Vacant(slot) = observed.entry(id.clone())
+                {
+                    slot.insert(entry);
+                    continue;
                 }
             }
+            if let Err(error) = self.kernel.delete(&entry.handle) {
+                first_error.get_or_insert(error);
+            }
         }
-        if self.policies.is_empty() {
-            return first_error.map_or(Ok(()), Err);
-        }
-        let observed: HashMap<_, _> = self
-            .kernel
-            .list()?
-            .into_iter()
-            .map(|entry| (entry.id.clone(), entry))
-            .collect();
         for (id, uses) in &self.policies {
-            let handle = &self.owned[id];
             let spec = id.spec(&uses[0]);
-            let result = match observed.get(id) {
-                Some(entry) if &entry.handle != handle => {
-                    Err(io::Error::from_raw_os_error(libc::EEXIST))
-                }
-                Some(entry) if entry.config.as_ref() == Some(&spec.config) => Ok(()),
-                Some(_) => Self::update(&mut self.kernel, handle, &spec).map(|handle| {
-                    self.owned.insert(id.clone(), handle);
-                }),
-                None => self.kernel.create(&spec).map(|handle| {
-                    self.owned.insert(id.clone(), handle);
-                }),
+            let result = match observed.get(&spec.id) {
+                Some(entry) => Self::repair(&mut self.kernel, entry, &spec),
+                None => self.kernel.create(&spec).map(|_| ()),
             };
             if let Err(error) = result {
                 first_error.get_or_insert(error);
@@ -296,18 +292,8 @@ impl<K: PolicyKernel> Policies<K> {
         first_error.map_or(Ok(()), Err)
     }
     pub fn flush_policies(&mut self) -> io::Result<()> {
-        let keys: Vec<_> = self
-            .policies
-            .keys()
-            .filter(|key| key.if_id != 0)
-            .cloned()
-            .collect();
-        for key in keys {
-            self.kernel.delete(&self.owned[&key])?;
-            self.owned.remove(&key);
-            self.policies.remove(&key);
-        }
-        Ok(())
+        self.policies.retain(|key, _| key.if_id == 0);
+        self.reconcile()
     }
     pub fn port_bypass(&mut self, family: u16, port: u16) -> io::Result<()> {
         if port == 0 {
@@ -347,25 +333,32 @@ impl<K: PolicyKernel> Policies<K> {
         }
         Ok(())
     }
-    pub fn remove_bypasses(&mut self) -> io::Result<()> {
-        while let Some((id, data)) = self.bypasses.last().cloned() {
-            self.delete_policy(&id, &data)?;
-            self.bypasses.pop();
-        }
-        Ok(())
-    }
     pub fn has_tunnel_policies(&self) -> bool {
         self.policies.keys().any(|key| key.if_id != 0)
     }
+}
+
+fn is_missing(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct MemoryHandle {
+        index: u64,
+        id: Option<PolicyKey>,
+    }
+    impl PolicyHandle for MemoryHandle {
+        fn id(&self) -> Option<&PolicyKey> {
+            self.id.as_ref()
+        }
+    }
     #[derive(Default)]
     struct MemoryKernel {
-        installed: HashMap<PolicyKey, ObservedPolicy<u64>>,
+        installed: HashMap<PolicyKey, ObservedPolicy<MemoryHandle>>,
         next: u64,
         writes: usize,
         lists: usize,
@@ -378,8 +371,10 @@ mod tests {
             self.installed.insert(
                 spec.id.clone(),
                 ObservedPolicy {
-                    handle: self.next,
-                    id: spec.id,
+                    handle: MemoryHandle {
+                        index: self.next,
+                        id: Some(spec.id),
+                    },
                     config: Some(spec.config),
                     last_use: 0,
                 },
@@ -388,19 +383,19 @@ mod tests {
         }
     }
     impl PolicyKernel for MemoryKernel {
-        type Handle = u64;
-        fn list(&mut self) -> io::Result<Vec<ObservedPolicy<u64>>> {
+        type Handle = MemoryHandle;
+        fn list(&mut self) -> io::Result<Vec<ObservedPolicy<MemoryHandle>>> {
             self.lists += 1;
             Ok(self.installed.values().cloned().collect())
         }
-        fn get(&mut self, handle: &u64) -> io::Result<ObservedPolicy<u64>> {
+        fn get(&mut self, id: &PolicyKey) -> io::Result<ObservedPolicy<MemoryHandle>> {
             self.installed
                 .values()
-                .find(|entry| entry.handle == *handle)
+                .find(|entry| entry.handle.id() == Some(id))
                 .cloned()
                 .ok_or_else(missing)
         }
-        fn create(&mut self, spec: &PolicySpec) -> io::Result<u64> {
+        fn create(&mut self, spec: &PolicySpec) -> io::Result<MemoryHandle> {
             if self.reject_write {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
@@ -408,29 +403,32 @@ mod tests {
                 return Err(io::Error::from_raw_os_error(libc::EEXIST));
             }
             self.writes += 1;
-            Ok(self.insert(spec.clone()))
+            let index = self.insert(spec.clone());
+            Ok(MemoryHandle {
+                index,
+                id: Some(spec.id.clone()),
+            })
         }
-        fn update(&mut self, handle: &u64, spec: &PolicySpec) -> io::Result<()> {
+        fn update(&mut self, handle: &MemoryHandle, spec: &PolicySpec) -> io::Result<()> {
             if self.reject_write {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
             let entry = self
                 .installed
                 .values_mut()
-                .find(|entry| entry.handle == *handle)
+                .find(|entry| entry.handle.index == handle.index)
                 .ok_or_else(missing)?;
-            if entry.id != spec.id {
-                return Err(invalid());
-            }
+            assert_eq!(entry.handle.id(), Some(&spec.id));
             entry.config = Some(spec.config.clone());
             self.writes += 1;
             Ok(())
         }
-        fn delete(&mut self, handle: &u64) -> io::Result<()> {
-            if self.reject_delete.contains(handle) {
+        fn delete(&mut self, handle: &MemoryHandle) -> io::Result<()> {
+            if self.reject_delete.contains(&handle.index) {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
-            self.installed.retain(|_, entry| entry.handle != *handle);
+            self.installed
+                .retain(|_, entry| entry.handle.index != handle.index);
             Ok(())
         }
     }
@@ -465,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn repairs_follow_current_ownership_and_rekey_precedence() {
+    fn repairs_follow_current_desires_and_rekey_precedence() {
         let (id, old) = fixture();
         let key = PolicyKey::new(&id).unwrap();
         let old_spec = key.spec(&old);
@@ -486,9 +484,12 @@ mod tests {
             policies.kernel.installed[&key].config.as_ref(),
             Some(&new_spec.config)
         );
-        let previous_handle = policies.kernel.installed.remove(&key).unwrap().handle;
+        let previous_handle = policies.kernel.installed.remove(&key).unwrap().handle.index;
         policies.reconcile().unwrap();
-        assert_ne!(policies.kernel.installed[&key].handle, previous_handle);
+        assert_ne!(
+            policies.kernel.installed[&key].handle.index,
+            previous_handle
+        );
         assert_eq!(
             policies.kernel.installed[&key].config.as_ref(),
             Some(&new_spec.config)
@@ -510,11 +511,7 @@ mod tests {
         policies.kernel.installed.remove(&key);
         policies.delete_policy(&id, &old).unwrap();
         policies.reconcile().unwrap();
-        assert_eq!(policies.kernel.installed.len(), 1);
-        assert_eq!(
-            policies.kernel.installed[&foreign_spec.id].config.as_ref(),
-            Some(&foreign_spec.config)
-        );
+        assert!(policies.kernel.installed.is_empty());
     }
 
     #[test]
@@ -544,30 +541,26 @@ mod tests {
     }
 
     #[test]
-    fn foreign_policies_are_not_adopted_even_with_identical_configuration() {
+    fn existing_policies_and_replacements_are_discovered_without_cached_handles() {
         let (id, data) = fixture();
         let spec = PolicySpec::new(&id, &data).unwrap();
         let mut policies = Policies::new(MemoryKernel::default());
-        let foreign = policies.kernel.insert(spec.clone());
-        assert_eq!(
-            policies
-                .add_policy(id.clone(), data.clone())
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EEXIST)
-        );
+        let previous = policies.kernel.insert(spec.clone());
+        policies.add_policy(id.clone(), data.clone()).unwrap();
         policies.reconcile().unwrap();
         assert_eq!(policies.kernel.writes, 0);
-        policies.kernel.installed.clear();
-        policies.add_policy(id, data).unwrap();
         let replacement = policies.kernel.insert(spec.clone());
-        assert_ne!(foreign, replacement);
+        assert_ne!(previous, replacement);
+        policies.reconcile().unwrap();
+        assert_eq!(policies.kernel.writes, 0);
+        policies.kernel.installed.get_mut(&spec.id).unwrap().config = None;
+        policies.reconcile().unwrap();
         assert_eq!(
-            policies.reconcile().unwrap_err().raw_os_error(),
-            Some(libc::EEXIST)
+            policies.kernel.installed[&spec.id].handle.index,
+            replacement
         );
         policies.flush_policies().unwrap();
-        assert_eq!(policies.kernel.installed[&spec.id].handle, replacement);
+        assert!(policies.kernel.installed.is_empty());
     }
 
     #[test]
@@ -591,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_desires_deletes_owned_policies_and_retains_failed_deletions() {
+    fn empty_desires_retry_failed_deletions_from_inventory() {
         let (id, data) = fixture();
         let key = PolicyKey::new(&id).unwrap();
         let mut foreign = id.clone();
@@ -601,7 +594,7 @@ mod tests {
         kernel.insert(foreign.clone());
         let mut policies = Policies::new(kernel);
         policies.add_policy(id.clone(), data.clone()).unwrap();
-        let failed = policies.owned[&key];
+        let failed = policies.kernel.installed[&key].handle.index;
         policies.kernel.reject_delete.insert(failed);
         policies.kernel.installed.get_mut(&key).unwrap().config = None;
         let mut missing = id.clone();
@@ -616,14 +609,12 @@ mod tests {
         let writes = policies.kernel.writes;
         policies.clear();
         assert!(policies.policies.is_empty() && policies.bypasses.is_empty());
-        assert_eq!(policies.owned.len(), 6, "clearing must retain ownership");
         assert_eq!(
             policies.reconcile().unwrap_err().raw_os_error(),
             Some(libc::EIO)
         );
-        assert_eq!(policies.owned.len(), 1);
-        assert_eq!(policies.owned[&key], failed);
-        assert_eq!(policies.kernel.installed.len(), 2);
+        assert_eq!(policies.kernel.installed.len(), 1);
+        assert_eq!(policies.kernel.installed[&key].handle.index, failed);
         assert_eq!(
             policies.query_policy(&id).unwrap_err().kind(),
             io::ErrorKind::NotFound
@@ -631,15 +622,62 @@ mod tests {
         policies.kernel.reject_delete.clear();
         policies.reconcile().unwrap();
         policies.reconcile().unwrap();
-        assert!(policies.owned.is_empty());
-        assert_eq!(policies.kernel.installed.len(), 1);
-        assert_eq!(
-            policies.kernel.installed[&foreign.id].config.as_ref(),
-            Some(&foreign.config)
-        );
+        assert!(policies.kernel.installed.is_empty());
         assert_eq!(
             policies.kernel.writes, writes,
             "cleanup must never recreate policies"
         );
+    }
+
+    #[test]
+    fn inventory_prunes_unidentified_duplicates_and_controller_restart_leftovers() {
+        let (id, data) = fixture();
+        let key = PolicyKey::new(&id).unwrap();
+        let mut policies = Policies::new(MemoryKernel::default());
+        policies.add_policy(id, data).unwrap();
+        let original = policies.kernel.installed[&key].handle.index;
+        let mut duplicate_key = key.clone();
+        duplicate_key.if_id = 99;
+        let mut duplicate = policies.kernel.installed[&key].clone();
+        duplicate.handle.index = 98;
+        duplicate.config = None;
+        policies
+            .kernel
+            .installed
+            .insert(duplicate_key.clone(), duplicate);
+        duplicate_key.if_id = 100;
+        let mut unidentified = policies.kernel.installed[&key].clone();
+        unidentified.handle.index = 99;
+        unidentified.handle.id = None;
+        policies
+            .kernel
+            .installed
+            .insert(duplicate_key, unidentified);
+        policies.reconcile().unwrap();
+        assert_eq!(policies.kernel.installed.len(), 1);
+        assert_eq!(policies.kernel.installed[&key].handle.index, original);
+        assert_eq!(policies.kernel.writes, 1);
+        // The next controller has no cached handles or desired state. It can
+        // still retire every leftover supplied by the backend's inventory.
+        let mut restarted = Policies::new(policies.kernel);
+        restarted.reconcile().unwrap();
+        assert!(restarted.kernel.installed.is_empty());
+    }
+
+    #[test]
+    fn flush_preserves_bypasses_and_retries_cleanup_without_restoring_tunnels() {
+        let (id, data) = fixture();
+        let key = PolicyKey::new(&id).unwrap();
+        let mut policies = Policies::new(MemoryKernel::default());
+        policies.add_policy(id, data).unwrap();
+        policies.port_bypass(libc::AF_INET as u16, 13000).unwrap();
+        let failed = policies.kernel.installed[&key].handle.index;
+        policies.kernel.reject_delete.insert(failed);
+        assert!(policies.flush_policies().is_err());
+        assert!(!policies.has_tunnel_policies());
+        policies.kernel.reject_delete.clear();
+        policies.reconcile().unwrap();
+        assert_eq!(policies.kernel.installed.len(), 2);
+        assert!(policies.kernel.installed.keys().all(|key| key.if_id == 0));
     }
 }

@@ -67,7 +67,8 @@ in
       description = ''
         Numeric Linux link group reserved for this daemon. Every interface in
         this group is owned by the backend, regardless of its interface type.
-        Independent instances in the same network namespace need distinct groups.
+        The daemon also exclusively owns all global XFRM policies in its network
+        namespace, so independent instances need separate network namespaces.
       '';
     };
     masterDevice = lib.mkOption {

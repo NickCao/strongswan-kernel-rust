@@ -115,10 +115,9 @@ impl Backend {
     pub fn shutdown(&mut self) -> io::Result<()> {
         self.policies.clear();
         let policies = self.policies.reconcile();
+        let sas = self.xfrm.flush_all_sas();
         let interfaces = self.interfaces.reconcile(&HashSet::new());
-        // SA and SPI-reservation cleanup will join this path when their
-        // ownership and reconciliation are managed by a controller too.
-        policies.and(interfaces)
+        policies.and(sas).and(interfaces)
     }
     pub fn close(&mut self) -> io::Result<()> {
         // Remove bypasses only after all tunnel objects are gone.
@@ -126,7 +125,8 @@ impl Backend {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
         self.flush_sas()?;
-        self.policies.remove_bypasses()
+        self.policies.clear();
+        self.policies.reconcile()
     }
 }
 pub fn number<T: TryFrom<i64>>(n: i64) -> io::Result<T> {

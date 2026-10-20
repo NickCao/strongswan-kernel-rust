@@ -347,19 +347,23 @@ def run(binary):
                     assert priorities[1] < priorities[0], priorities
                 for v6 in [False, True]:
                     for direction in [0,1,2]: rpc("InstallPolicy",id=policy(v6=v6,direction=direction),config=policy_config(spi=b["spi"]))
-                # Reconciliation repairs only desired policies. Exercise the
-                # real kernel inventory, including normalized bypass defaults.
+                # The entire global policy table is owned. Unsolicited policies
+                # are pruned, including identities outside the supported model.
                 foreign_policy = ["src", "203.0.113.0/24", "dst", "203.0.114.0/24",
                                   "dir", "out", "if_id", "77"]
                 ip("xfrm", "policy", "add", *foreign_policy, "priority", "1234", "action", "block")
+                ip("xfrm", "policy", "add", "src", "203.0.115.0/24", "dst", "203.0.116.0/24",
+                   "dev", "underlay", "dir", "out", "mark", "0x123", "mask", "0xfff", "if_id", "88",
+                   "priority", "1234", "action", "block")
                 def policy_specs():
                     return set(re.split(r"(?=^src )", ip("xfrm", "policy"), flags=re.M)[1:])
                 def outbound_policy():
                     return subprocess.run(["ip", "-s", "xfrm", "policy", "get",
                         "src", "0.0.0.0/0", "dst", "0.0.0.0/0", "dir", "out", "if_id", "41"],
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False).stdout
+                wait(lambda: len(policy_specs()) == 10)
                 expected = policy_specs()
-                assert len(expected) == 11, expected
+                assert all("203.0.11" not in spec for spec in expected), expected
                 # Suppress background traffic before XFRM, so an SA's replay
                 # counters cannot advance during comparison.
                 subprocess.run(["tc", "qdisc", "add", "dev", "ranet00000029", "clsact"], check=True)
@@ -392,9 +396,7 @@ def run(binary):
                     rpc("RemovePolicy",id=policy(),config=replacement)
                 wait(lambda: policy_specs() == expected)
                 ip("xfrm", "policy", "flush")
-                # The admin also flushed the foreign policy; it is not ours
-                # to recreate. Restore all six tunnel and four bypass policies.
-                expected = {spec for spec in expected if "if_id 0x4d" not in spec}
+                # Restore all six desired tunnel and four bypass policies.
                 wait(lambda: policy_specs() == expected)
                 assert len(expected) == 10
                 assert states() == original_states, "policy repair must not modify SAs"
@@ -406,7 +408,7 @@ def run(binary):
                 assert [l["ifname"] for l in links()] == ["foreign"], "policies must not keep interfaces alive"
                 ip("xfrm", "policy", "delete", "src", "0.0.0.0/0", "dst", "0.0.0.0/0", "dir", "out", "if_id", "41")
                 rpc("FlushPolicies")
-                # Flush only session tunnel policies: port bypass must survive.
+                # Flush tunnel desires and reconcile the table; bypasses survive.
                 assert "priority 32" in ip("xfrm","policy")
                 after_flush = policy_specs()
                 time.sleep(5.3)
@@ -492,7 +494,6 @@ def run(binary):
     foreign_policy = ["src", "203.0.113.0/24", "dst", "203.0.114.0/24",
                       "dir", "out", "if_id", "77"]
     ip("xfrm", "policy", "add", *foreign_policy, "priority", "1234", "action", "block")
-    expected_policies = ip("xfrm", "policy")
     for attempt, (signum, disconnect) in enumerate([
         (signal.SIGTERM, False), (signal.SIGINT, False), (signal.SIGTERM, True),
     ]):
@@ -510,6 +511,7 @@ def run(binary):
                         assert "error" not in reply, reply
                         return reply.get("parameters", {})
                     call("OpenSession", interfacesUse="", interfacesIgnore="")
+                    assert not ip("xfrm", "policy").strip(), "session startup must remove old policies"
                     owned = sa_id(spi=0x40000 + attempt, interface=61 + attempt)
                     call("InstallSa", id=owned, config=sa_config())
                     allocated = call("AllocateSpi", src=owned["src"], dst=owned["dst"],
@@ -526,18 +528,16 @@ def run(binary):
                         id=policy(interface=owned["interfaceId"], v6=True),
                         config=policy_config(spi=owned["spi"])))
                     assert len(links()) == 2
-                    before_sas = states()
+                    assert f"{allocated:08x}" in states() and f"{owned['spi']:08x}" in states()
                     if disconnect:
                         control.socket.close()
+                    ip("xfrm", "policy", "add", *foreign_policy, "priority", "1234", "action", "block")
                     daemon.send_signal(signum)
                     assert daemon.wait(timeout=10) == 0
                     idle.socket.close()
-                    assert ip("xfrm", "policy") == expected_policies
+                    assert not ip("xfrm", "policy").strip()
                     assert [link["ifname"] for link in links()] == ["foreign"]
-                    assert states() == before_sas, "shutdown must leave SAs and SPI reservations unchanged"
-                    for spi in [owned["spi"], allocated]:
-                        ip("xfrm", "state", "delete", "src", owned["src"]["address"],
-                           "dst", owned["dst"]["address"], "proto", "esp", "spi", spi)
+                    assert not states().strip(), "shutdown must flush SAs and SPI reservations"
                 except BaseException:
                     log.seek(0); print(log.read(), file=sys.stderr); raise
                 finally:
@@ -545,8 +545,70 @@ def run(binary):
                         control.socket.close()
                     if daemon.poll() is None:
                         daemon.kill(); daemon.wait()
-    ip("xfrm", "policy", "delete", *foreign_policy)
-    print("PASS: SIGTERM/SIGINT reconcile policies and interfaces to empty with active or disconnected clients, preserve foreign objects, and leave SAs and SPI reservations unchanged")
+    print("PASS: SIGTERM/SIGINT clear all global policies, SAs, SPI reservations and owned interfaces with active or disconnected clients, preserving foreign interfaces")
+
+    for clean_close in [False, True]:
+        with tempfile.TemporaryDirectory(prefix="kernel-rust-idle-shutdown-") as d:
+            path = str(Path(d) / "kernel.sock")
+            with open(Path(d) / "daemon.log", "w+") as log:
+                daemon = subprocess.Popen([binary, "--socket", path], stdout=log, stderr=log)
+                try:
+                    wait(lambda: Path(path).exists() or daemon.poll() is not None)
+                    assert daemon.poll() is None
+                    if clean_close:
+                        control = Varlink(path)
+                        assert "error" not in control.call("OpenSession", dict(interfacesUse="", interfacesIgnore=""))
+                        assert "error" not in control.call("CloseSession")
+                        control.socket.close()
+                    # Cleanup must cover untracked kernel objects even if no
+                    # session exists, or the last session already closed.
+                    ip("xfrm", "state", "add", "src", "192.0.2.10", "dst", "192.0.2.11",
+                       "proto", "esp", "spi", "0xbbbb", "mode", "tunnel", "aead",
+                       "rfc4106(gcm(aes))", "0x" + "00" * 20, "128")
+                    ip("xfrm", "policy", "add", *foreign_policy, "action", "block")
+                    ip("link", "add", "ranet00000063", "type", "xfrm", "if_id", "99")
+                    ip("link", "set", "ranet00000063", "group", "17227")
+                    assert states().strip() and len(links()) == 2
+                    daemon.terminate(); assert daemon.wait(timeout=10) == 0
+                    assert not states().strip() and not ip("xfrm", "policy").strip()
+                    assert [link["ifname"] for link in links()] == ["foreign"]
+                except BaseException:
+                    log.seek(0); print(log.read(), file=sys.stderr); raise
+                finally:
+                    if daemon.poll() is None:
+                        daemon.kill(); daemon.wait()
+    print("PASS: orderly shutdown cleans namespace-owned state with no session or after a clean session close")
+
+    # Policy ownership is the whole global table, so no journal or handle cache
+    # is needed to retire policies after a daemon crash and a fresh session.
+    with tempfile.TemporaryDirectory(prefix="kernel-rust-policy-restart-") as d:
+        for attempt in range(2):
+            path = str(Path(d) / f"kernel-{attempt}.sock")
+            with open(Path(d) / f"daemon-{attempt}.log", "w+") as log:
+                daemon = subprocess.Popen([binary, "--socket", path], stdout=log, stderr=log)
+                control = None
+                try:
+                    wait(lambda: Path(path).exists() or daemon.poll() is not None)
+                    assert daemon.poll() is None
+                    control = Varlink(path)
+                    assert "error" not in control.call("OpenSession", dict(interfacesUse="", interfacesIgnore=""))
+                    assert not ip("xfrm", "policy").strip()
+                    if attempt == 0:
+                        assert "error" not in control.call("InstallPolicy", dict(id=policy(), config=policy_config()))
+                        assert "error" not in control.call("BypassPort", dict(family=socket.AF_INET, port=13000))
+                        daemon.kill(); daemon.wait(timeout=5)
+                        assert ip("xfrm", "policy").strip(), "SIGKILL must leave policies to discover"
+                    else:
+                        assert "error" not in control.call("CloseSession")
+                        daemon.terminate(); assert daemon.wait(timeout=5) == 0
+                except BaseException:
+                    log.seek(0); print(log.read(), file=sys.stderr); raise
+                finally:
+                    if control:
+                        control.socket.close()
+                    if daemon.poll() is None:
+                        daemon.kill(); daemon.wait()
+    print("PASS: fresh sessions retire all global policy leftovers after daemon SIGKILL without persisted ownership records")
 
     # Group membership survives daemon crashes. Reuse recognizable interfaces,
     # remove every unwanted owned kind, and preserve interfaces in other groups.
@@ -621,9 +683,7 @@ def run(binary):
                 assert any(link["ifname"] == "resume00000048" for link in inventory())
                 assert any(link["ifname"] == "foreign" for link in links())
                 daemon.terminate(); assert daemon.wait(timeout=5) == 0
-                for sa in [first, second, third]:
-                    ip("xfrm", "state", "delete", "src", sa["src"]["address"],
-                       "dst", sa["dst"]["address"], "proto", "esp", "spi", sa["spi"])
+                assert not states().strip(), "orderly shutdown must also flush SAs left by previous crashes"
                 ip("link", "del", "resume00000048")
             except BaseException:
                 log.seek(0); print(log.read(), file=sys.stderr); raise

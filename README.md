@@ -9,6 +9,13 @@ netlink backend. Netlink transport uses `neli`; typed network and XFRM payloads
 use `netlink-packet-route` and `netlink-packet-xfrm`. The canonical API is
 [io.ranet.Kernel.varlink](io.ranet.Kernel.varlink).
 
+The daemon exclusively owns **all global XFRM policies in its network
+namespace**, including policies for other transform protocols. Every policy
+absent from desired state is removed. Run other policy managers in a separate
+network namespace. Orderly daemon shutdown also flushes the namespace's entire
+XFRM state table, including larval SPI reservations, so SA management is also
+exclusive to the daemon. Per-socket policies remain owned by their sockets.
+
 The scope follows [ranet's VICI configuration](https://github.com/NickCao/ranet/blob/b0e52359f7c5816263f83cd5f12065945c5e4eaa/src/vici.rs):
 tunnel-mode ESP, nonzero XFRM interface IDs, forced UDP encapsulation, high
 IKE ports, IPv4/IPv6 selectors, SA output marks, statistics, expiry events,
@@ -38,9 +45,9 @@ interfaces; `--interface-group` selects a different nonzero numeric group.
 Every interface in that group is owned, regardless of its native type or name.
 Group membership selects the interfaces returned by the ownership inventory.
 It persists across daemon restarts and needs no entry in iproute2's group names file.
-Independent daemon instances in one network namespace must reserve distinct
-groups. `--ifname-prefix` and `--mtu` change the naming prefix and MTU. Interfaces
-have multicast enabled. `--master-device NAME` attaches them to an existing
+Independent daemon instances require separate network namespaces because each
+owns its global policy table. `--ifname-prefix` and `--mtu` change the naming
+prefix and MTU. Interfaces have multicast enabled. `--master-device NAME` attaches them to an existing
 master, such as a VRF, before installing the first SA. Without this option,
 the standalone daemon leaves them unattached. The master remains owned by
 the network configuration and is never created or deleted by the daemon.
@@ -433,23 +440,28 @@ connection.
 The daemon serves one charon session at a time. An independently authenticated
 second connection from the same PID/UID carries Varlink streaming events.
 A clean close requires all tunnel SAs/policies removed, cleans larval SPI
-reservations and IKE bypass policies, and permits a new session. Flushes are
-restricted to session-owned objects; flushing tunnel policies preserves IKE
-port bypasses until close.
+reservations and all remaining global policies, and permits a new session.
+The `FlushSas` RPC remains restricted to session-owned objects. Flushing tunnel policies
+clears their desired references and reconciles the whole policy table,
+preserving desired IKE port bypasses until close. Opening a new session first
+reconciles global policies against an empty desired set, removing leftovers
+from previous daemon runs before accepting new policy requests.
 
 On SIGTERM or SIGINT, the daemon stops accepting requests and disables session
 mutations and repairs. It clears desired policies, including IKE bypasses, and
 runs a final policy and interface reconciliation against empty desired sets.
-Policy ownership handles are retained until deletion succeeds; interface
-ownership is discovered from the configured link group. Unrelated objects
-remain untouched and failed deletions can be retried. Cleanup runs explicitly
-before exit; errors are reported and cause a nonzero exit status. Signals are
+It also flushes the entire XFRM state table, including untracked SAs and larval
+SPI reservations. This is shutdown cleanup; periodic SA reconciliation remains
+unimplemented. Cleanup also runs if no session opened or the last one closed.
+Policy ownership covers the entire global table; interface ownership is
+discovered from the configured link group. Interfaces outside that group remain
+untouched. Failed deletions remain discoverable for retries. Cleanup runs
+explicitly before exit; errors are reported and cause a nonzero exit status. Signals are
 received through `nix::sys::signalfd` in the main loop, outside signal handlers.
-SAs and larval SPI reservations are left unchanged until SA reconciliation is
-implemented. Orderly strongSwan shutdown still removes its SAs before closing
-the session. SIGKILL, aborts and daemon crashes bypass the final reconciliation.
+Orderly strongSwan shutdown normally removes its SAs before closing the session.
+SIGKILL, aborts and daemon crashes bypass shutdown cleanup.
 
-While the session is connected, missing or changed owned policies are repaired
+While the session is connected, missing or changed desired policies are repaired
 from the current desired policy records, including IKE port bypasses. Policy
 and link notifications are coalesced over 100 ms, and an audit runs every five
 seconds to catch missed notifications. An external `ip xfrm policy flush` is therefore
@@ -458,7 +470,8 @@ rewritten; kernel-assigned indices, usage counters, timestamps, attribute order
 and omitted default attributes are excluded from configuration comparisons.
 Inventory and repairs hold the same backend lock as policy installation and
 deletion, so a pending repair cannot restore an obsolete rekey template or a
-policy that strongSwan has removed. Unrelated policies are left alone.
+policy that strongSwan has removed. Unsolicited global policies are deleted,
+including native policy configurations outside the supported model.
 
 Linux implementations live under `src/linux/`: policy and interface trait
 implementations are in `policy.rs` and `interfaces.rs`, alongside the XFRM SA,
@@ -466,20 +479,28 @@ network discovery and Netlink support modules. Shared controllers, traits and
 model types remain at the top level.
 
 The policy controller in `src/policy.rs` keeps desired policies and shared
-references separate from ownership handles. It canonicalizes identities,
-selects the winning strongSwan
-`PolicyData` reference and resolves its effective priority and protection
+references without retaining a handle or ownership cache. It canonicalizes
+identities, selects the winning strongSwan `PolicyData` reference and resolves
+its effective priority and protection
 template into a `PolicySpec`. Its `PolicyKernel` trait provides
 list/get/create/update/delete operations with opaque handles and normalized
 `ObservedPolicy` values. The controller compares observed configuration and
-decides repairs; `get` reads one policy's usage without dumping the table.
-`LinuxPolicies` implements CRUD and translates typed XFRM messages. Native
-configuration outside the supported model is reported as unrepresentable, so
-the controller can repair changed policies it owns. Linux policy handles use
-selectors, direction, mark and XFRM interface ID; a replacement reusing that
-identity is indistinguishable from a changed owned policy. Another device
-backend can reuse the controller without implementing reconciliation or
-strongSwan reference selection.
+decides repairs. Inventory returns backend-owned policies, including leftovers,
+and each handle exposes its captured logical identity through `id()`. Matching
+identities with changed or unrepresentable configuration are passed to
+`update()`; the backend chooses repair or replacement. Unidentified, duplicate
+and undesired entries are deleted. `get` looks up one logical identity directly,
+including its usage and fresh handle, so requests do not dump the table.
+`LinuxPolicies` implements CRUD and translates typed XFRM messages. It lists all
+global policies, including native selectors, security contexts and policy types
+outside our supported configuration model. These remain visible for cleanup.
+Linux handles use the kernel policy index as their native key and capture the
+logical identity when representable. XFRM additionally requires mark, interface
+ID and policy type qualifiers for index lookups; these stay private to the
+backend. Updates inspect the current native object and replace it when Linux
+cannot update it in place. No index ranges or other ownership markers are used.
+Another device backend can reuse the controller without implementing
+reconciliation or strongSwan reference selection.
 
 The interface controller in `src/interfaces.rs` derives desired interfaces from
 the current SA ownership records, grouped by interface ID. `InterfaceSpec`
@@ -547,10 +568,10 @@ If charon or its event connection disappears unexpectedly, installed tunnel
 objects are preserved and replacement sessions are rejected. Hard expiry
 still releases the last SA's interface. Interface ownership survives daemon
 restarts through the reserved group: a new session can reuse recognizable links
-or remove leftovers through reconciliation. This does not recover desired SAs
-or established IKE sessions. Policy and SA ownership persistence and automatic
-full restart recovery are not implemented. Endpoint
-or encapsulation migration requires reestablishing the SAs. This
+or remove leftovers through reconciliation. Global policy leftovers are removed
+when a new session opens. This does not recover desired SAs or established IKE
+sessions. Automatic full restart recovery is not implemented. Endpoint or
+encapsulation migration requires reestablishing the SAs. This
 is an experimental backend with a coordinated restart requirement: stop
 protected traffic before removing leftover objects and restarting the pair.
 Routes through deleted interfaces disappear with the links.
@@ -558,24 +579,22 @@ Routes through deleted interfaces disappear with the links.
 Full crash recovery is deferred. Proposed follow-up work is:
 
 - If charon crashes while the daemon survives, retire the failed session,
-  stop its repairs, and remove its owned SAs, policies, larval SPI
-  reservations, IKE bypasses and interfaces. Accept a replacement session
-  only after cleanup succeeds. Extend the final shutdown reconciliation to
-  SAs and SPI reservations once they have a reconciliation controller.
+  stop its repairs, and remove the namespace's SAs, policies and larval SPI
+  reservations along with daemon-owned interfaces. Accept a replacement session
+  only after cleanup succeeds. Once an SA reconciliation controller exists,
+  use it for shutdown cleanup in place of the direct state-table flush.
 - If the daemon crashes, systemd already stops charon, but the kernel objects
-  can outlive both processes. Interface ownership is already marked by group;
-  SA, policy and SPI-reservation recovery still needs ownership information that
-  survives a daemon restart, such as a journal of object identities and
-  pending mutations, without encryption keys. Its storage must survive
-  service cleanup and DynamicUser changes. Startup would resolve interrupted
-  operations and remove recorded leftovers before accepting a new session;
-  ambiguous ownership must not cause unrelated objects to be deleted.
+  can outlive both processes. Interfaces are discoverable by group, and all
+  global policies are owned and retired at session startup. SA and
+  SPI-reservation leftovers still need cleanup at startup before accepting a
+  replacement session; currently the full state-table flush runs only on
+  orderly daemon shutdown.
 - Reload connection configuration and negotiate fresh IKE/CHILD_SAs after
   cleanup. Preserving established SAs across crashes is outside this proposal.
 
 Verification should kill charon and the daemon separately with active tunnels,
 then check cleanup, successful tunnel reestablishment, and preservation of
-unrelated kernel objects. Interrupted cleanup and journal operations also need
+interfaces outside the reserved group. Interrupted cleanup and recovery also need
 coverage before automatic daemon-crash recovery is enabled.
 
 ## Verification
@@ -590,9 +609,9 @@ network namespaces and leave the caller's network namespace untouched:
 
 ```sh
 unshare --net -- python3 tests/integration.py target/release/charon-kernel-daemon
-# Direct backend checks, including mutations through an index reused by the kernel:
+# Direct backend checks, including mutations through reused native indices:
 unshare --net -- cargo test --locked -p charon-kernel-daemon \
-    linux::interfaces::tests::mutations_target_the_current_interface_at_the_handle_index -- --ignored
+    linux:: -- --ignored
 unshare --net -- python3 tests/plugin.py /tmp/strongswan-install
 unshare --net -- python3 tests/tunnel.py /tmp/strongswan-install \
     --vici-python /path/to/strongswan/src/libcharon/plugins/vici/python
@@ -607,7 +626,8 @@ The RPC test checks socket group permissions and a rejected nonmember,
 standard introspection (also with varlinkctl when installed), a
 capability-free client, address scope/type filtering, multihomed source
 selection and egress-interface exclusions, ICMP policy priorities, policy
-deletion/modification/flush repair, interface recreation and settings repair,
+deletion/modification/flush repair, unsolicited global policy cleanup, policy
+cleanup after daemon SIGKILL, interface recreation and settings repair,
 index reuse and ownership conflicts, numeric group ownership across native link
 types, crash inventory reuse and cleanup, native if_id drift independent of
 logical identity, preservation of unmanaged settings, rekey references and teardown, validation,
