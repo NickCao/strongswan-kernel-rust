@@ -278,6 +278,13 @@ in
             )
             assert "kernel-rust" in controller
 
+    with subtest("kernel RPC contracts in an isolated network namespace"):
+        daemon = left.succeed("command -v charon-kernel-daemon").strip()
+        bypasses = left.succeed("ip xfrm policy list nosock")
+        left.succeed("unshare --net python3 ${../tests/integration.py} " + daemon)
+        assert not links(left) and not spis(left)
+        assert left.succeed("ip xfrm policy list nosock") == bypasses
+
     with subtest("VICI stays responsive with 200 connections and continuous route updates"):
         left.succeed(
             "PYTHONPATH=${pkgs.strongswan.src}/src/libcharon/plugins/vici/python "

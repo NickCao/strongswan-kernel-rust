@@ -570,24 +570,16 @@ impl Xfrm {
             if_id: id.if_id,
         })
     }
-    fn priorities(id: &PolicyId, data: &PolicyData) -> (u32, u32) {
-        let (_, sp) = id.src.subnet();
-        let (_, dp) = id.dst.subnet();
-        let (_, sm) = id.src.ports();
-        let (_, dm) = id.dst.ports();
+    fn priorities(key: &PolicyKey, data: &PolicyData) -> (u32, u32) {
         let base = match data.prio {
             0 => 200000,
             3 => 600000,
             _ => 400000,
         };
         let auto = base
-            - (sp as u32 + dp as u32) * 512
-            - if id.src.proto | id.dst.proto != 0 {
-                256
-            } else {
-                0
-            }
-            - (sm.count_ones() + dm.count_ones()) * 4
+            - (key.src.prefix_len() as u32 + key.dst.prefix_len() as u32) * 512
+            - if key.protocol != 0 { 256 } else { 0 }
+            - (key.src_port_mask.count_ones() + key.dst_port_mask.count_ones()) * 4
             - u32::from(data.prio != 2);
         (
             if data.manual_prio == 0 {
@@ -601,7 +593,7 @@ impl Xfrm {
     fn policy_message(id: &PolicyId, data: &PolicyData, update: bool) -> io::Result<Message> {
         let info = packet::UserPolicyInfo {
             selector: selector(&id.src, &id.dst, "")?,
-            priority: Self::priorities(id, data).0,
+            priority: Self::priorities(&Self::policy_key(id)?, data).0,
             direction: id.dir,
             action: u8::from(data.kind == 3),
             ..Default::default()
@@ -645,11 +637,11 @@ impl Xfrm {
         let key = Self::policy_key(&id)?;
         let current = self.policies.get(&key);
         let mut uses = current.map(|p| p.used_by.clone()).unwrap_or_default();
-        let priority = Self::priorities(&id, &data);
+        let priority = Self::priorities(&key, &data);
         let pos = uses
             .iter()
             .position(|p| {
-                let existing = Self::priorities(&id, p);
+                let existing = Self::priorities(&key, p);
                 existing > priority || (existing == priority && (p.reqid == 0 || data.reqid != 0))
             })
             .unwrap_or(uses.len());
@@ -677,6 +669,15 @@ impl Xfrm {
             &XfrmMessage::DeletePolicy(Self::policy_id(id)?),
         ))
     }
+    fn remove_kernel_policy(&self, id: &PolicyId) -> io::Result<()> {
+        match self.socket.ack(&Self::delete_policy_message(id)?) {
+            Ok(()) => Ok(()),
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub fn delete_policy(&mut self, id: &PolicyId, data: &PolicyData) -> io::Result<()> {
         let key = Self::policy_key(id)?;
         let state = self.policies.get(&key).ok_or_else(missing)?;
@@ -684,11 +685,7 @@ impl Xfrm {
         let pos = uses.iter().position(|p| p == data).ok_or_else(missing)?;
         uses.remove(pos);
         if uses.is_empty() {
-            match self.socket.ack(&Self::delete_policy_message(&state.id)?) {
-                Ok(()) => (),
-                Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => (),
-                Err(e) => return Err(e),
-            }
+            self.remove_kernel_policy(&state.id)?;
             self.policies.remove(&key);
         } else {
             if pos == 0 {
@@ -723,7 +720,7 @@ impl Xfrm {
             .collect();
         for key in keys {
             let state = &self.policies[&key];
-            self.socket.ack(&Self::delete_policy_message(&state.id)?)?;
+            self.remove_kernel_policy(&state.id)?;
             self.policies.remove(&key);
         }
         Ok(())
@@ -897,6 +894,45 @@ impl Xfrm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn specific_icmp_codes_outrank_type_only_policies() {
+        for (address, protocol, icmp_type) in [("0.0.0.0", 1, 3), ("::", 58, 128)] {
+            let any = Host {
+                ip: address.parse().unwrap(),
+                port: 0,
+            };
+            let mut id = PolicyId {
+                src: Ts::from_subnet(any.clone(), 0, protocol, icmp_type << 8, icmp_type << 8)
+                    .unwrap(),
+                dst: Ts::from_subnet(any.clone(), 0, 0, 0, u16::MAX).unwrap(),
+                dir: 1,
+                mark: Mark::default(),
+                if_id: 41,
+            };
+            let data = PolicyData {
+                kind: 1,
+                prio: 1,
+                manual_prio: 0,
+                src: any.clone(),
+                dst: any,
+                reqid: 42,
+                policy_count: 1,
+                esp: Some(0x10203),
+            };
+            let priority = |id: &PolicyId| {
+                let request = Xfrm::policy_message(id, &data, false).unwrap();
+                packet::policy::ModifyMessage::parse(request.payload.as_slice())
+                    .unwrap()
+                    .user_policy_info
+                    .priority
+            };
+            let broad = priority(&id);
+            id.src.from_port += 1;
+            id.src.to_port += 1;
+            assert!(priority(&id) < broad, "ICMP code must increase specificity");
+        }
+    }
 
     #[test]
     fn policy_keys_follow_canonical_kernel_selectors() {

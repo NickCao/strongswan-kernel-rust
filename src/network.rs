@@ -15,6 +15,12 @@ use netlink_packet_route::{
 };
 use std::{io, sync::Arc};
 
+// kernel_address_type_t: DOWN and IGNORED permit additional interfaces;
+// REGULAR still selects their non-virtual addresses.
+const ADDR_TYPE_REGULAR: u32 = 1 << 0;
+const ADDR_TYPE_DOWN: u32 = 1 << 1;
+const ADDR_TYPE_IGNORED: u32 = 1 << 2;
+
 #[derive(Clone, Debug)]
 pub struct Link {
     pub index: u32,
@@ -184,6 +190,9 @@ impl Network {
         Ok(out)
     }
     pub fn enumerate(&mut self, which: u32) -> io::Result<Vec<Host>> {
+        if which & ADDR_TYPE_REGULAR == 0 {
+            return Ok(Vec::new());
+        }
         let snapshot = self.snapshot()?;
         Ok(snapshot
             .addresses
@@ -193,7 +202,9 @@ impl Network {
                     return false;
                 };
                 if link.xfrm.is_some()
-                    || a.scope >= u8::from(AddressScope::Host)
+                    || a.scope >= u8::from(AddressScope::Link)
+                    || a.host.ip.is_loopback()
+                    || a.host.is_link_local()
                     || a.flags.intersects(
                         AddressFlags::Dadfailed
                             | AddressFlags::Deprecated
@@ -202,14 +213,8 @@ impl Network {
                 {
                     return false;
                 }
-                let class = if !self.config.usable(&link.name) {
-                    4
-                } else if !link.flags.contains(LinkFlags::Up) {
-                    2
-                } else {
-                    1
-                };
-                which & class != 0
+                (self.config.usable(&link.name) || which & ADDR_TYPE_IGNORED != 0)
+                    && (link.flags.contains(LinkFlags::Up) || which & ADDR_TYPE_DOWN != 0)
             })
             .map(|a| a.host.clone())
             .collect())
@@ -239,17 +244,19 @@ impl Network {
         let snapshot = self.snapshot()?;
         for a in &snapshot.addresses {
             if a.host.ip == host.ip {
-                if let Some(link) = snapshot.links.iter().find(|l| {
-                    l.index == a.index
-                        && l.flags.contains(LinkFlags::Up)
-                        && l.xfrm.is_none()
-                        && self.config.usable(&l.name)
-                }) {
+                if let Some(link) = snapshot
+                    .links
+                    .iter()
+                    .find(|l| l.index == a.index && self.usable_link(l))
+                {
                     return Ok(link.name.clone());
                 }
             }
         }
         Err(absent())
+    }
+    fn usable_link(&self, link: &Link) -> bool {
+        link.flags.contains(LinkFlags::Up) && link.xfrm.is_none() && self.config.usable(&link.name)
     }
     pub fn lookup(
         &mut self,
@@ -304,37 +311,41 @@ impl Network {
         let link = snapshot
             .links
             .iter()
-            .find(|l| {
-                l.index == index
-                    && l.flags.contains(LinkFlags::Up)
-                    && l.xfrm.is_none()
-                    && self.config.usable(&l.name)
-            })
+            .find(|l| l.index == index && self.usable_link(l))
             .ok_or_else(unreachable)?;
         let valid = |a: &&AddressEntry| {
             a.host.family() == family
                 && !a.flags.intersects(
                     AddressFlags::Dadfailed | AddressFlags::Deprecated | AddressFlags::Tentative,
                 )
+                && snapshot
+                    .links
+                    .iter()
+                    .any(|l| l.index == a.index && self.usable_link(l))
         };
-        let source = if let Some(src) = src {
+        // Both a caller-supplied source and the FIB's preferred source must
+        // belong to an eligible underlay interface, even when the egress does.
+        let source = if let Some(source) = src.or(source.as_ref()) {
             if !snapshot
                 .addresses
                 .iter()
                 .filter(valid)
-                .any(|a| a.host.ip == src.ip)
+                .any(|a| a.host.ip == source.ip)
             {
                 return Err(unreachable());
             }
-            src.clone()
-        } else if let Some(source) = source {
-            source
+            source.clone()
         } else {
             snapshot
                 .addresses
                 .iter()
                 .filter(valid)
-                .find(|a| a.index == index && a.scope < u8::from(AddressScope::Host))
+                .find(|a| {
+                    a.index == index
+                        && a.scope < u8::from(AddressScope::Link)
+                        && !a.host.ip.is_loopback()
+                        && !a.host.is_link_local()
+                })
                 .ok_or_else(unreachable)?
                 .host
                 .clone()

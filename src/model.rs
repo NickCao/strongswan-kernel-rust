@@ -39,6 +39,12 @@ impl Host {
             port: 0,
         }
     }
+    pub fn is_link_local(&self) -> bool {
+        match self.ip {
+            IpAddr::V4(ip) => ip.is_link_local(),
+            IpAddr::V6(ip) => ip.is_unicast_link_local(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

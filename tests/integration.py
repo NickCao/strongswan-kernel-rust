@@ -3,8 +3,10 @@
 """Real Varlink/XFRM lifecycle tests. Run in a disposable network namespace."""
 import copy
 import errno
+import ipaddress
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import socket
@@ -103,6 +105,10 @@ def run(binary):
     ip("link", "set", "underlay", "up")
     ip("addr", "add", "192.0.2.1/24", "dev", "underlay")
     ip("-6", "addr", "add", "2001:db8:1::1/64", "dev", "underlay", "nodad")
+    ip("-6", "addr", "add", "fe80::123/64", "dev", "underlay", "nodad")
+    ip("addr", "add", "169.254.1.1/16", "dev", "underlay")
+    ip("link", "add", "spare", "type", "dummy")
+    ip("addr", "add", "198.18.1.1/24", "dev", "spare")
     ip("link", "add", "foreign", "type", "xfrm", "if_id", 77)
     ip("link", "set", "foreign", "up")
     overlay_addresses = ["198.51.100.1", "2001:db8:77::1"]
@@ -168,6 +174,16 @@ def run(binary):
                 addresses = {a["address"] for a in rpc("ListAddresses", which=1)["addresses"]}
                 assert {"192.0.2.1", "2001:db8:1::1"} <= addresses, addresses
                 assert addresses.isdisjoint(overlay_addresses), addresses
+                assert not any(ipaddress.ip_address(address).is_link_local for address in addresses), addresses
+                assert "198.18.1.1" not in addresses, addresses
+                assert "198.18.1.1" in {a["address"] for a in rpc("ListAddresses", which=3)["addresses"]}
+                for address in overlay_addresses:
+                    destination = "2001:db8:2::2" if ":" in address else "203.0.113.2"
+                    failure("GetSourceAddress", errno.ENETUNREACH,
+                            destination=endpoint(destination), source=endpoint(address))
+                ip("route", "add", "198.19.0.2/32", "via", "192.0.2.254", "dev", "underlay", "src", overlay_addresses[0])
+                failure("GetSourceAddress", errno.ENETUNREACH, destination=endpoint("198.19.0.2"))
+                ip("route", "del", "198.19.0.2/32")
                 assert all(s["interface"] != "foreign" for s in rpc("ListSubnets")["subnets"])
                 ip("route", "add", "192.0.2.2/32", "dev", "foreign")
                 failure("GetSourceAddress", errno.ENETUNREACH, destination=endpoint("192.0.2.2"))
@@ -230,6 +246,24 @@ def run(binary):
                         assert selector["protocol"] == 17 and selector["fromPort"] == selector["toPort"] == port, acquire
                     ip(*flags, "route", "del", destination)
                     rpc("RemovePolicy",id=trap,config=config)
+                # A specific ICMP code must outrank the type-only policy.
+                for v6, protocol, icmp_type in [(False, 1, 3), (True, 58, 128)]:
+                    priorities = []
+                    for code in [0, 1]:
+                        icmp = policy(v6=v6)
+                        icmp["src"].update(protocol=protocol, fromPort=icmp_type << 8 | code,
+                                           toPort=icmp_type << 8 | code)
+                        config = policy_config(spi=b["spi"])
+                        rpc("InstallPolicy",id=icmp,config=config)
+                        args = ["src", "::/0" if v6 else "0.0.0.0/0",
+                                "dst", "::/0" if v6 else "0.0.0.0/0",
+                                "proto", str(protocol), "type", str(icmp_type)]
+                        if code:
+                            args += ["code", str(code)]
+                        installed = ip("xfrm", "policy", "get", *args, "dir", "out", "if_id", "41")
+                        priorities.append(int(re.search(r"priority (\d+)", installed)[1]))
+                        rpc("RemovePolicy",id=icmp,config=config)
+                    assert priorities[1] < priorities[0], priorities
                 for v6 in [False, True]:
                     for direction in [0,1,2]: rpc("InstallPolicy",id=policy(v6=v6,direction=direction),config=policy_config(spi=b["spi"]))
                 unused = rpc("QuerySa",id=b)
@@ -238,6 +272,7 @@ def run(binary):
                 failure("CloseSession",errno.EBUSY)
                 rpc("RemoveSa",id=b)
                 assert [l["ifname"] for l in links()] == ["foreign"], "policies must not keep interfaces alive"
+                ip("xfrm", "policy", "delete", "src", "0.0.0.0/0", "dst", "0.0.0.0/0", "dir", "out", "if_id", "41")
                 rpc("FlushPolicies")
                 # Flush only session tunnel policies: port bypass must survive.
                 assert "priority 32" in ip("xfrm","policy")
@@ -263,6 +298,20 @@ def run(binary):
                 assert "error" not in excluded.call("OpenSession",dict(interfacesUse="",interfacesIgnore="underlay"))
                 assert excluded.call("GetSourceAddress",dict(destination=endpoint("203.0.113.2")))["parameters"]["errno"] == errno.ENETUNREACH
                 assert "error" not in excluded.call("CloseSession"); excluded.socket.close()
+                filtered = Varlink(path)
+                assert "error" not in filtered.call("OpenSession",dict(interfacesUse="",interfacesIgnore="spare"))
+                def listed(which):
+                    return {a["address"] for a in filtered.call("ListAddresses",dict(which=which))["parameters"]["addresses"]}
+                # DOWN/IGNORED modify REGULAR; they are not address classes.
+                assert listed(4) == set()
+                assert "198.18.1.1" not in listed(5)
+                assert "198.18.1.1" in listed(7)
+                ip("link", "set", "spare", "up")
+                wait(lambda: "198.18.1.1" in listed(5))
+                assert filtered.call("GetSourceAddress",dict(destination=endpoint("203.0.113.2"),source=endpoint("198.18.1.1")))["parameters"]["errno"] == errno.ENETUNREACH
+                ip("link", "set", "spare", "down")
+                wait(lambda: "198.18.1.1" not in listed(5))
+                assert "error" not in filtered.call("CloseSession"); filtered.socket.close()
                 # Losing charon preserves active kernel objects, while the
                 # daemon still cleans an interface when its last SA expires.
                 lost = Varlink(path); assert "error" not in lost.call("OpenSession",dict(interfacesUse="",interfacesIgnore=""))
@@ -273,7 +322,7 @@ def run(binary):
                 assert probe.call("OpenSession",dict(interfacesUse="",interfacesIgnore=""))["error"].endswith("SessionBusy")
                 probe.socket.close()
                 wait(lambda: [l["ifname"] for l in links()] == ["foreign"])
-                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, update-to-add retry, IPv4/IPv6 acquire events, rollback, foreign objects, larval SPI, hard expiry, scoped cleanup and disconnected-client expiry")
+                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, address scope/type filtering, source-interface exclusions, ICMP policy priorities, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, update-to-add retry, IPv4/IPv6 acquire events, rollback, foreign objects, larval SPI, hard expiry, scoped cleanup including missing policies, and disconnected-client expiry")
             except BaseException:
                 log.seek(0); print(log.read(),file=sys.stderr); raise
             finally:
