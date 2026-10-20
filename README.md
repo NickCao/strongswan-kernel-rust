@@ -442,6 +442,11 @@ Inventory and repairs hold the same backend lock as policy installation and
 deletion, so a pending repair cannot restore an obsolete rekey template or a
 policy that strongSwan has removed. Unrelated policies are left alone.
 
+Linux implementations live under `src/linux/`: policy and interface trait
+implementations are in `policy.rs` and `interfaces.rs`, alongside the XFRM SA,
+network discovery and Netlink support modules. Shared controllers, traits and
+model types remain at the top level.
+
 The policy controller in `src/policy.rs` owns desired policies and shared
 references. Its `PolicyKernel` trait abstracts inventory, configuration
 comparison, writes, deletion and usage queries. `LinuxPolicies` implements

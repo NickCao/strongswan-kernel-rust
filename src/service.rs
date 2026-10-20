@@ -2,7 +2,7 @@
 use crate::{
     backend::{self, Backend},
     error::invalid,
-    netlink::{Netlink, NlFamily, Notifications},
+    linux::netlink::{Netlink, NlFamily, Notifications},
     rpc_api::*,
     transport,
 };

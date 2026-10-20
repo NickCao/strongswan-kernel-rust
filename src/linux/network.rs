@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Network semantics ported from kernel_netlink_net.c, Copyright secunet
 // Security Networks AG, Martin Willi, Tobias Brunner and contributors.
-use crate::{
-    error::invalid,
-    model::*,
-    netlink::{Message, Netlink, NlFamily, NlmF},
-};
+use super::netlink::{Message, Netlink, NlFamily, NlmF};
+use crate::{error::invalid, model::*};
 use netlink_packet_core::ParseableParametrized;
 use netlink_packet_route::{
     address::{AddressAttribute, AddressFlags, AddressMessage, AddressScope},

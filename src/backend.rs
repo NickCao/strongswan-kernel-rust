@@ -2,12 +2,10 @@
 use crate::{
     error::invalid,
     interfaces::Interfaces,
-    linux_interfaces::LinuxInterfaces,
+    linux::{interfaces::LinuxInterfaces, network::Network, policy::LinuxPolicies, xfrm::Xfrm},
     model::*,
-    network::Network,
     policy::Policies,
     rpc_api as rpc,
-    xfrm::{LinuxPolicies, Xfrm},
 };
 use std::{collections::HashSet, io};
 use zeroize::Zeroizing;

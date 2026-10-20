@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Linux interface CRUD; lifecycle, ownership and repair decisions live in the
 //! shared interface controller.
+use super::{
+    netlink::NlmF,
+    network::{self, Link, Network},
+};
 use crate::{
     error::invalid,
     interfaces::{InterfaceKernel, InterfaceSpec, ObservedInterface},
-    netlink::NlmF,
-    network::{self, Link, Network},
 };
 use netlink_packet_route::{
     link::{InfoData, InfoKind, InfoXfrm, LinkAttribute, LinkFlags, LinkInfo, LinkMessage},
