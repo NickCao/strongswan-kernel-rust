@@ -30,6 +30,7 @@ let
               remote_ts = 0.0.0.0/0, ::/0
               mode = tunnel
               esp_proposals = ${proposal}
+              tfc_padding = 256
               set_mark_out = 123
               rekey_time = 300s
               life_time = 600s
@@ -208,6 +209,15 @@ in
         machine.succeed(f"ip vrf exec {master} ping -c 3 -W 2 -I 10.{peer}.0.1 10.{other}.0.1")
         machine.succeed(f"ip vrf exec {master} ping -6 -c 3 -W 2 -I fd10:{peer}::1 fd10:{other}::1")
 
+    def sa_use_times(machine):
+        listing = ctl(machine, "--list-sas --raw")
+        result = {}
+        for direction in ["in", "out"]:
+            values = re.findall(rf"\buse-{direction}=(\d+)", listing)
+            assert len(values) == 1, listing
+            result[direction] = int(values[0])
+        return result
+
     start_all()
     with subtest("systemd runtime directories and least privilege"):
         for peer, machine in enumerate(machines, 1):
@@ -305,7 +315,29 @@ in
                 assert algorithm in state, state
                 assert "output-mark 0x7b" in state, state
                 assert "encap type espinudp sport 13000 dport 13000" in state, state
+                assert "tfcpad 256" in state, state
                 assert any(int(value) > 0 for value in re.findall(r"(\d+)\(packets\)", state))
+
+        with subtest(name + ": VICI SA use times age while idle and reset after traffic"):
+            # Stop background traffic before XFRM processing during the idle interval.
+            tunnels = [(machine, next(iter(current)))
+                       for machine, current in zip(machines, original_indices)]
+            for machine, interface in tunnels:
+                machine.succeed(f"tc qdisc add dev {interface} clsact")
+                machine.succeed(f"tc filter add dev {interface} egress matchall action drop")
+            recent = [sa_use_times(machine) for machine in machines]
+            assert all(0 <= value <= 10 for usage in recent for value in usage.values()), recent
+            time.sleep(3)
+            for machine, previous in zip(machines, recent):
+                idle = sa_use_times(machine)
+                assert all(2 <= idle[direction] - previous[direction] <= 10
+                           for direction in previous), (previous, idle)
+            for machine, interface in tunnels:
+                machine.succeed(f"tc qdisc del dev {interface} clsact")
+            left.succeed("ip vrf exec gravity ping -c 1 -W 2 -I 10.1.0.1 10.2.0.1")
+            for machine in machines:
+                usage = sa_use_times(machine)
+                assert all(0 <= value <= 2 for value in usage.values()), usage
 
         with subtest(name + ": rekey keeps interface indices and traffic working"):
             previous_spis = spis(left)

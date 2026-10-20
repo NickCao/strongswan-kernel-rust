@@ -36,6 +36,18 @@ fn missing() -> io::Error {
 fn unsupported() -> io::Error {
     io::Error::from_raw_os_error(libc::EOPNOTSUPP)
 }
+fn monotonic_use_time(time: u64) -> io::Result<u64> {
+    if time == 0 {
+        return Ok(0);
+    }
+    // XFRM reports Unix seconds; strongSwan expects CLOCK_MONOTONIC seconds.
+    let monotonic = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| invalid())?
+        .as_secs();
+    Ok((monotonic.tv_sec as u64).saturating_sub(wall.saturating_sub(time)))
+}
 fn message(flags: NlmF, value: &XfrmMessage) -> Message {
     Message::new(value.message_type(), flags, value)
 }
@@ -469,16 +481,17 @@ impl Xfrm {
     }
     pub fn query_sa(&mut self, id: &SaId) -> io::Result<(u64, u64, u64)> {
         let sa = self.read_sa(id)?;
-        let last = sa
-            .nlas
-            .iter()
-            .find_map(|attr| match attr {
+        let last = if self.lastused {
+            sa.nlas.iter().find_map(|attr| match attr {
                 Attr::LastUsed(time) => Some(*time),
                 _ => None,
             })
-            .unwrap_or(0);
+        } else {
+            None
+        }
+        .unwrap_or(0);
         let lifetime = sa.user_sa_info.lifetime_cur;
-        Ok((lifetime.bytes, lifetime.packets, last))
+        Ok((lifetime.bytes, lifetime.packets, monotonic_use_time(last)?))
     }
     fn delete_one(&mut self, id: &SaId) -> io::Result<()> {
         if !self.owned(id) {
@@ -699,16 +712,7 @@ impl Xfrm {
             .ok_or_else(missing)?;
         let policy = packet::policy::ModifyMessage::parse(reply.payload.as_slice())
             .map_err(io::Error::other)?;
-        let time = policy.user_policy_info.lifetime_cur.use_time;
-        if time == 0 {
-            return Ok(0);
-        }
-        let monotonic = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-        let wall = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| invalid())?
-            .as_secs();
-        Ok((monotonic.tv_sec as u64).saturating_sub(wall.saturating_sub(time)))
+        monotonic_use_time(policy.user_policy_info.lifetime_cur.use_time)
     }
     pub fn flush_policies(&mut self) -> io::Result<()> {
         let keys: Vec<_> = self

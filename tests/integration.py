@@ -232,8 +232,9 @@ def run(binary):
                     rpc("RemovePolicy",id=trap,config=config)
                 for v6 in [False, True]:
                     for direction in [0,1,2]: rpc("InstallPolicy",id=policy(v6=v6,direction=direction),config=policy_config(spi=b["spi"]))
-                assert rpc("QuerySa",id=b)["bytes"] == "0"
-                assert "lastUse" in rpc("QueryPolicy",id=policy())
+                unused = rpc("QuerySa",id=b)
+                assert (unused["bytes"], unused["packets"], unused["lastUse"]) == ("0", "0", 0), unused
+                assert rpc("QueryPolicy",id=policy())["lastUse"] == 0
                 failure("CloseSession",errno.EBUSY)
                 rpc("RemoveSa",id=b)
                 assert [l["ifname"] for l in links()] == ["foreign"], "policies must not keep interfaces alive"

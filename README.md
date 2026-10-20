@@ -22,6 +22,12 @@ The backend advertises `KERNEL_REQUIRE_UDP_ENCAPSULATION`, so charon forces
 ESP-in-UDP for its connections. Existing `encap=yes` configurations behave
 the same.
 
+Linux XFRM handles ESPv3 TFC padding, controlled by the CHILD_SA's
+`tfc_padding` setting (disabled by default). On Linux 6.2 and later, the
+backend also advertises `KERNEL_SA_USE_TIME`: SA queries return the last use
+time converted from the kernel's Unix timestamp to strongSwan's monotonic
+clock. Earlier kernels use strongSwan's policy-query fallback.
+
 An interface named `ranet<if_id in eight hex digits>` is created and brought
 up **before its first SA is installed**. Its default MTU is 1400. Every SA
 using that ID shares the interface, including inbound/outbound SAs and old/new
@@ -156,7 +162,8 @@ to retain its enabled plugins without maintaining a global `load` list.
 The VM check uses actual strongSwan `charon-systemd` processes with dynamic
 users and no capabilities, alongside the restricted dynamic kernel daemons.
 It checks plugin discovery from the system profile, socket authorization,
-AES-GCM and AES-CBC/HMAC, encrypted IPv4/IPv6 traffic, rekeying without
+AES-GCM and AES-CBC/HMAC, TFC padding, encrypted IPv4/IPv6 traffic,
+SA use times that age while idle and reset after traffic, rekeying without
 interface replacement, final-SA cleanup, configurable interface names/MTUs,
 default and custom VRF masters, multicast flags, VRF-routed IPv4/IPv6 traffic,
 VICI responsiveness with 200 connections and continuous BGP-style route updates,
