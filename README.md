@@ -379,10 +379,11 @@ Route/link/address notifications are coalesced over 100 ms, retaining whether
 addresses changed, so routing updates do not queue a roaming job for every
 route. SA expiry, acquisition, and mapping events are delivered immediately.
 Host route lookups query the kernel FIB directly and honor its routing policy.
-A route through an excluded or XFRM interface is rejected, as is a source
-address on one of these interfaces, including a preferred source supplied by
-the kernel FIB. Discovered IKE addresses exclude link-local addresses and
-include down or ignored interfaces only when explicitly requested.
+A route through an excluded or XFRM interface is rejected. A caller-supplied
+or FIB-selected source address may belong to another interface, including one
+excluded from discovery; a successful route lookup is authoritative.
+Discovered IKE addresses exclude link-local addresses and include down or
+ignored interfaces only when explicitly requested.
 Subnet nexthop queries for route installation are unsupported.
 Interface/address discovery is cached until a link or address notification
 invalidates it. Interface ownership checks always query the kernel.
@@ -463,9 +464,9 @@ unshare --net -- python3 tests/tunnel.py /tmp/strongswan-install --dynamic-user 
 
 The RPC test checks socket group permissions and a rejected nonmember,
 standard introspection (also with varlinkctl when installed), a
-capability-free client, address scope/type filtering, source-interface
-exclusions, ICMP policy priorities, validation, interface rollback,
-foreign objects, overlapping SAs, scoped flushes (including missing policies),
+capability-free client, address scope/type filtering, multihomed source
+selection and egress-interface exclusions, ICMP policy priorities, validation,
+interface rollback, foreign objects, overlapping SAs, scoped flushes (including missing policies),
 larval allocation, hard expiry, and expiry after losing the client. The tunnel tests use
 capability-free charons, Ed25519 raw public keys, ranet's wildcard IPv4/IPv6
 selectors, high ports, output marks, traffic counters, actual rekeying with

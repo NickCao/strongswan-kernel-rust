@@ -179,14 +179,24 @@ def run(binary):
                 assert "198.18.1.1" in {a["address"] for a in rpc("ListAddresses", which=3)["addresses"]}
                 for address in overlay_addresses:
                     destination = "2001:db8:2::2" if ":" in address else "203.0.113.2"
-                    failure("GetSourceAddress", errno.ENETUNREACH,
-                            destination=endpoint(destination), source=endpoint(address))
-                ip("route", "add", "198.19.0.2/32", "via", "192.0.2.254", "dev", "underlay", "src", overlay_addresses[0])
-                failure("GetSourceAddress", errno.ENETUNREACH, destination=endpoint("198.19.0.2"))
-                ip("route", "del", "198.19.0.2/32")
+                    assert rpc("GetSourceAddress", destination=endpoint(destination), source=endpoint(address))["address"]["address"] == address
+                    assert rpc("GetNextHop", destination=endpoint(destination), source=endpoint(address))["interface"] == "underlay"
+                # The source's interface does not constrain the egress. Honor
+                # the FIB's preferred source for both address families too.
+                for destination, source, gateway in [
+                    ("198.19.0.2", overlay_addresses[0], "192.0.2.254"),
+                    ("2001:db8:19::2", overlay_addresses[1], "2001:db8:1::fe"),
+                ]:
+                    family = ["-6"] if ":" in destination else []
+                    ip(*family, "route", "add", destination, "via", gateway, "dev", "underlay", "src", source)
+                    assert rpc("GetSourceAddress", destination=endpoint(destination))["address"]["address"] == source
+                    route = rpc("GetNextHop", destination=endpoint(destination))
+                    assert route["gateway"]["address"] == gateway and route["interface"] == "underlay", route
+                    ip(*family, "route", "del", destination)
                 assert all(s["interface"] != "foreign" for s in rpc("ListSubnets")["subnets"])
                 ip("route", "add", "192.0.2.2/32", "dev", "foreign")
                 failure("GetSourceAddress", errno.ENETUNREACH, destination=endpoint("192.0.2.2"))
+                failure("GetNextHop", errno.ENETUNREACH, destination=endpoint("192.0.2.2"), source=endpoint())
                 ip("route", "del", "192.0.2.2/32")
                 ip("route", "add", "unreachable", "default", "table", "100")
                 ip("rule", "add", "to", "203.0.113.0/24", "lookup", "100", "priority", "100")
@@ -308,9 +318,19 @@ def run(binary):
                 assert "198.18.1.1" in listed(7)
                 ip("link", "set", "spare", "up")
                 wait(lambda: "198.18.1.1" in listed(5))
-                assert filtered.call("GetSourceAddress",dict(destination=endpoint("203.0.113.2"),source=endpoint("198.18.1.1")))["parameters"]["errno"] == errno.ENETUNREACH
+                assert "198.18.1.1" not in listed(1)
+                # Ignoring an interface for discovery must still allow its
+                # address as a source over the permitted underlay route.
+                ip("route", "add", "198.19.0.2/32", "via", "192.0.2.254", "dev", "underlay", "src", "198.18.1.1")
+                def multihomed_source():
+                    assert filtered.call("GetSourceAddress",dict(destination=endpoint("203.0.113.2"),source=endpoint("198.18.1.1")))["parameters"]["address"]["address"] == "198.18.1.1"
+                    assert filtered.call("GetSourceAddress",dict(destination=endpoint("198.19.0.2")))["parameters"]["address"]["address"] == "198.18.1.1"
+                    assert filtered.call("GetNextHop",dict(destination=endpoint("198.19.0.2")))["parameters"]["interface"] == "underlay"
+                multihomed_source()
                 ip("link", "set", "spare", "down")
                 wait(lambda: "198.18.1.1" not in listed(5))
+                multihomed_source()
+                ip("route", "del", "198.19.0.2/32")
                 assert "error" not in filtered.call("CloseSession"); filtered.socket.close()
                 # Losing charon preserves active kernel objects, while the
                 # daemon still cleans an interface when its last SA expires.
@@ -322,7 +342,7 @@ def run(binary):
                 assert probe.call("OpenSession",dict(interfacesUse="",interfacesIgnore=""))["error"].endswith("SessionBusy")
                 probe.socket.close()
                 wait(lambda: [l["ifname"] for l in links()] == ["foreign"])
-                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, address scope/type filtering, source-interface exclusions, ICMP policy priorities, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, update-to-add retry, IPv4/IPv6 acquire events, rollback, foreign objects, larval SPI, hard expiry, scoped cleanup including missing policies, and disconnected-client expiry")
+                print("PASS: socket group authorization and denied nonmember, standard Varlink, IPv4/IPv6 FIB lookups and routing policy, address scope/type filtering, multihomed sources and egress-interface exclusions, ICMP policy priorities, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, update-to-add retry, IPv4/IPv6 acquire events, rollback, foreign objects, larval SPI, hard expiry, scoped cleanup including missing policies, and disconnected-client expiry")
             except BaseException:
                 log.seek(0); print(log.read(),file=sys.stderr); raise
             finally:

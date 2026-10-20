@@ -313,35 +313,23 @@ impl Network {
             .iter()
             .find(|l| l.index == index && self.usable_link(l))
             .ok_or_else(unreachable)?;
-        let valid = |a: &&AddressEntry| {
-            a.host.family() == family
-                && !a.flags.intersects(
-                    AddressFlags::Dadfailed | AddressFlags::Deprecated | AddressFlags::Tentative,
-                )
-                && snapshot
-                    .links
-                    .iter()
-                    .any(|l| l.index == a.index && self.usable_link(l))
-        };
-        // Both a caller-supplied source and the FIB's preferred source must
-        // belong to an eligible underlay interface, even when the egress does.
+        // A caller-supplied or FIB-selected source may belong to another
+        // interface, including one excluded from address discovery. Trust
+        // the successful route lookup instead of filtering its owner again.
         let source = if let Some(source) = src.or(source.as_ref()) {
-            if !snapshot
-                .addresses
-                .iter()
-                .filter(valid)
-                .any(|a| a.host.ip == source.ip)
-            {
-                return Err(unreachable());
-            }
             source.clone()
         } else {
             snapshot
                 .addresses
                 .iter()
-                .filter(valid)
                 .find(|a| {
                     a.index == index
+                        && a.host.family() == family
+                        && !a.flags.intersects(
+                            AddressFlags::Dadfailed
+                                | AddressFlags::Deprecated
+                                | AddressFlags::Tentative,
+                        )
                         && a.scope < u8::from(AddressScope::Link)
                         && !a.host.ip.is_loopback()
                         && !a.host.is_link_local()
