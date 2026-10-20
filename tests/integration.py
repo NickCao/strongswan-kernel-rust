@@ -265,16 +265,22 @@ def run(binary):
                 ip("link", "set", "accidental", "up")
                 ip("link", "set", name, "master", "accidental")
                 wait(configured)
-                ip("link", "set", name, "name", "renamed")
-                wait(configured)
-                assert tunnel()["ifindex"] == index
-                extras_preserved()
                 # The opaque logical identity remains 41 while native if_id
                 # drifts. Repair reads if_id from configuration, not identity.
                 ip("link", "set", name, "type", "xfrm", "if_id", 66)
                 wait(configured)
                 assert tunnel()["ifindex"] == index
                 extras_preserved()
+                # Names store logical identity. An unrecognizable name or an
+                # undesired encoded ID is replaced, losing unmanaged settings.
+                for renamed in ["renamed", "ranet00000063"]:
+                    ip("link", "set", name, "name", renamed)
+                    wait(configured)
+                    assert tunnel()["ifindex"] != index
+                    assert not any(l["ifname"] == renamed for l in links())
+                    assert not tunnel().get("ifalias")
+                    assert "198.18.41.1/32" not in ip("-o", "addr", "show", "dev", name)
+                    index = tunnel()["ifindex"]
                 ip("link", "del", name)
                 wait(configured)
                 assert tunnel()["ifindex"] != index

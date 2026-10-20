@@ -48,13 +48,11 @@ pub struct ObservedInterface<H> {
     pub config: Option<InterfaceConfig>,
 }
 
-/// Identity and backend-private managed settings observed by list(). Both
-/// methods use only the captured snapshot and perform no I/O. Unmanaged
-/// attributes are excluded from the snapshot and drift detection.
+/// Logical identity captured by list(), read from the snapshot without I/O.
+/// All managed configuration is exposed through ObservedInterface::config.
 pub trait InterfaceHandle {
     /// The caller-supplied logical ID, or None for an unidentified owned object.
     fn id(&self) -> Option<InterfaceId>;
-    fn needs_reconcile(&self) -> bool;
 }
 
 /// CRUD for tunnel interfaces. Handles identify objects independently of their
@@ -113,7 +111,7 @@ impl<K: InterfaceKernel> Interfaces<K> {
             .iter()
             .find(|entry| entry.handle.id() == Some(spec.id))
         {
-            if current.config.as_ref() != Some(&spec.config) || current.handle.needs_reconcile() {
+            if current.config.as_ref() != Some(&spec.config) {
                 self.kernel.update(&current.handle, &spec)?;
             }
             return Ok(());
@@ -192,14 +190,10 @@ mod tests {
         identity: u64,
         id: Option<InterfaceId>,
         name: String,
-        expected_name: String,
     }
     impl InterfaceHandle for MemoryHandle {
         fn id(&self) -> Option<InterfaceId> {
             self.id
-        }
-        fn needs_reconcile(&self) -> bool {
-            self.name != self.expected_name
         }
     }
     #[derive(Default)]
@@ -246,8 +240,7 @@ mod tests {
             let handle = MemoryHandle {
                 identity: self.next,
                 id: Some(spec.id),
-                name: name.clone(),
-                expected_name: name,
+                name,
             };
             self.objects.push(ObservedInterface {
                 handle: handle.clone(),
@@ -303,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn repairs_shared_and_private_settings_without_updating_unchanged_interfaces() {
+    fn repairs_configuration_without_updating_unchanged_interfaces() {
         let mut interfaces = controller();
         let desired = HashSet::from([41]);
         interfaces.ensure(41).unwrap();
@@ -326,14 +319,6 @@ mod tests {
             interfaces.kernel.updates, updates,
             "unchanged interfaces must not call update"
         );
-        // The shared spec still matches; only an opaque backend setting drifted.
-        interfaces.kernel.objects[0].handle.name = "renamed".into();
-        interfaces.reconcile(&desired).unwrap();
-        assert_eq!(interfaces.kernel.updates, updates + 1);
-        assert_eq!(interfaces.kernel.objects[0].handle.name, "memory-00000029");
-        assert_eq!(interfaces.kernel.objects[0].handle.identity, original);
-        interfaces.reconcile(&desired).unwrap();
-        assert_eq!(interfaces.kernel.updates, updates + 1);
         interfaces.kernel.objects.clear();
         interfaces.reconcile(&desired).unwrap();
         assert_ne!(interfaces.kernel.objects[0].handle.identity, original);
@@ -412,7 +397,6 @@ mod tests {
                 identity: 999,
                 id: Some(InterfaceId(99)),
                 name: "foreign".into(),
-                expected_name: "foreign".into(),
             },
             config: Some(interfaces.spec(99).config),
         });
@@ -438,7 +422,6 @@ mod tests {
                 identity: 1,
                 id: Some(InterfaceId(41)),
                 name: "memory-00000029".into(),
-                expected_name: "memory-00000029".into(),
             },
             config: None,
         });
@@ -480,7 +463,6 @@ mod tests {
                 identity: 99,
                 id: None,
                 name: "unidentified".into(),
-                expected_name: "unidentified".into(),
             },
             config: None,
         });

@@ -13,7 +13,7 @@ use netlink_packet_route::{
     link::{InfoData, InfoKind, InfoXfrm, LinkAttribute, LinkFlags, LinkInfo, LinkMessage},
     RouteNetlinkMessage,
 };
-use std::{collections::HashMap, io};
+use std::io;
 
 pub const DEFAULT_INTERFACE_GROUP: u32 = 17227;
 
@@ -34,17 +34,13 @@ pub struct InterfaceHandle {
     index: u32,
     id: Option<InterfaceId>,
     xfrm: Option<(u32, u32)>,
-    name: String,
-    expected_name: Option<String>,
 }
 impl InterfaceHandle {
-    fn from_link(link: &Link, id: Option<InterfaceId>, expected_name: Option<String>) -> Self {
+    fn from_link(link: &Link, id: Option<InterfaceId>) -> Self {
         Self {
             index: link.index,
             id,
             xfrm: link.xfrm,
-            name: link.name.clone(),
-            expected_name,
         }
     }
 }
@@ -52,20 +48,12 @@ impl crate::interfaces::InterfaceHandle for InterfaceHandle {
     fn id(&self) -> Option<InterfaceId> {
         self.id
     }
-    fn needs_reconcile(&self) -> bool {
-        self.expected_name
-            .as_ref()
-            .is_some_and(|name| name != &self.name)
-    }
 }
 
 pub struct LinuxInterfaces {
     net: Network,
     prefix: String,
     group: u32,
-    // Preserve opaque identities through external renames. This is only an
-    // association cache: group membership alone determines ownership.
-    identities: HashMap<u32, InterfaceHandle>,
 }
 impl LinuxInterfaces {
     pub fn new(prefix: String, group: u32) -> io::Result<Self> {
@@ -77,15 +65,13 @@ impl LinuxInterfaces {
             net: Network::new()?,
             prefix,
             group,
-            identities: HashMap::new(),
         })
     }
 
     fn current(&mut self, handle: &InterfaceHandle) -> io::Result<Option<Link>> {
-        Ok(self
-            .net
-            .link(handle.index)?
-            .filter(|link| link.group == self.group && link.xfrm == handle.xfrm))
+        Ok(self.net.link(handle.index)?.filter(|link| {
+            link.group == self.group && link.xfrm == handle.xfrm && self.id(link) == handle.id
+        }))
     }
 
     fn name(&self, id: InterfaceId) -> String {
@@ -93,13 +79,7 @@ impl LinuxInterfaces {
     }
 
     fn id(&self, link: &Link) -> Option<InterfaceId> {
-        self.identities
-            .get(&link.index)
-            .filter(|handle| {
-                handle.xfrm.map(|(_, physical)| physical) == link.xfrm.map(|(_, physical)| physical)
-            })
-            .and_then(|handle| handle.id)
-            .or_else(|| link.name.strip_prefix(&self.prefix)?.parse().ok())
+        link.name.strip_prefix(&self.prefix)?.parse().ok()
     }
 
     fn settings(&self, spec: &InterfaceSpec, index: u32) -> io::Result<LinkMessage> {
@@ -136,12 +116,12 @@ impl InterfaceKernel for LinuxInterfaces {
 
     fn list(&mut self) -> io::Result<Vec<ObservedInterface<InterfaceHandle>>> {
         let links = self.net.links()?;
-        let observed: Vec<_> = links
+        links
             .iter()
             .filter(|link| link.group == self.group)
             .map(|link| {
                 let id = self.id(link);
-                let handle = InterfaceHandle::from_link(link, id, id.map(|id| self.name(id)));
+                let handle = InterfaceHandle::from_link(link, id);
                 let config = if let Some((if_id, _)) = link.xfrm {
                     let master = if link.master == 0 {
                         None
@@ -167,13 +147,7 @@ impl InterfaceKernel for LinuxInterfaces {
                 };
                 Ok(ObservedInterface { handle, config })
             })
-            .collect::<io::Result<_>>()?;
-        self.identities = observed
-            .iter()
-            .filter(|entry| entry.handle.id.is_some())
-            .map(|entry| (entry.handle.index, entry.handle.clone()))
-            .collect();
-        Ok(observed)
+            .collect()
     }
 
     fn create(&mut self, spec: &InterfaceSpec) -> io::Result<InterfaceHandle> {
@@ -183,15 +157,11 @@ impl InterfaceKernel for LinuxInterfaces {
             RouteNetlinkMessage::NewLink(message),
             NlmF::ACK | NlmF::CREATE | NlmF::EXCL,
         )?;
-        let handle = InterfaceHandle {
+        Ok(InterfaceHandle {
             index: network::index(&self.name(spec.id))?,
             id: Some(spec.id),
             xfrm: Some((spec.config.if_id, 0)),
-            name: self.name(spec.id),
-            expected_name: Some(self.name(spec.id)),
-        };
-        self.identities.insert(handle.index, handle.clone());
-        Ok(handle)
+        })
     }
 
     fn update(&mut self, handle: &InterfaceHandle, spec: &InterfaceSpec) -> io::Result<()> {
@@ -224,14 +194,8 @@ impl InterfaceKernel for LinuxInterfaces {
             .net
             .request(RouteNetlinkMessage::DelLink(message), NlmF::ACK)
         {
-            Ok(_) => {
-                self.identities.remove(&handle.index);
-                Ok(())
-            }
-            Err(error) if error.raw_os_error() == Some(libc::ENODEV) => {
-                self.identities.remove(&handle.index);
-                Ok(())
-            }
+            Ok(_) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(libc::ENODEV) => Ok(()),
             Err(error) => Err(error),
         }
     }

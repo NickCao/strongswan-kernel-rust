@@ -419,21 +419,27 @@ in
                 wait_overlay_config(machine, peer, interface)
                 ping_overlay(machine, peer)
 
-        with subtest(name + ": deleted interfaces recover with networkd addresses and routes"):
-            original_spis = [spis(machine) for machine in machines]
-            expected_policies = [policy_specs(machine) for machine in machines]
-            for peer, machine in enumerate(machines, 1):
-                interface = next(iter(original_indices[peer - 1]))
-                machine.succeed(f"ip link del dev {interface}")
-            for peer, machine in enumerate(machines, 1):
-                interface = next(iter(original_indices[peer - 1]))
-                recreated = wait_interface(machine, peer, interface)
-                assert recreated["ifindex"] != original_indices[peer - 1][interface]
-                assert spis(machine) == original_spis[peer - 1]
-                assert policy_specs(machine) == expected_policies[peer - 1]
-                wait_overlay_config(machine, peer, interface)
-                ping_overlay(machine, peer)
-                original_indices[peer - 1] = indices(machine)
+        for mutation in ["deleted", "renamed"]:
+            with subtest(name + f": {mutation} interfaces recover with networkd addresses and routes"):
+                original_spis = [spis(machine) for machine in machines]
+                expected_policies = [policy_specs(machine) for machine in machines]
+                for peer, machine in enumerate(machines, 1):
+                    interface = next(iter(original_indices[peer - 1]))
+                    if mutation == "deleted":
+                        machine.succeed(f"ip link del dev {interface}")
+                    else:
+                        machine.succeed(f"ip link set dev {interface} name renamed")
+                for peer, machine in enumerate(machines, 1):
+                    interface = next(iter(original_indices[peer - 1]))
+                    recreated = wait_interface(machine, peer, interface)
+                    assert recreated["ifindex"] != original_indices[peer - 1][interface]
+                    if mutation == "renamed":
+                        machine.fail("ip link show dev renamed")
+                    assert spis(machine) == original_spis[peer - 1]
+                    assert policy_specs(machine) == expected_policies[peer - 1]
+                    wait_overlay_config(machine, peer, interface)
+                    ping_overlay(machine, peer)
+                    original_indices[peer - 1] = indices(machine)
 
         with subtest(name + ": VICI SA use times age while idle and reset after traffic"):
             # Stop background traffic before XFRM processing during the idle interval.

@@ -497,25 +497,28 @@ interfaces.
 Its separate `InterfaceKernel` trait provides only list/create/update/delete
 operations. Listing returns every backend-owned object as an `ObservedInterface`
 with optional configuration and an opaque handle. The handle's `id()` returns
-its logical identity, when known; `needs_reconcile()` reports drift in
-backend-managed settings such as naming. Both methods inspect the captured
-snapshot without I/O. The controller updates matching desired IDs, creates
-missing ones, and deletes unidentified, undesired or duplicate owned objects.
+its logical identity, when known, from the captured snapshot without I/O.
+All managed configuration is exposed through `InterfaceConfig`; the controller
+updates matching desired IDs when that configuration differs or is
+unrepresentable. It creates missing ones and deletes unidentified, undesired
+or duplicate owned objects.
 An unrepresentable configuration with a known desired ID is passed to
 `update()`; the backend chooses in-place repair or replacement.
 
 `LinuxInterfaces` implements CRUD using typed route Netlink messages and owns
-group membership and naming. Names encode the opaque logical ID; a backend-local
-association cache preserves that identity through renames while the daemon is
-running. A fresh backend can discover recognizable names in its group after a
-crash, independently of native `if_id` drift. If a name was changed before a
-crash, or the configured prefix changes, the identity may be unrecognizable:
-the owned object is then deleted and recreated when needed. Wrong native types
-with recognizable identities are replaced inside `update()`. The shared
-controller keeps no separate interface ownership map.
+group membership and naming. It keeps only its Netlink connection and fixed
+configuration; every listing derives ownership and identity from the kernel.
+Names encode the opaque logical ID, independently of native `if_id` drift.
+An unrecognizable name loses its logical identity: the owned object is deleted
+and recreated when needed, both during normal operation and after restart.
+Renaming to another valid encoded name changes the observed logical identity.
+Changing the configured prefix can also cause replacement. Wrong native types
+with recognizable identities are replaced inside `update()`. Neither the
+backend nor the shared controller keeps an interface association or ownership
+cache.
 
 Linux handles capture the interface index and native XFRM identity, alongside
-the logical ID and backend-managed name observation. Updates and deletion check
+the logical ID decoded from the name. Updates and deletion check
 the current object and group membership. These are checks, not kernel lifetime
 references: a replacement reusing all checked fields cannot be distinguished.
 Moving a link out of the reserved group releases ownership. Repairs modify only
@@ -523,10 +526,11 @@ managed attributes; user aliases, addresses, queue lengths, unrelated flags and
 other unmanaged settings are preserved during in-place updates. SA handling
 and network discovery remain Linux-specific.
 
-Recreated links need their addresses and routes reapplied by the external
-network configuration; the daemon only restores link settings. The
-NixOS test exercises this with systemd-networkd managing tunnel addresses and
-routes while preserving the daemon-managed master attachment.
+Recreated links lose their unmanaged settings, including addresses and routes,
+which must be reapplied by the external network configuration; the daemon only
+restores managed link settings. This also applies to replacement after renaming.
+The NixOS test exercises this with systemd-networkd managing tunnel addresses
+and routes while preserving the daemon-managed master attachment.
 
 External changes to kernel SAs are not automatically reconciled.
 An external `ip xfrm state flush` can leave SA ownership records
