@@ -65,8 +65,10 @@ pub unsafe fn config() -> Result<kernel_rust_protocol::client::Config> {
                 c"%s.plugins.kernel-rust.socket",
                 c"/run/charon-kernel/charon-kernel.sock",
             )?,
-            interfaces_use: setting_str(c"%s.interfaces_use", c"")?,
-            interfaces_ignore: setting_str(c"%s.interfaces_ignore", c"")?,
+            session: api::SessionConfig {
+                interfaces_use: setting_str(c"%s.interfaces_use", c"")?,
+                interfaces_ignore: setting_str(c"%s.interfaces_ignore", c"")?,
+            },
         })
     }
 }

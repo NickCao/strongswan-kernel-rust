@@ -163,8 +163,10 @@ impl Fixture {
         Self {
             config: Config {
                 path: path.to_str().unwrap().into(),
-                interfaces_use: "eth0".into(),
-                interfaces_ignore: String::new(),
+                session: SessionConfig {
+                    interfaces_use: "eth0".into(),
+                    interfaces_ignore: String::new(),
+                },
             },
             _directory: directory,
             state,

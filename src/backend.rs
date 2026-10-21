@@ -22,18 +22,14 @@ impl Backend {
         master_device: Option<String>,
         mtu: u32,
         interface_group: u32,
-        interfaces_use: String,
-        interfaces_ignore: String,
+        config: SessionConfig,
     ) -> io::Result<Self> {
         if !(1280..=65535).contains(&mtu) {
             return Err(invalid());
         }
         let mut net = Network::new()?;
         // Host routes, policy rules and virtual addresses belong to ranet.
-        net.config = Config {
-            interfaces_use,
-            interfaces_ignore,
-        };
+        net.config = config;
         Ok(Self {
             sas: Sas::new(LinuxSas::new()?),
             net,
@@ -78,52 +74,22 @@ impl Backend {
         {
             return Err(unsupported());
         }
-        let lifetime = config.lifetime.as_ref().ok_or_else(invalid)?;
-        // strongSwan has already applied jitter to these rekey limits. Tunnel
-        // SAs use policies for selection; their selector lists are not installed.
-        let data = AddSa {
-            reqid: config.reqid,
-            seq: config.acquire_sequence,
-            lifetime: [
-                lifetime.time.life,
-                lifetime.time.rekey,
-                lifetime.bytes.life,
-                lifetime.bytes.rekey,
-                lifetime.packets.life,
-                lifetime.packets.rekey,
-            ],
-            enc_alg: config.encryption.id,
-            enc_key: &config.encryption.key,
-            int_alg: config.integrity.id,
-            int_key: &config.integrity.key,
-            enc_name: config.encryption.name.clone(),
-            int_name: config.integrity.name.clone(),
-            replay_window: config.replay_window,
-            tfc: config.tfc,
-            encap: config.udp_encapsulation,
-            mark: mark(config.output_mark),
-            esn: config.esn,
-            copy_df: config.copy_df,
-            copy_ecn: config.copy_ecn,
-            copy_dscp: number(config.copy_dscp)?,
-            inbound: config.inbound,
-            update: config.update,
-        };
-        if data.replay_window > 4096 * 32
-            || data.copy_dscp > 3
-            || data.reqid == 0
-            || data.enc_name.len() >= 64
-            || data.int_name.len() >= 64
-            || data.enc_key.len() > 8192
-            || data.int_key.len() > 8192
+        if config.lifetime.is_none()
+            || config.replay_window > 4096 * 32
+            || !(0..=3).contains(&config.copy_dscp)
+            || config.reqid == 0
+            || config.encryption.name.len() >= 64
+            || config.integrity.name.len() >= 64
+            || config.encryption.key.len() > 8192
+            || config.integrity.key.len() > 8192
         {
             return Err(invalid());
         }
-        if data.encap && (id.src.port < 1024 || id.dst.port < 1024) {
+        if config.udp_encapsulation && (id.src.port < 1024 || id.dst.port < 1024) {
             return Err(invalid());
         }
         self.interfaces.ensure(id.if_id)?;
-        let result = self.sas.install(&id, &data);
+        let result = self.sas.install(&id, &config);
         let cleanup = self.cleanup_interfaces();
         result.and(cleanup)
     }
@@ -157,37 +123,20 @@ impl Backend {
 fn number<T: TryFrom<i32>>(n: i32) -> io::Result<T> {
     T::try_from(n).map_err(|_| invalid())
 }
-pub fn host(h: rpc::Endpoint) -> io::Result<Host> {
-    let address = std::net::SocketAddr::try_from(&h).map_err(|_| invalid())?;
-    Ok(Host {
-        ip: address.ip(),
-        port: address.port(),
-    })
-}
-pub fn endpoint(h: Host) -> rpc::Endpoint {
-    rpc::Endpoint {
-        address: h.ip,
-        port: h.port,
-        flow_info: 0,
-        scope_id: 0,
-    }
-}
-fn mark(m: rpc::Mark) -> Mark {
-    Mark {
-        value: m.value,
-        mask: m.mask,
-    }
+pub fn validate_endpoint(endpoint: Endpoint) -> io::Result<Endpoint> {
+    std::net::SocketAddr::try_from(&endpoint).map_err(|_| invalid())?;
+    Ok(endpoint)
 }
 pub fn sa_id(id: rpc::SaId) -> io::Result<SaId> {
     if id.protocol != 50 {
         return Err(unsupported());
     }
     let s = SaId {
-        src: host(id.src)?,
-        dst: host(id.dst)?,
+        src: validate_endpoint(id.src)?,
+        dst: validate_endpoint(id.dst)?,
         spi: id.spi,
         proto: id.protocol,
-        mark: mark(id.mark),
+        mark: id.mark,
         if_id: id.interface_id,
     };
     if s.src.family() != s.dst.family() || s.spi < 256 || s.if_id == 0 {
@@ -196,11 +145,8 @@ pub fn sa_id(id: rpc::SaId) -> io::Result<SaId> {
     Ok(s)
 }
 pub fn selector(s: rpc::Selector) -> io::Result<Ts> {
-    let from = Host {
-        ip: s.from,
-        port: 0,
-    };
-    let to = Host { ip: s.to, port: 0 };
+    let from = Endpoint::new(s.from, 0);
+    let to = Endpoint::new(s.to, 0);
     if s.dynamic || s.kind != if s.from.is_ipv4() { 7 } else { 8 } {
         return Err(unsupported());
     }
@@ -211,7 +157,10 @@ pub fn selector(s: rpc::Selector) -> io::Result<Ts> {
         from_port: s.from_port,
         to_port: s.to_port,
     };
-    if ts.from.family() != ts.to.family() || ts.from.ip > ts.to.ip || ts.from_port > ts.to_port {
+    if ts.from.family() != ts.to.family()
+        || ts.from.address > ts.to.address
+        || ts.from_port > ts.to_port
+    {
         return Err(invalid());
     }
     // XFRM accepts prefixes and aligned port masks, not arbitrary ranges.
@@ -229,10 +178,10 @@ pub fn selector(s: rpc::Selector) -> io::Result<Ts> {
 }
 pub fn rpc_selector(s: Ts) -> rpc::Selector {
     rpc::Selector {
-        kind: if s.from.ip.is_ipv4() { 7 } else { 8 },
+        kind: if s.from.address.is_ipv4() { 7 } else { 8 },
         dynamic: false,
-        from: s.from.ip,
-        to: s.to.ip,
+        from: s.from.address,
+        to: s.to.address,
         protocol: s.proto,
         from_port: s.from_port,
         to_port: s.to_port,
@@ -246,7 +195,7 @@ pub fn policy_id(p: rpc::PolicyId) -> io::Result<PolicyId> {
         dir: number(p.direction)?,
         src: selector(p.src)?,
         dst: selector(p.dst)?,
-        mark: mark(p.mark),
+        mark: p.mark,
         if_id: p.interface_id,
     };
     if id.dir > 2 || id.if_id == 0 || id.src.from.family() != id.dst.from.family() {
@@ -269,8 +218,9 @@ pub fn policy_config(p: rpc::PolicyConfig) -> io::Result<PolicyData> {
         kind: number(p.kind)?,
         prio: number(p.priority)?,
         manual_prio: p.manual_priority,
-        src: host(p.src.ok_or_else(invalid)?)?,
-        dst: host(p.dst.ok_or_else(invalid)?)?,
+        // Policy references use addresses and ports, not IPv6 sockaddr metadata.
+        src: policy_endpoint(p.src.ok_or_else(invalid)?)?,
+        dst: policy_endpoint(p.dst.ok_or_else(invalid)?)?,
         reqid: sa.reqid,
         policy_count: sa.policy_count,
         esp: sa.esp.used.then_some(sa.esp.spi),
@@ -286,4 +236,61 @@ pub fn policy_config(p: rpc::PolicyConfig) -> io::Result<PolicyData> {
 }
 fn restricted_interface(interface: Option<&str>) -> bool {
     interface.is_some_and(|name| !name.is_empty())
+}
+fn policy_endpoint(endpoint: Endpoint) -> io::Result<Endpoint> {
+    let endpoint = validate_endpoint(endpoint)?;
+    Ok(Endpoint::new(endpoint.address, endpoint.port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_endpoints_retain_metadata_while_sa_keys_keep_native_identity() {
+        let source = Endpoint {
+            address: "2001:db8::1".parse().unwrap(),
+            port: 13000,
+            flow_info: 0x12345,
+            scope_id: 17,
+        };
+        let destination = Endpoint {
+            address: "2001:db8::2".parse().unwrap(),
+            ..source
+        };
+        let id = sa_id(rpc::SaId {
+            src: source,
+            dst: destination,
+            spi: 0x10203,
+            protocol: 50,
+            mark: Mark {
+                value: 0x1234,
+                mask: 0xff,
+            },
+            interface_id: 41,
+        })
+        .unwrap();
+        assert_eq!(id.src, source);
+        assert_eq!(id.dst, destination);
+        let mut same_native_sa = id.clone();
+        same_native_sa.src.port += 1;
+        same_native_sa.src.scope_id += 1;
+        same_native_sa.dst.flow_info += 1;
+        same_native_sa.mark.value ^= 0xff00;
+        assert_eq!(id.key(), same_native_sa.key());
+        same_native_sa.dst.address = "2001:db8::3".parse().unwrap();
+        assert_ne!(id.key(), same_native_sa.key());
+    }
+
+    #[test]
+    fn sharing_endpoints_keeps_ipv4_sockaddr_validation() {
+        let endpoint = Endpoint {
+            scope_id: 17,
+            ..Endpoint::new("192.0.2.1".parse().unwrap(), 13000)
+        };
+        assert_eq!(
+            validate_endpoint(endpoint).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 }

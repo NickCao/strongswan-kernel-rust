@@ -71,7 +71,7 @@ impl Link {
 }
 #[derive(Clone, Debug)]
 pub struct AddressEntry {
-    pub host: Host,
+    pub host: Endpoint,
     pub prefix: u8,
     pub scope: u8,
     pub flags: AddressFlags,
@@ -83,19 +83,19 @@ struct Snapshot {
 }
 pub struct Network {
     socket: Netlink,
-    pub config: Config,
+    pub config: SessionConfig,
     snapshot: Option<Arc<Snapshot>>,
 }
 fn absent() -> io::Error {
     io::Error::from_raw_os_error(libc::ENOENT)
 }
-fn route_host(address: RouteAddress) -> io::Result<Host> {
+fn route_host(address: RouteAddress) -> io::Result<Endpoint> {
     let ip = match address {
         RouteAddress::Inet(ip) => ip.into(),
         RouteAddress::Inet6(ip) => ip.into(),
         _ => return Err(invalid()),
     };
-    Ok(Host { ip, port: 0 })
+    Ok(Endpoint::new(ip, 0))
 }
 pub fn index(name: &str) -> io::Result<u32> {
     if name.is_empty() {
@@ -116,7 +116,7 @@ impl Network {
     pub fn new() -> io::Result<Self> {
         Ok(Self {
             socket: Netlink::new(NlFamily::Route)?,
-            config: Config::default(),
+            config: SessionConfig::default(),
             snapshot: None,
         })
     }
@@ -199,7 +199,7 @@ impl Network {
             }
             if let Some(ip) = local.or(address) {
                 out.push(AddressEntry {
-                    host: Host { ip, port: 0 },
+                    host: Endpoint::new(ip, 0),
                     prefix: info.header.prefix_len,
                     scope: info.header.scope.into(),
                     flags,
@@ -209,7 +209,7 @@ impl Network {
         }
         Ok(out)
     }
-    pub fn enumerate(&mut self, which: u32) -> io::Result<Vec<Host>> {
+    pub fn enumerate(&mut self, which: u32) -> io::Result<Vec<Endpoint>> {
         if which & ADDR_TYPE_REGULAR == 0 {
             return Ok(Vec::new());
         }
@@ -223,7 +223,7 @@ impl Network {
                 };
                 if link.xfrm_if_id.is_some()
                     || a.scope >= u8::from(AddressScope::Link)
-                    || a.host.ip.is_loopback()
+                    || a.host.address.is_loopback()
                     || a.host.is_link_local()
                     || a.flags.intersects(
                         AddressFlags::Dadfailed
@@ -236,10 +236,10 @@ impl Network {
                 (self.config.usable(&link.name) || which & ADDR_TYPE_IGNORED != 0)
                     && (link.flags.contains(LinkFlags::Up) || which & ADDR_TYPE_DOWN != 0)
             })
-            .map(|a| a.host.clone())
+            .map(|a| a.host)
             .collect())
     }
-    pub fn subnets(&mut self) -> io::Result<Vec<(Host, u8, String)>> {
+    pub fn subnets(&mut self) -> io::Result<Vec<(Endpoint, u8, String)>> {
         let snapshot = self.snapshot()?;
         Ok(snapshot
             .addresses
@@ -260,10 +260,10 @@ impl Network {
             })
             .collect())
     }
-    pub fn interface(&mut self, host: &Host) -> io::Result<String> {
+    pub fn interface(&mut self, host: &Endpoint) -> io::Result<String> {
         let snapshot = self.snapshot()?;
         for a in &snapshot.addresses {
-            if a.host.ip == host.ip {
+            if a.host.address == host.address {
                 if let Some(link) = snapshot
                     .links
                     .iter()
@@ -282,10 +282,10 @@ impl Network {
     }
     pub fn lookup(
         &mut self,
-        dest: &Host,
-        src: Option<&Host>,
+        dest: &Endpoint,
+        src: Option<&Endpoint>,
         prefix: i32,
-    ) -> io::Result<(Host, Host, String)> {
+    ) -> io::Result<(Endpoint, Endpoint, String)> {
         if src.is_some_and(|s| s.family() != dest.family()) {
             return Err(invalid());
         }
@@ -294,17 +294,19 @@ impl Network {
         if prefix != -1 && prefix != i32::from(dest.bits()) {
             return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
         }
-        let src = src.filter(|s| !s.ip.is_unspecified());
+        let src = src.filter(|s| !s.address.is_unspecified());
         let family = dest.family();
         let mut query = RouteMessage::default();
-        query.header.address_family = dest.ip.into();
+        query.header.address_family = dest.address.into();
         query.header.destination_prefix_length = dest.bits();
         query.header.source_prefix_length = if src.is_some() { dest.bits() } else { 0 };
         query
             .attributes
-            .push(RouteAttribute::Destination(dest.ip.into()));
+            .push(RouteAttribute::Destination(dest.address.into()));
         if let Some(src) = src {
-            query.attributes.push(RouteAttribute::Source(src.ip.into()));
+            query
+                .attributes
+                .push(RouteAttribute::Source(src.address.into()));
         }
         // Use the kernel's FIB and routing rules, without dumping BGP tables
         // or trying to choose an alternative to an excluded kernel route.
@@ -339,7 +341,7 @@ impl Network {
         // interface, including one excluded from address discovery. Trust
         // the successful route lookup instead of filtering its owner again.
         let source = if let Some(source) = src.or(source.as_ref()) {
-            source.clone()
+            *source
         } else {
             snapshot
                 .addresses
@@ -353,16 +355,15 @@ impl Network {
                                 | AddressFlags::Tentative,
                         )
                         && a.scope < u8::from(AddressScope::Link)
-                        && !a.host.ip.is_loopback()
+                        && !a.host.address.is_loopback()
                         && !a.host.is_link_local()
                 })
                 .ok_or_else(unreachable)?
                 .host
-                .clone()
         };
         Ok((
             source,
-            gateway.unwrap_or(Host::any(family)?),
+            gateway.unwrap_or(Endpoint::any(family)?),
             link.name.clone(),
         ))
     }
@@ -376,13 +377,10 @@ mod tests {
         let links = net.links().unwrap();
         assert!(links.iter().any(|l| l.name == "lo"));
         let addresses = net.addresses().unwrap();
-        assert!(addresses.iter().any(|a| a.host.ip.is_loopback()));
+        assert!(addresses.iter().any(|a| a.host.address.is_loopback()));
         assert_eq!(
-            net.interface(&Host {
-                ip: "127.0.0.1".parse().unwrap(),
-                port: 0
-            })
-            .unwrap(),
+            net.interface(&Endpoint::new("127.0.0.1".parse().unwrap(), 0))
+                .unwrap(),
             "lo"
         );
     }

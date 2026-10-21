@@ -7,13 +7,7 @@ use super::{
     policy::LinuxPolicies,
 };
 use crate::sa::{is_missing, ObservedSa, SaHandle as _, SaKernel, SaSpec, SaState, SaUsage, Sas};
-use crate::{
-    backend::{endpoint, rpc_selector},
-    error::invalid,
-    model::*,
-    policy::Policies,
-    rpc_api as rpc,
-};
+use crate::{backend::rpc_selector, error::invalid, model::*, policy::Policies, rpc_api as rpc};
 use netlink_packet_core::{DefaultNla, Emitable, Nla, NlasIterator, Parseable};
 use netlink_packet_xfrm::{self as packet, XfrmAttrs as Attr, XfrmMessage};
 use std::io;
@@ -51,13 +45,13 @@ pub(super) fn monotonic_use_time(time: u64) -> io::Result<u64> {
 pub(super) fn message(flags: NlmF, value: &XfrmMessage) -> Message {
     Message::new(value.message_type(), flags, value)
 }
-pub(super) fn host(family: u16, address: packet::Address, port: u16) -> io::Result<Host> {
+pub(super) fn host(family: u16, address: packet::Address, port: u16) -> io::Result<Endpoint> {
     let ip = match family as i32 {
         libc::AF_INET => address.to_ipv4().into(),
         libc::AF_INET6 => address.to_ipv6().into(),
         _ => return Err(invalid()),
     };
-    Ok(Host { ip, port })
+    Ok(Endpoint::new(ip, port))
 }
 pub(super) fn id_attrs(mark: Mark, if_id: u32) -> Vec<Attr> {
     let mut attrs = Vec::new();
@@ -77,7 +71,7 @@ fn direction(inbound: bool) -> Attr {
 }
 fn sa_id(id: &SaId) -> packet::UserSaId {
     packet::UserSaId {
-        daddr: packet::Address::from_ip(&id.dst.ip),
+        daddr: packet::Address::from_ip(&id.dst.address),
         spi: id.spi,
         family: id.dst.family(),
         proto: id.proto,
@@ -198,8 +192,8 @@ impl LinuxSas {
     }
     fn allocate_spi(
         &mut self,
-        src: &Host,
-        dst: &Host,
+        src: &Endpoint,
+        dst: &Endpoint,
         proto: u8,
         min: u32,
         max: u32,
@@ -210,9 +204,9 @@ impl LinuxSas {
         let request = XfrmMessage::AllocSpi(packet::state::AllocSpiMessage {
             spi_info: packet::UserSpiInfo {
                 info: packet::UserSaInfo {
-                    saddr: packet::Address::from_ip(&src.ip),
+                    saddr: packet::Address::from_ip(&src.address),
                     id: packet::Id {
-                        daddr: packet::Address::from_ip(&dst.ip),
+                        daddr: packet::Address::from_ip(&dst.address),
                         proto,
                         ..Default::default()
                     },
@@ -241,7 +235,10 @@ impl LinuxSas {
         }
         Err(invalid())
     }
-    fn sa_message(&self, id: &SaId, data: &AddSa<'_>) -> io::Result<XfrmMessage> {
+    fn sa_message(&self, id: &SaId, data: &SaConfig) -> io::Result<XfrmMessage> {
+        // strongSwan has already jittered the rekey limits. Tunnel selectors
+        // are represented by policies, not installed on the SA itself.
+        let lifetime = data.lifetime.as_ref().ok_or_else(invalid)?;
         let mut flags = packet::XFRM_STATE_AF_UNSPEC;
         if !data.copy_ecn {
             flags |= packet::XFRM_STATE_NOECN;
@@ -261,16 +258,16 @@ impl LinuxSas {
             u32::from(data.esn && !self.sa_dir)
         };
         let info = packet::UserSaInfo {
-            saddr: packet::Address::from_ip(&id.src.ip),
+            saddr: packet::Address::from_ip(&id.src.address),
             id: packet::Id {
-                daddr: packet::Address::from_ip(&id.dst.ip),
+                daddr: packet::Address::from_ip(&id.dst.address),
                 spi: id.spi,
                 proto: id.proto,
             },
             family: id.src.family(),
             mode: packet::XFRM_MODE_TUNNEL,
             reqid: data.reqid,
-            seq: data.seq,
+            seq: data.acquire_sequence,
             flags,
             replay_window: if !data.esn && replay <= 32 {
                 replay as u8
@@ -278,23 +275,26 @@ impl LinuxSas {
                 0
             },
             lifetime_cfg: packet::LifetimeConfig {
-                soft_byte_limit: nonzero(data.lifetime[3]),
-                hard_byte_limit: nonzero(data.lifetime[2]),
-                soft_packet_limit: nonzero(data.lifetime[5]),
-                hard_packet_limit: nonzero(data.lifetime[4]),
-                soft_add_expires_seconds: data.lifetime[1],
-                hard_add_expires_seconds: data.lifetime[0],
+                soft_byte_limit: nonzero(lifetime.bytes.rekey),
+                hard_byte_limit: nonzero(lifetime.bytes.life),
+                soft_packet_limit: nonzero(lifetime.packets.rekey),
+                hard_packet_limit: nonzero(lifetime.packets.life),
+                soft_add_expires_seconds: lifetime.time.rekey,
+                hard_add_expires_seconds: lifetime.time.life,
                 ..Default::default()
             },
             ..Default::default()
         };
         let mut nlas = Vec::new();
-        if data.enc_alg != 1024 {
-            let (name, icv) = enc_algorithm(data.enc_alg)
-                .or_else(|| (!data.enc_name.is_empty()).then_some((data.enc_name.as_str(), None)))
+        if data.encryption.id != 1024 {
+            let (name, icv) = enc_algorithm(data.encryption.id)
+                .or_else(|| {
+                    (!data.encryption.name.is_empty())
+                        .then_some((data.encryption.name.as_str(), None))
+                })
                 .ok_or_else(unsupported)?;
             let alg_name = algorithm(name)?;
-            let alg_key = data.enc_key.to_vec();
+            let alg_key = data.encryption.key.to_vec();
             let alg_key_len = alg_key.len() as u32 * 8;
             nlas.push(match icv {
                 Some(alg_icv_len) => Attr::EncryptionAlgAead(packet::AlgAead {
@@ -310,12 +310,15 @@ impl LinuxSas {
                 }),
             });
         }
-        if data.int_alg != 1024 {
-            let (name, trunc) = int_algorithm(data.int_alg)
-                .or_else(|| (!data.int_name.is_empty()).then_some((data.int_name.as_str(), None)))
+        if data.integrity.id != 1024 {
+            let (name, trunc) = int_algorithm(data.integrity.id)
+                .or_else(|| {
+                    (!data.integrity.name.is_empty())
+                        .then_some((data.integrity.name.as_str(), None))
+                })
                 .ok_or_else(unsupported)?;
             let alg_name = algorithm(name)?;
-            let alg_key = data.int_key.to_vec();
+            let alg_key = data.integrity.key.to_vec();
             let alg_key_len = alg_key.len() as u32 * 8;
             nlas.push(match trunc {
                 Some(alg_trunc_len) => Attr::AuthenticationAlgTrunc(packet::AlgAuth {
@@ -331,7 +334,7 @@ impl LinuxSas {
                 }),
             });
         }
-        if data.encap {
+        if data.udp_encapsulation {
             nlas.push(Attr::EncapsulationTemplate(packet::EncapTmpl {
                 encap_type: packet::UDP_ENCAP_ESPINUDP,
                 encap_sport: id.src.port,
@@ -339,9 +342,9 @@ impl LinuxSas {
                 encap_oa: packet::Address::default(),
             }));
         }
-        if data.mark.value | data.mark.mask != 0 {
-            nlas.push(Attr::MarkVal(data.mark.value));
-            nlas.push(Attr::MarkMask(data.mark.mask));
+        if data.output_mark.value | data.output_mark.mask != 0 {
+            nlas.push(Attr::MarkVal(data.output_mark.value));
+            nlas.push(Attr::MarkMask(data.output_mark.mask));
         }
         if data.tfc != 0 {
             nlas.push(Attr::TfcPadding(data.tfc));
@@ -505,7 +508,7 @@ pub struct Configuration(packet::state::ModifyMessage);
 fn native_request(id: &SaId) -> packet::state::DelGetMessage {
     let mut nlas = id_attrs(id.mark, 0);
     if ![50, 51, 108].contains(&id.proto) {
-        nlas.push(Attr::SrcAddr(packet::Address::from_ip(&id.src.ip)));
+        nlas.push(Attr::SrcAddr(packet::Address::from_ip(&id.src.address)));
     }
     packet::state::DelGetMessage {
         user_sa_id: sa_id(id),
@@ -521,8 +524,8 @@ impl SaKernel for LinuxSas {
     }
     fn allocate(
         &mut self,
-        src: &Host,
-        dst: &Host,
+        src: &Endpoint,
+        dst: &Endpoint,
         proto: u8,
         min: u32,
         max: u32,
@@ -679,7 +682,7 @@ pub fn event(
             }
             let id = SaId {
                 src,
-                dst: dst.clone(),
+                dst,
                 spi: sa.id.spi,
                 proto: sa.id.proto,
                 mark,
@@ -694,7 +697,7 @@ pub fn event(
             event.expiry = Some(rpc::Expiry {
                 protocol: sa.id.proto,
                 spi: sa.id.spi,
-                destination: endpoint(dst),
+                destination: dst,
                 hard,
             });
         }
@@ -706,7 +709,7 @@ pub fn event(
             if mapping.id.proto != 50
                 || !sas
                     .ids()
-                    .any(|id| id.dst.ip == dst.ip && id.spi == spi && id.proto == 50)
+                    .any(|id| id.dst.address == dst.address && id.spi == spi && id.proto == 50)
             {
                 return Ok(None);
             }
@@ -714,8 +717,8 @@ pub fn event(
             event.kind = rpc::EventKind::Mapping;
             event.mapping = Some(rpc::Mapping {
                 spi,
-                destination: endpoint(dst),
-                remote: endpoint(remote),
+                destination: dst,
+                remote,
             });
         }
         _ => return Ok(None),

@@ -2,6 +2,11 @@
 
 [protocol/src/lib.rs](protocol/src/lib.rs) defines the shared Rust types,
 service trait and errors. `#[tarpc::service]` generates the client and dispatch.
+Endpoints, marks, session configuration, SA usage and SA installation inputs
+(including algorithms and lifetimes) are shared with the daemon's internal
+code. Validation runs in the daemon, and native encoding runs in the platform
+backend. Canonical SA/policy keys and observed kernel snapshots remain separate
+because they describe native identity and reconciliation state.
 Connections use Unix SOCK_STREAM sockets. Before starting tarpc, the daemon
 sends a one-byte zero payload with one nonblocking eventfd through `SCM_RIGHTS`.
 The plugin receives it with `MSG_CMSG_CLOEXEC`, then calls `open_session`.

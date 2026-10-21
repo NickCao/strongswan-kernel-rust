@@ -31,10 +31,20 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub interfaces_use: String,
     pub interfaces_ignore: String,
+}
+impl SessionConfig {
+    pub fn usable(&self, interface: &str) -> bool {
+        let member = |list: &str| list.split(',').any(|entry| entry.trim() == interface);
+        if !self.interfaces_use.is_empty() {
+            member(&self.interfaces_use)
+        } else {
+            !member(&self.interfaces_ignore)
+        }
+    }
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -43,7 +53,7 @@ pub struct SessionInfo {
 
 // SocketAddr's Serde representation drops IPv6 sockaddr metadata. Preserve
 // these explicit, typed fields instead of serializing its display string.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Endpoint {
     pub address: IpAddr,
     pub port: u16,
@@ -52,7 +62,7 @@ pub struct Endpoint {
     #[serde(default)]
     pub scope_id: u32,
 }
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Mark {
     pub value: u32,
     pub mask: u32,
@@ -153,10 +163,11 @@ pub struct SaUpdate {
     pub interface: Option<String>,
     pub inbound: bool,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SaUsage {
     pub bytes: u64,
     pub packets: u64,
+    /// Last use in monotonic seconds, or zero if unused/unavailable.
     pub last_use: u64,
 }
 #[derive(Debug, Serialize, Deserialize)]

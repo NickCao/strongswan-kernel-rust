@@ -41,8 +41,8 @@ impl PolicyKey {
             dst_port_mask = if dst_port == 0 { 0 } else { u16::MAX };
         }
         Ok(Self {
-            src: IpNet::new(src.ip, src_prefix).map_err(|_| invalid())?,
-            dst: IpNet::new(dst.ip, dst_prefix).map_err(|_| invalid())?,
+            src: IpNet::new(src.address, src_prefix).map_err(|_| invalid())?,
+            dst: IpNet::new(dst.address, dst_prefix).map_err(|_| invalid())?,
             src_port,
             src_port_mask,
             dst_port,
@@ -85,8 +85,8 @@ impl PolicyKey {
                 priority: self.priority(data).0,
                 block: data.kind == 3,
                 template: (data.kind == 1 && data.reqid != 0).then(|| PolicyTemplate {
-                    src: data.src.ip,
-                    dst: data.dst.ip,
+                    src: data.src.address,
+                    dst: data.dst.address,
                     reqid: data.reqid,
                     spi: if self.dir == 1 {
                         data.esp.unwrap_or(0)
@@ -299,10 +299,10 @@ impl<K: PolicyKernel> Policies<K> {
         if port == 0 {
             return Err(invalid());
         }
-        let any = Host::any(family)?;
+        let any = Endpoint::any(family)?;
         for dir in [1, 0] {
-            let wildcard = Ts::from_subnet(any.clone(), 0, 17, 0, 65535)?;
-            let specific = Ts::from_subnet(any.clone(), 0, 17, port, port)?;
+            let wildcard = Ts::from_subnet(any, 0, 17, 0, 65535)?;
+            let specific = Ts::from_subnet(any, 0, 17, port, port)?;
             let (src, dst) = if dir == 1 {
                 (specific, wildcard)
             } else {
@@ -322,8 +322,8 @@ impl<K: PolicyKernel> Policies<K> {
                 kind: 2,
                 prio: 0,
                 manual_prio: 32,
-                src: any.clone(),
-                dst: any.clone(),
+                src: any,
+                dst: any,
                 reqid: 0,
                 policy_count: 1,
                 esp: None,
@@ -433,18 +433,12 @@ mod tests {
         }
     }
     fn fixture() -> (PolicyId, PolicyData) {
-        let src = Host {
-            ip: "192.0.2.1".parse().unwrap(),
-            port: 0,
-        };
-        let dst = Host {
-            ip: "192.0.2.2".parse().unwrap(),
-            port: 0,
-        };
+        let src = Endpoint::new("192.0.2.1".parse().unwrap(), 0);
+        let dst = Endpoint::new("192.0.2.2".parse().unwrap(), 0);
         (
             PolicyId {
-                src: Ts::from_subnet(src.clone(), 0, 0, 0, u16::MAX).unwrap(),
-                dst: Ts::from_subnet(dst.clone(), 0, 0, 0, u16::MAX).unwrap(),
+                src: Ts::from_subnet(src, 0, 0, 0, u16::MAX).unwrap(),
+                dst: Ts::from_subnet(dst, 0, 0, 0, u16::MAX).unwrap(),
                 dir: 1,
                 mark: Mark::default(),
                 if_id: 41,

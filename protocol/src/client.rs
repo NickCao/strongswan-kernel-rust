@@ -18,8 +18,7 @@ pub use tokio_util::sync::CancellationToken;
 
 pub struct Config {
     pub path: String,
-    pub interfaces_use: String,
-    pub interfaces_ignore: String,
+    pub session: api::SessionConfig,
 }
 #[derive(Debug)]
 pub struct Error {
@@ -59,13 +58,7 @@ impl Client {
                 KernelClient::new(tarpc::client::Config::default(), transport::framed(socket))
                     .spawn();
             let session = rpc
-                .open_session(
-                    context::current(),
-                    api::SessionConfig {
-                        interfaces_use: config.interfaces_use.clone(),
-                        interfaces_ignore: config.interfaces_ignore.clone(),
-                    },
-                )
+                .open_session(context::current(), config.session.clone())
                 .await
                 .map_err(io::Error::other)?
                 .map_err(io::Error::other)?;

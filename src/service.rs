@@ -76,8 +76,7 @@ impl Server {
                 self.master_device.clone(),
                 self.mtu,
                 self.interface_group,
-                String::new(),
-                String::new(),
+                SessionConfig::default(),
             )?
             .shutdown()?;
         }
@@ -334,7 +333,7 @@ fn repair_loop(session: Arc<Session>, wakeup: Receiver<()>) {
                         expiry: Some(Expiry {
                             protocol: id.proto,
                             spi: id.spi,
-                            destination: backend::endpoint(id.dst),
+                            destination: id.dst,
                             hard: true,
                         }),
                         acquire: None,
@@ -383,8 +382,7 @@ impl Kernel for Service {
                 self.server.master_device.clone(),
                 self.server.mtu,
                 self.server.interface_group,
-                config.interfaces_use,
-                config.interfaces_ignore,
+                config,
             )?;
             backend.policies.reconcile()?;
             backend.sas.clear()?;
@@ -480,7 +478,10 @@ impl Kernel for Service {
             if protocol != 50 {
                 return Err(unsupported());
             }
-            let (src, dst) = (backend::host(src)?, backend::host(dst)?);
+            let (src, dst) = (
+                backend::validate_endpoint(src)?,
+                backend::validate_endpoint(dst)?,
+            );
             if src.family() != dst.family() || minimum < 256 || minimum > maximum {
                 return Err(invalid());
             }
@@ -516,12 +517,7 @@ impl Kernel for Service {
             if cpi != 0 {
                 return Err(unsupported());
             }
-            let usage = backend.sas.query(&backend::sa_id(id)?)?;
-            Ok(SaUsage {
-                bytes: usage.bytes,
-                packets: usage.packets,
-                last_use: usage.last_use,
-            })
+            backend.sas.query(&backend::sa_id(id)?)
         })
     }
     async fn remove_sa(self, _: tarpc::context::Context, id: SaId, cpi: u16) -> Result<()> {
@@ -580,15 +576,12 @@ impl Kernel for Service {
         source: Option<Endpoint>,
     ) -> Result<Endpoint> {
         self.request(|backend| {
-            let src = source.map(backend::host).transpose()?;
+            let src = source.map(backend::validate_endpoint).transpose()?;
             let (host, _, _) =
                 backend
                     .net
-                    .lookup(&backend::host(destination)?, src.as_ref(), -1)?;
-            // Preserve the full caller endpoint when the backend confirms it.
-            Ok(source
-                .filter(|s| s.address == host.ip)
-                .unwrap_or_else(|| backend::endpoint(host)))
+                    .lookup(&backend::validate_endpoint(destination)?, src.as_ref(), -1)?;
+            Ok(host)
         })
     }
     async fn get_next_hop(
@@ -599,28 +592,24 @@ impl Kernel for Service {
         prefix: Option<i32>,
     ) -> Result<NextHop> {
         self.request(|backend| {
-            let dst = backend::host(destination)?;
-            let src = source.map(backend::host).transpose()?;
+            let dst = backend::validate_endpoint(destination)?;
+            let src = source.map(backend::validate_endpoint).transpose()?;
             let prefix = prefix.unwrap_or(-1);
             if prefix < -1 || prefix > dst.bits().into() {
                 return Err(invalid());
             }
             let (_, gateway, interface) = backend.net.lookup(&dst, src.as_ref(), prefix)?;
-            Ok(NextHop {
-                gateway: backend::endpoint(gateway),
-                interface,
-            })
+            Ok(NextHop { gateway, interface })
         })
     }
     async fn get_interface(self, _: tarpc::context::Context, address: Endpoint) -> Result<String> {
-        self.request(|backend| backend.net.interface(&backend::host(address)?))
+        self.request(|backend| backend.net.interface(&backend::validate_endpoint(address)?))
     }
     async fn list_addresses(self, _: tarpc::context::Context, which: i32) -> Result<Vec<Endpoint>> {
         self.request(|backend| {
             backend
                 .net
                 .enumerate(u32::try_from(which).map_err(|_| invalid())?)
-                .map(|hosts| hosts.into_iter().map(backend::endpoint).collect())
         })
     }
     async fn list_subnets(self, _: tarpc::context::Context) -> Result<Vec<Subnet>> {
@@ -629,7 +618,7 @@ impl Kernel for Service {
                 subnets
                     .into_iter()
                     .map(|(address, prefix, interface)| Subnet {
-                        address: backend::endpoint(address),
+                        address,
                         prefix,
                         interface,
                     })

@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     error::invalid,
-    model::{Host, Mark},
+    model::{Endpoint, Mark},
     policy::{ObservedPolicy, PolicyConfig, PolicyKernel, PolicyKey, PolicySpec, PolicyTemplate},
 };
 use ipnet::IpNet;
@@ -20,11 +20,7 @@ fn selector(id: &PolicyKey) -> packet::Selector {
     packet::Selector {
         saddr: packet::Address::from_ip(&id.src.addr()),
         daddr: packet::Address::from_ip(&id.dst.addr()),
-        family: Host {
-            ip: id.src.addr(),
-            port: 0,
-        }
-        .family(),
+        family: Endpoint::new(id.src.addr(), 0).family(),
         prefixlen_s: id.src.prefix_len(),
         prefixlen_d: id.dst.prefix_len(),
         proto: id.protocol,
@@ -89,9 +85,9 @@ impl LinuxPolicies {
         if_id: u32,
     ) -> io::Result<PolicyKey> {
         Ok(PolicyKey {
-            src: IpNet::new(host(sel.family, sel.saddr, 0)?.ip, sel.prefixlen_s)
+            src: IpNet::new(host(sel.family, sel.saddr, 0)?.address, sel.prefixlen_s)
                 .map_err(|_| invalid())?,
-            dst: IpNet::new(host(sel.family, sel.daddr, 0)?.ip, sel.prefixlen_d)
+            dst: IpNet::new(host(sel.family, sel.daddr, 0)?.address, sel.prefixlen_d)
                 .map_err(|_| invalid())?,
             src_port: sel.sport,
             src_port_mask: sel.sport_mask,
@@ -123,11 +119,7 @@ impl LinuxPolicies {
                     proto: 50,
                 },
                 saddr: packet::Address::from_ip(&template.src),
-                family: Host {
-                    ip: template.src,
-                    port: 0,
-                }
-                .family(),
+                family: Endpoint::new(template.src, 0).family(),
                 reqid: template.reqid,
                 mode: packet::XFRM_MODE_TUNNEL,
                 share: 0,
@@ -193,8 +185,8 @@ impl LinuxPolicies {
         let template = match templates {
             None | Some([]) => None,
             Some([template]) => Some(PolicyTemplate {
-                src: host(template.family, template.saddr, 0).ok()?.ip,
-                dst: host(template.family, template.id.daddr, 0).ok()?.ip,
+                src: host(template.family, template.saddr, 0).ok()?.address,
+                dst: host(template.family, template.id.daddr, 0).ok()?.address,
                 reqid: template.reqid,
                 spi: template.id.spi,
             }),
@@ -466,17 +458,11 @@ mod tests {
             ("192.0.2.1", "192.0.2.2", 32),
             ("2001:db8::1", "2001:db8::2", 128),
         ] {
-            let src = Host {
-                ip: src.parse().unwrap(),
-                port: 0,
-            };
-            let dst = Host {
-                ip: dst.parse().unwrap(),
-                port: 0,
-            };
+            let src = Endpoint::new(src.parse().unwrap(), 0);
+            let dst = Endpoint::new(dst.parse().unwrap(), 0);
             let id = PolicyKey::new(&PolicyId {
-                src: Ts::from_subnet(src.clone(), prefix, 0, 0, u16::MAX).unwrap(),
-                dst: Ts::from_subnet(dst.clone(), prefix, 0, 0, u16::MAX).unwrap(),
+                src: Ts::from_subnet(src, prefix, 0, 0, u16::MAX).unwrap(),
+                dst: Ts::from_subnet(dst, prefix, 0, 0, u16::MAX).unwrap(),
                 dir: 1,
                 mark: Mark::default(),
                 if_id: 41,
@@ -486,8 +472,8 @@ mod tests {
                 priority: 100,
                 block: false,
                 template: Some(PolicyTemplate {
-                    src: src.ip,
-                    dst: dst.ip,
+                    src: src.address,
+                    dst: dst.address,
                     reqid: 42,
                     spi: 0x10203,
                 }),
@@ -521,14 +507,10 @@ mod tests {
     #[test]
     fn specific_icmp_codes_outrank_type_only_policies() {
         for (address, protocol, icmp_type) in [("0.0.0.0", 1, 3), ("::", 58, 128)] {
-            let any = Host {
-                ip: address.parse().unwrap(),
-                port: 0,
-            };
+            let any = Endpoint::new(address.parse().unwrap(), 0);
             let mut id = PolicyId {
-                src: Ts::from_subnet(any.clone(), 0, protocol, icmp_type << 8, icmp_type << 8)
-                    .unwrap(),
-                dst: Ts::from_subnet(any.clone(), 0, 0, 0, u16::MAX).unwrap(),
+                src: Ts::from_subnet(any, 0, protocol, icmp_type << 8, icmp_type << 8).unwrap(),
+                dst: Ts::from_subnet(any, 0, 0, 0, u16::MAX).unwrap(),
                 dir: 1,
                 mark: Mark::default(),
                 if_id: 41,
@@ -537,7 +519,7 @@ mod tests {
                 kind: 1,
                 prio: 1,
                 manual_prio: 0,
-                src: any.clone(),
+                src: any,
                 dst: any,
                 reqid: 42,
                 policy_count: 1,
@@ -564,12 +546,9 @@ mod tests {
             ("10.1.0.0", "10.1.0.1", "10.1.0.254", 24),
             ("2001:db8::", "2001:db8::1", "2001:db8::fffe", 112),
         ] {
-            let host = Host {
-                ip: network.parse().unwrap(),
-                port: 0,
-            };
+            let host = Endpoint::new(network.parse().unwrap(), 0);
             let id = PolicyId {
-                src: Ts::from_subnet(host.clone(), prefix, 6, 1024, 2047).unwrap(),
+                src: Ts::from_subnet(host, prefix, 6, 1024, 2047).unwrap(),
                 dst: Ts::from_subnet(host, prefix, 0, 0, u16::MAX).unwrap(),
                 dir: 1,
                 mark: Mark {
@@ -582,8 +561,8 @@ mod tests {
             // The kernel sees the same prefixes, aligned port range and
             // protocol even though the caller's traffic selectors differ.
             let mut equivalent = id.clone();
-            equivalent.src.from.ip = first.parse().unwrap();
-            equivalent.src.to.ip = last.parse().unwrap();
+            equivalent.src.from.address = first.parse().unwrap();
+            equivalent.src.to.address = last.parse().unwrap();
             equivalent.src.from.port = 123;
             equivalent.src.from_port = 1025;
             equivalent.src.to_port = 2046;
@@ -612,12 +591,8 @@ mod tests {
         for (address, prefix, protocol, type_code) in
             [("10.1.0.0", 24, 1, 0x0800), ("2001:db8::", 64, 58, 0x8001)]
         {
-            let host = Host {
-                ip: address.parse().unwrap(),
-                port: 0,
-            };
-            let src =
-                Ts::from_subnet(host.clone(), prefix, protocol, type_code, type_code).unwrap();
+            let host = Endpoint::new(address.parse().unwrap(), 0);
+            let src = Ts::from_subnet(host, prefix, protocol, type_code, type_code).unwrap();
             let dst = Ts::from_subnet(host, prefix, 0, 0, u16::MAX).unwrap();
             let selector = selector(
                 &PolicyKey::new(&PolicyId {
@@ -636,7 +611,7 @@ mod tests {
             let parsed = packet::Selector::parse(&bytes).unwrap();
             for source in [false, true] {
                 let decoded = selector_ts(&parsed, source).unwrap();
-                assert_eq!(decoded.from.ip, src.from.ip);
+                assert_eq!(decoded.from.address, src.from.address);
                 assert_eq!(decoded.from_port, type_code);
                 assert_eq!(decoded.to_port, type_code);
             }

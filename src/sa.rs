@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Immutable SA lifecycle. Established SAs are never repaired or recreated:
 //! loss or configuration drift retires them and asks the IKE owner to recover.
-use crate::model::{AddSa, Host, SaId};
+use crate::model::{Endpoint, SaConfig, SaId};
+pub use crate::rpc_api::SaUsage;
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -19,7 +20,7 @@ fn missing() -> io::Error {
 /// completion of a larval reservation; they are never replayed by an audit.
 pub struct SaSpec<'a> {
     pub id: &'a SaId,
-    pub config: &'a AddSa<'a>,
+    pub config: &'a SaConfig,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,13 +30,6 @@ pub enum SaState {
     /// A temporary kernel acquisition, before the IKE owner installs an SA.
     /// The kernel owns its timeout; it may not yet have an addressable SPI.
     Acquiring,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SaUsage {
-    pub bytes: u64,
-    pub packets: u64,
-    pub last_use: u64,
 }
 
 pub trait SaHandle {
@@ -66,8 +60,8 @@ pub trait SaKernel: Send {
     fn features(&self) -> u32;
     fn allocate(
         &mut self,
-        src: &Host,
-        dst: &Host,
+        src: &Endpoint,
+        dst: &Endpoint,
         proto: u8,
         min: u32,
         max: u32,
@@ -94,8 +88,8 @@ struct Reservation {
 impl From<&SaId> for Reservation {
     fn from(id: &SaId) -> Self {
         Self {
-            src: id.src.ip,
-            dst: id.dst.ip,
+            src: id.src.address,
+            dst: id.dst.address,
             spi: id.spi,
             proto: id.proto,
         }
@@ -141,22 +135,22 @@ impl<K: SaKernel> Sas<K> {
     }
     pub fn allocate(
         &mut self,
-        src: Host,
-        dst: Host,
+        src: Endpoint,
+        dst: Endpoint,
         proto: u8,
         min: u32,
         max: u32,
     ) -> io::Result<u32> {
         let spi = self.kernel.allocate(&src, &dst, proto, min, max)?;
         self.reservations.insert(Reservation {
-            src: src.ip,
-            dst: dst.ip,
+            src: src.address,
+            dst: dst.address,
             spi,
             proto,
         });
         Ok(spi)
     }
-    pub fn install(&mut self, id: &SaId, data: &AddSa<'_>) -> io::Result<()> {
+    pub fn install(&mut self, id: &SaId, data: &SaConfig) -> io::Result<()> {
         let key = id.key();
         if self.installed.contains_key(&key) {
             return Err(io::Error::from_raw_os_error(libc::EEXIST));
@@ -280,20 +274,21 @@ mod tests {
         }
         fn allocate(
             &mut self,
-            src: &Host,
-            dst: &Host,
+            src: &Endpoint,
+            dst: &Endpoint,
             proto: u8,
             min: u32,
             _: u32,
         ) -> io::Result<u32> {
             let id = SaId {
-                src: src.without_port(),
-                dst: dst.without_port(),
+                src: *src,
+                dst: *dst,
                 spi: min,
                 proto,
                 mark: Mark::default(),
                 if_id: 0,
-            };
+            }
+            .key();
             self.objects
                 .insert(id, (None, SaState::Larval, 1, SaUsage::default()));
             Ok(min)
@@ -348,40 +343,66 @@ mod tests {
             Ok(())
         }
     }
-    fn fixture() -> (SaId, AddSa<'static>) {
+    fn fixture() -> (SaId, SaConfig) {
         (
             SaId {
-                src: Host {
-                    ip: "192.0.2.1".parse().unwrap(),
-                    port: 13000,
-                },
-                dst: Host {
-                    ip: "192.0.2.2".parse().unwrap(),
-                    port: 13000,
-                },
+                src: Endpoint::new("192.0.2.1".parse().unwrap(), 13000),
+                dst: Endpoint::new("192.0.2.2".parse().unwrap(), 13000),
                 spi: 0x10203,
                 proto: 50,
                 mark: Mark::default(),
                 if_id: 41,
             },
-            AddSa {
+            SaConfig {
                 reqid: 42,
-                seq: 0,
-                lifetime: [0; 6],
-                enc_alg: 20,
-                enc_key: &[0; 20],
-                int_alg: 1024,
-                int_key: &[],
-                enc_name: String::new(),
-                int_name: String::new(),
+                acquire_sequence: 0,
+                mode: 2,
+                src_selectors: None,
+                dst_selectors: None,
+                interface: None,
+                encryption: crate::rpc_api::Algorithm {
+                    id: 20,
+                    name: String::new(),
+                    key: vec![0; 20],
+                },
+                integrity: crate::rpc_api::Algorithm {
+                    id: 1024,
+                    name: String::new(),
+                    key: Vec::new(),
+                },
+                lifetime: Some(crate::rpc_api::Lifetime {
+                    time: crate::rpc_api::LifetimeLimit {
+                        life: 0,
+                        rekey: 0,
+                        jitter: 0,
+                    },
+                    bytes: crate::rpc_api::LifetimeLimit {
+                        life: 0,
+                        rekey: 0,
+                        jitter: 0,
+                    },
+                    packets: crate::rpc_api::LifetimeLimit {
+                        life: 0,
+                        rekey: 0,
+                        jitter: 0,
+                    },
+                }),
                 replay_window: 128,
+                ipcomp: 0,
+                cpi: 0,
+                cpu: u32::MAX,
+                hw_offload: 0,
+                security_label: None,
                 tfc: 0,
-                encap: true,
-                mark: Mark::default(),
+                udp_encapsulation: true,
+                output_mark: Mark::default(),
                 esn: true,
                 copy_df: true,
                 copy_ecn: true,
                 copy_dscp: 0,
+                iptfs_dont_fragment: false,
+                forward_icmp: false,
+                initiator: true,
                 inbound: false,
                 update: false,
             },
@@ -434,7 +455,7 @@ mod tests {
         let (mut id, mut data) = fixture();
         let mut sas = Sas::new(MemoryKernel::default());
         id.spi = sas
-            .allocate(id.src.clone(), id.dst.clone(), 50, 0xc0000000, 0xcfffffff)
+            .allocate(id.src, id.dst, 50, 0xc0000000, 0xcfffffff)
             .unwrap();
         assert!(sas.reconcile().unwrap().expired.is_empty());
         assert_eq!(sas.kernel.objects.len(), 1);

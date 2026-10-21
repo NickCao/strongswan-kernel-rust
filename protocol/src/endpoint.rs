@@ -1,9 +1,49 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 use crate::Endpoint;
+use rustix::net::AddressFamily;
 use std::{
     io,
-    net::{IpAddr, SocketAddr, SocketAddrV6},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
 };
+
+impl Endpoint {
+    pub fn new(address: IpAddr, port: u16) -> Self {
+        Self {
+            address,
+            port,
+            flow_info: 0,
+            scope_id: 0,
+        }
+    }
+    pub fn family(&self) -> u16 {
+        if self.address.is_ipv4() {
+            AddressFamily::INET.as_raw()
+        } else {
+            AddressFamily::INET6.as_raw()
+        }
+    }
+    pub fn bits(&self) -> u8 {
+        if self.address.is_ipv4() {
+            32
+        } else {
+            128
+        }
+    }
+    pub fn any(family: u16) -> io::Result<Self> {
+        let address = match AddressFamily::from_raw(family) {
+            AddressFamily::INET => Ipv4Addr::UNSPECIFIED.into(),
+            AddressFamily::INET6 => Ipv6Addr::UNSPECIFIED.into(),
+            _ => return Err(io::ErrorKind::InvalidInput.into()),
+        };
+        Ok(Self::new(address, 0))
+    }
+    pub fn is_link_local(&self) -> bool {
+        match self.address {
+            IpAddr::V4(address) => address.is_link_local(),
+            IpAddr::V6(address) => address.is_unicast_link_local(),
+        }
+    }
+}
 
 impl TryFrom<&Endpoint> for SocketAddr {
     type Error = io::Error;
