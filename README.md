@@ -172,14 +172,18 @@ Modular loading is needed because the standalone plugin is absent from
 strongSwan's compile-time plugin list. Include the package-generated snippets
 to retain its enabled plugins without maintaining a global `load` list.
 
-The VM check uses actual strongSwan `charon-systemd` processes with dynamic
-users and no capabilities, alongside the restricted dynamic kernel daemons.
-It checks plugin discovery from the system profile, socket authorization,
+The VM check connects an unprivileged dynamic-user strongSwan `charon-systemd`
+using the Rust backend to a privileged upstream `kernel-netlink` peer. The
+upstream peer has no Rust plugin or daemon; systemd-networkd creates its static
+XFRM interface. Each implementation initiates a connection, and both send
+encrypted IPv4/IPv6 traffic. Policy/interface damage and SA loss are injected
+on the Rust peer, with recovery checked against the untouched upstream peer.
+It also checks plugin discovery from the system profile, socket authorization,
 the kernel RPC contract regressions in an isolated network namespace,
 AES-GCM and AES-CBC/HMAC, TFC padding, encrypted IPv4/IPv6 traffic,
 SA use times that age while idle and reset after traffic, rekeying without
 interface replacement, final-SA cleanup, configurable interface names/MTUs/groups,
-default and custom VRF masters, multicast flags, VRF-routed IPv4/IPv6 traffic,
+custom VRF attachment, multicast flags, VRF-routed IPv4/IPv6 traffic,
 VICI responsiveness with 200 connections and continuous BGP-style route updates,
 VICI access from a separate dynamic controller, coordinated stop/restart,
 startup failure, daemon failure, and runtime directory removal.
@@ -449,9 +453,9 @@ client reference is released. Reading RPC replies cannot consume eventfd
 wakeups, so no custom transport, notification frames or framing-buffer
 inspection are needed.
 
-See [the historical event delivery measurements](BENCHMARKS.md) for the previous
-socket-notification implementation's comparison with the Tokio-worker client
-and continuous current-thread polling.
+See [the event delivery benchmarks](BENCHMARKS.md) for the eventfd implementation's
+comparison with socket notifications, the Tokio-worker client and continuous
+current-thread polling.
 
 The plugin still implements strongSwan's C interfaces. Its remaining unsafe
 code borrows C callback arguments, invokes host functions, manages the exported

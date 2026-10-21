@@ -22,11 +22,11 @@ let
           local_port = 13000
           remote_port = 13000
           proposals = aes128-sha256-x25519
-          # The backend must force ESP-in-UDP without a connection override.
+          # The Rust backend must force ESP-in-UDP without a connection override.
           encap = no
           mobike = no
-          if_id_in = %unique
-          if_id_out = %unique
+          if_id_in = ${if peer == 1 then "%unique" else "42"}
+          if_id_out = ${if peer == 1 then "%unique" else "42"}
           local {
             auth = psk
             id = peer-${toString peer}
@@ -63,14 +63,13 @@ let
     peer:
     { config, lib, ... }:
     let
-      master = if peer == 1 then "gravity" else "overlay";
+      native = peer == 2;
+      master = if native then "gravity" else "overlay";
     in
     {
       imports = [ module ];
       services.charon-kernel = {
-        enable = true;
-      }
-      // lib.optionalAttrs (peer == 2) {
+        enable = !native;
         mtu = 1380;
         interfaceNamePrefix = "gn";
         interfaceGroup = 17228;
@@ -110,13 +109,23 @@ let
         pkgs.iproute2
         pkgs.python3
         pkgs.util-linux
-      ];
-      systemd.services = lib.genAttrs [ "strongswan-swanctl" "charon-kernel" ] (name: {
-        postStart =
-          "${pkgs.python3}/bin/python3 ${../tests/hardening.py} "
-          + (if name == "strongswan-swanctl" then "strongswan" else name)
-          + " ${pkgs.keyutils}/bin/keyctl";
-      });
+      ]
+      ++ lib.optional native package.strongswan;
+      environment.pathsToLink = lib.mkIf native [ "/lib/ipsec/plugins" ];
+      services.strongswan-swanctl.enable = lib.mkIf native true;
+      services.strongswan-swanctl.package = lib.mkIf native package.strongswan;
+      systemd.services =
+        if native then
+          {
+            strongswan-swanctl.serviceConfig.RuntimeDirectory = "strongswan";
+          }
+        else
+          lib.genAttrs [ "strongswan-swanctl" "charon-kernel" ] (name: {
+            postStart =
+              "${pkgs.python3}/bin/python3 ${../tests/hardening.py} "
+              + (if name == "strongswan-swanctl" then "strongswan" else name)
+              + " ${pkgs.keyutils}/bin/keyctl";
+          });
       systemd.network = {
         enable = true;
         netdevs = {
@@ -130,6 +139,20 @@ let
           "20-overlay-addresses".netdevConfig = {
             Name = "overlay0";
             Kind = "dummy";
+          };
+        }
+        // lib.optionalAttrs native {
+          # kernel-netlink installs SAs/policies but does not create XFRM links.
+          "20-ipsec" = {
+            netdevConfig = {
+              Name = "stock0000002a";
+              Kind = "xfrm";
+              MTUBytes = "1400";
+            };
+            xfrmConfig = {
+              InterfaceId = 42;
+              Independent = true;
+            };
           };
         };
         networks = {
@@ -148,20 +171,22 @@ let
               LinkLocalAddressing = "no";
             };
           };
-          # The daemon owns link settings. Networkd owns addresses and routes,
-          # and reapplies them when reconciliation recreates a tunnel link.
+          # Networkd owns the upstream peer's static link. On the Rust peer it
+          # only reapplies addresses/routes when the daemon recreates the link.
           "30-ipsec" = {
-            matchConfig.Name = if peer == 1 then "ranet*" else "gn*";
+            matchConfig.Name = if native then "stock*" else "gn*";
             linkConfig = {
               RequiredForOnline = false;
-              ActivationPolicy = "manual";
-            };
+              ActivationPolicy = if native then "up" else "manual";
+            }
+            // lib.optionalAttrs native { Multicast = true; };
             networkConfig = {
-              KeepMaster = true;
+              KeepMaster = !native;
               ConfigureWithoutCarrier = true;
               LinkLocalAddressing = "no";
               IPv6AcceptRA = false;
-            };
+            }
+            // lib.optionalAttrs native { VRF = master; };
             address = [
               "198.18.${toString peer}.1/32"
               "fd20:${toString peer}::1/128"
@@ -190,10 +215,10 @@ let
           plugins {
             include ${config.services.strongswan-swanctl.package}/share/strongswan/templates/config/plugins/*.conf
             kernel-netlink {
-              load = no
+              load = ${if native then "yes" else "no"}
             }
             kernel-rust {
-              load = yes
+              load = ${if native then "no" else "yes"}
             }
           }
         }
@@ -213,15 +238,15 @@ in
     import time
 
     machines = [left, right]
-    interface_settings = [("ranet", 1400, "gravity"), ("gn", 1380, "overlay")]
-    interface_groups = [17227, 17228]
+    interface_settings = [("gn", 1380, "overlay"), ("stock", 1400, "gravity")]
+    interface_groups = [17228, 0]
     capability_fields = ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"]
 
     def ctl(machine, arguments):
         return machine.succeed("swanctl " + arguments)
 
     def links(machine):
-        return json.loads(machine.succeed("ip -j -d link show type xfrm"))
+        return json.loads(machine.succeed("ip -N -j -d link show type xfrm"))
 
     def indices(machine):
         return {link["ifname"]: link["ifindex"] for link in links(machine)}
@@ -303,11 +328,23 @@ in
     with subtest("systemd runtime directories and least privilege"):
         for peer, machine in enumerate(machines, 1):
             machine.wait_for_unit("strongswan-swanctl.service")
-            machine.wait_for_unit("charon-kernel.service")
             machine.wait_for_unit("systemd-networkd.service")
             machine.wait_until_succeeds(
                 f"ip -o -6 address show dev overlay0 | grep -F 'fd10:{peer}::1/128' | grep -v tentative"
             )
+            statistics = ctl(machine, "--stats")
+            if machine is right:
+                assert "kernel-netlink" in statistics and "kernel-rust" not in statistics
+                assert property(machine, "charon-kernel.service", "LoadState") == "not-found"
+                machine.succeed("test ! -e /run/charon-kernel")
+                machine.succeed("test ! -e /run/current-system/sw/lib/ipsec/plugins/libstrongswan-kernel-rust.so")
+                ike = process_status(machine, "strongswan-swanctl.service")
+                assert int(ike["CapEff"], 16) & (1 << 12), ike
+                assert not spis(machine)
+                wait_interface(machine, peer, "stock0000002a")
+                wait_overlay_config(machine, peer, "stock0000002a")
+                continue
+            machine.wait_for_unit("charon-kernel.service")
             machine.succeed("test -S /run/charon-kernel/charon-kernel.sock")
             assert property(machine, "charon-kernel.service", "Type") == "notify"
             backend = process_status(machine, "charon-kernel.service")
@@ -348,7 +385,6 @@ in
             assert set(property(machine, "strongswan-swanctl.service", "RestrictAddressFamilies").split()) == {
                 "AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"
             }
-            statistics = ctl(machine, "--stats")
             assert "kernel-rust" in statistics and "kernel-netlink" not in statistics
             assert not links(machine) and not spis(machine)
             controller = machine.succeed(
@@ -380,11 +416,13 @@ in
         ("AES-GCM", "${connection 1 "aes128gcm128-esn"}", "${connection 2 "aes128gcm128-esn"}", "rfc4106(gcm(aes))"),
         ("AES-CBC/HMAC", "${connection 1 "aes128-sha256-esn"}", "${connection 2 "aes128-sha256-esn"}", "cbc(aes)"),
     ]
-    for name, left_config, right_config, algorithm in proposals:
+    for proposal_index, (name, left_config, right_config, algorithm) in enumerate(proposals):
         with subtest(name + ": IKE, ESP-in-UDP, wildcard selectors and IPv4/IPv6 traffic"):
             for machine, config_file in zip(machines, [left_config, right_config]):
                 ctl(machine, "--load-all --noprompt --file " + config_file)
-            assert "established" in ctl(left, "--initiate --child net")
+            # Exercise each implementation as both initiator and responder.
+            initiator = machines[proposal_index % len(machines)]
+            assert "established" in ctl(initiator, "--initiate --child net")
             original_indices = []
             for peer, machine in enumerate(machines, 1):
                 listing = ctl(machine, "--list-sas --raw")
@@ -411,8 +449,7 @@ in
         with subtest(name + ": policy flush recovers without replacing SAs or interfaces"):
             expected_policies = [policy_specs(machine) for machine in machines]
             original_spis = [spis(machine) for machine in machines]
-            for machine in machines:
-                machine.succeed("ip xfrm policy flush")
+            left.succeed("ip xfrm policy flush")
             for peer, machine in enumerate(machines, 1):
                 for attempt in range(100):
                     if policy_specs(machine) == expected_policies[peer - 1]:
@@ -427,16 +464,16 @@ in
         with subtest(name + ": interface settings repair preserves SAs and interface indices"):
             original_spis = [spis(machine) for machine in machines]
             expected_policies = [policy_specs(machine) for machine in machines]
-            for peer, machine in enumerate(machines, 1):
-                interface = next(iter(original_indices[peer - 1]))
-                machine.succeed(f"ip link set dev {interface} alias user-managed txqueuelen 123 promisc on")
-                machine.succeed(f"ip link set dev {interface} nomaster")
-                machine.succeed(f"ip link set dev {interface} down mtu 1280 multicast off")
+            interface = next(iter(original_indices[0]))
+            left.succeed(f"ip link set dev {interface} alias user-managed txqueuelen 123 promisc on")
+            left.succeed(f"ip link set dev {interface} nomaster")
+            left.succeed(f"ip link set dev {interface} down mtu 1280 multicast off")
             for peer, machine in enumerate(machines, 1):
                 interface = next(iter(original_indices[peer - 1]))
                 repaired = wait_interface(machine, peer, interface)
-                assert repaired["ifalias"] == "user-managed" and repaired["txqlen"] == 123, repaired
-                assert "PROMISC" in repaired["flags"], repaired
+                if machine is left:
+                    assert repaired["ifalias"] == "user-managed" and repaired["txqlen"] == 123, repaired
+                    assert "PROMISC" in repaired["flags"], repaired
                 assert indices(machine) == original_indices[peer - 1]
                 assert spis(machine) == original_spis[peer - 1]
                 assert policy_specs(machine) == expected_policies[peer - 1]
@@ -447,18 +484,20 @@ in
             with subtest(name + f": {mutation} interfaces recover with networkd addresses and routes"):
                 original_spis = [spis(machine) for machine in machines]
                 expected_policies = [policy_specs(machine) for machine in machines]
-                for peer, machine in enumerate(machines, 1):
-                    interface = next(iter(original_indices[peer - 1]))
-                    if mutation == "deleted":
-                        machine.succeed(f"ip link del dev {interface}")
-                    else:
-                        machine.succeed(f"ip link set dev {interface} name renamed")
+                interface = next(iter(original_indices[0]))
+                if mutation == "deleted":
+                    left.succeed(f"ip link del dev {interface}")
+                else:
+                    left.succeed(f"ip link set dev {interface} name renamed")
                 for peer, machine in enumerate(machines, 1):
                     interface = next(iter(original_indices[peer - 1]))
                     recreated = wait_interface(machine, peer, interface)
-                    assert recreated["ifindex"] != original_indices[peer - 1][interface]
-                    if mutation == "renamed":
-                        machine.fail("ip link show dev renamed")
+                    if machine is left:
+                        assert recreated["ifindex"] != original_indices[peer - 1][interface]
+                        if mutation == "renamed":
+                            machine.fail("ip link show dev renamed")
+                    else:
+                        assert indices(machine) == original_indices[peer - 1]
                     assert spis(machine) == original_spis[peer - 1]
                     assert policy_specs(machine) == expected_policies[peer - 1]
                     wait_overlay_config(machine, peer, interface)
@@ -481,7 +520,7 @@ in
                            for direction in previous), (previous, idle)
             for machine, interface in tunnels:
                 machine.succeed(f"tc qdisc del dev {interface} clsact")
-            left.succeed("ip vrf exec gravity ping -c 1 -W 2 -I 10.1.0.1 10.2.0.1")
+            left.succeed("ip vrf exec overlay ping -c 1 -W 2 -I 10.1.0.1 10.2.0.1")
             for machine in machines:
                 usage = sa_use_times(machine)
                 assert all(0 <= value <= 2 for value in usage.values()), usage
@@ -560,15 +599,22 @@ in
                     if mutation == "rekey-flush":
                         right.succeed("tc qdisc del dev eth1 root")
 
-        with subtest(name + ": removing the final SA removes its interface"):
+        with subtest(name + ": final-SA cleanup removes only the Rust-managed interface"):
             ctl(left, "--terminate --ike tunnel")
             for peer, machine in enumerate(machines, 1):
                 machine.wait_until_succeeds("test -z \"$(ip xfrm state)\"")
-                machine.wait_until_succeeds("test \"$(ip -j link show type xfrm)\" = '[]'")
+                if machine is left:
+                    machine.wait_until_succeeds("test \"$(ip -j link show type xfrm)\" = '[]'")
+                else:
+                    assert indices(machine) == original_indices[peer - 1]
                 master = interface_settings[peer - 1][2]
                 machine.succeed(f"ip link show dev {master}")
                 policies = machine.succeed("ip xfrm policy list nosock")
-                assert "if_id" not in policies and "priority 32" in policies, policies
+                if machine is left:
+                    assert "if_id" not in policies and "priority 32" in policies, policies
+                else:
+                    # The native backend's bypasses are socket policies.
+                    assert not policies.strip(), policies
 
     with subtest("strongSwan restart restarts the backend after cleaning live SAs"):
         for machine, config_file in zip(machines, [proposals[0][1], proposals[0][2]]):
@@ -585,7 +631,8 @@ in
         assert "kernel-rust" in ctl(left, "--stats")
         for machine in machines:
             machine.wait_until_succeeds("test -z \"$(ip xfrm state)\"")
-            assert not links(machine)
+        assert not links(left)
+        assert indices(right) == original_indices[1]
 
     with subtest("restarting the backend also restarts its strongSwan dependent"):
         previous = property(left, "strongswan-swanctl.service", "MainPID")
@@ -611,21 +658,24 @@ in
         assert "kernel-rust" in ctl(left, "--stats")
 
     with subtest("strongSwan exiting without a stop job stops the unused backend"):
-        right.succeed("systemctl kill --signal=TERM --kill-whom=main strongswan-swanctl.service")
-        assert_stopped(right, "strongswan-swanctl.service")
-        assert_stopped(right, "charon-kernel.service")
-        assert_empty(right)
-        right.succeed("test ! -e /run/strongswan && test ! -e /run/charon-kernel")
-        right.succeed("systemctl start strongswan-swanctl.service")
-        assert "kernel-rust" in ctl(right, "--stats")
+        left.succeed("systemctl kill --signal=TERM --kill-whom=main strongswan-swanctl.service")
+        assert_stopped(left, "strongswan-swanctl.service")
+        assert_stopped(left, "charon-kernel.service")
+        assert_empty(left)
+        left.succeed("test ! -e /run/strongswan && test ! -e /run/charon-kernel")
+        left.succeed("systemctl start strongswan-swanctl.service")
+        assert "kernel-rust" in ctl(left, "--stats")
 
     with subtest("stopping strongSwan stops the backend and removes runtime directories"):
         for machine in machines:
             machine.succeed("systemctl stop strongswan-swanctl.service")
-            assert_stopped(machine, "charon-kernel.service")
             machine.succeed("test ! -e /run/strongswan")
             machine.succeed("test ! -e /run/charon-kernel")
-            assert_empty(machine)
+        assert_stopped(left, "charon-kernel.service")
+        assert_empty(left)
+        assert not spis(right)
+        assert indices(right) == original_indices[1]
+        assert not right.succeed("ip xfrm policy list nosock").strip()
 
     with subtest("failed backend startup prevents strongSwan startup"):
         left.succeed("mkdir -p /run/systemd/system/charon-kernel.service.d")

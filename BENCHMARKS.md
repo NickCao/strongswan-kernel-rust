@@ -1,8 +1,52 @@
 # Event delivery comparison
 
-These measurements describe the previous `560f002` socket-notification
-implementation. The current implementation uses a passed eventfd and standard
-tarpc framing; it has not been measured in this comparison.
+The eventfd implementation (`2834370`) was sampled on 2026-10-21 with matching
+release daemon/plugin pairs in the same two-vCPU NixOS VM. The table uses one
+completed trial per implementation, as the user requested rough results.
+Each callback trial contains 5,000 calls; notification medians contain ten
+route probes. These are rough samples, not a completed repeated benchmark.
+
+| Measurement | Tokio worker (`adbea09`) | Busy polling (`94da3b5`) | Socket notifications (`560f002`) | Eventfd (`2834370`) |
+| --- | ---: | ---: | ---: | ---: |
+| Callback p50 | 211.2 us | 147.4 us | 111.4 us | 155.4 us |
+| Callback p95 | 352.1 us | 249.0 us | 193.3 us | 264.5 us |
+| Client CPU / 5,000 callbacks | 0.587 s | 0.460 s | 0.363 s | 0.317 s |
+| Daemon CPU during callback loop | 0.600 s | 0.500 s | 0.460 s | 0.530 s |
+| Combined idle CPU, core equivalents | 0.0000 | 1.1687 | 0.0033 | 0.0033 |
+| Idle roam notification p50 | 51.7 ms | 49.8 ms | 9.3 ms | 10.2 ms |
+| VICI: initial / reload, quiet | 1.945 / 0.907 s | 2.386 / 1.021 s | 2.153 / 0.774 s | 2.759 / 0.237 s |
+| VICI: initial / reload, route churn | 1.806 / 1.069 s | 2.396 / 0.993 s | 2.090 / 0.895 s | 2.097 / 0.909 s |
+
+Eventfd retains the low idle CPU and prompt notifications of socket
+notifications. Its callback and quiet initial-load latency were higher in this
+sample, while VICI under churn was similar. The quiet reload was faster. These
+single-run results do not establish a consistent latency improvement or regression.
+Zero idle CPU means no observed process ticks in the three-second sample;
+0.0033 cores is about 0.33% of one CPU and busy polling consumed about 117%.
+
+The new harness restarts services between quiet/churn workloads and stops them
+before the standalone ABI fixture, so a second busy client does not compete
+with the measured callback client. Its route worker uses a persistent
+line-buffered `ip -batch` process, with a link-query acknowledgement after each
+ten-route batch and a 10 ms pause. This avoids the process-creation stalls found
+in the previous worker. Every completed churn phase made progress, but actual
+counts still differed: initial/reload counts were 1610/760 for the Tokio worker,
+2130/890 for busy polling, 190/780 for socket notifications and 90/790 for eventfd.
+Churn comparisons are descriptive, not measurements at an identical update rate.
+The remaining callback/notification methodology is described below.
+
+Raw samples, scripts, exact package paths and logs are preserved in
+`/root/charon-kernel-eventfd-benchmark/`. The eventfd release package is
+`/nix/store/v12lg3zhhjpaxavkdxlgsgyac8nga2cf-strongswan-kernel-rust-0.1.0`.
+The full mixed-peer x86_64 NixOS test passed in 303.29 seconds, with the Rust
+backend on one peer and upstream `kernel-netlink` on the other, including traffic
+in both directions, both cipher cases, recovery, hardening and shutdown.
+Its log is `/root/charon-kernel-mixed-peer-final-nix.log`.
+
+## Earlier full comparison
+
+The following measurements describe the previous `560f002` socket-notification
+implementation and use the older benchmark harness.
 
 Measured on 2026-10-21 with matching release daemon/plugin pairs and unmodified
 strongSwan 6.1.0 in one NixOS VM: two vCPUs, 768 MiB RAM, Linux 6.18.56 and
