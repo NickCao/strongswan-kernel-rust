@@ -126,6 +126,13 @@ fn xfrm_egress_and_policy_rules_are_honored(
         ),
         Err(Error::Kernel(libc::ENETUNREACH))
     );
+    assert_eq!(
+        rpc.call(
+            rpc.kernel
+                .get_next_hop(ctx(), family.destination(), Some(family.local()), None)
+        ),
+        Err(Error::Kernel(libc::ENETUNREACH))
+    );
     ip(&["route", "del", &family.destination().address.to_string()]);
     ip(&[
         "route",
@@ -207,6 +214,15 @@ fn address_enumeration_flags(
     ip(&["link", "add", "foreign", "type", "xfrm", "if_id", "77"]);
     ip(&["link", "set", "foreign", "up"]);
     ip(&["addr", "add", "198.51.100.1/24", "dev", "foreign"]);
+    ip(&[
+        "-6",
+        "addr",
+        "add",
+        "2001:db8:77::1/64",
+        "dev",
+        "foreign",
+        "nodad",
+    ]);
     let rpc = daemon.connect();
     rpc.open(SessionConfig {
         interfaces_ignore: "ignored".into(),
@@ -221,21 +237,37 @@ fn address_enumeration_flags(
     assert!(!addresses
         .iter()
         .any(|e| e.is_link_local() || e.address.is_loopback()));
-    assert!(!contains("198.51.100.1"));
+    for address in ["198.51.100.1", "2001:db8:77::1"] {
+        assert!(!contains(address));
+        assert_eq!(
+            rpc.call(
+                rpc.kernel
+                    .get_interface(ctx(), Endpoint::new(address.parse().unwrap(), 0))
+            ),
+            Err(Error::Kernel(libc::ENOENT))
+        );
+    }
     let subnets = rpc.call(rpc.kernel.list_subnets(ctx())).unwrap();
     assert!(subnets.iter().all(|s| s.interface == "underlay"));
     rpc.close();
 }
 
 #[rstest]
+#[case::ignored_dummy(false)]
+#[case::xfrm(true)]
 #[ignore = "requires root and iproute2; creates a network namespace"]
 fn multihomed_sources_are_independent_of_egress_filters(
     daemon: Fixture,
+    #[case] xfrm: bool,
     #[values(Family::V4, Family::V6)] family: Family,
     #[values(false, true)] source_up: bool,
     #[values(false, true)] explicit_source: bool,
 ) {
-    ip(&["link", "add", "spare", "type", "dummy"]);
+    if xfrm {
+        ip(&["link", "add", "spare", "type", "xfrm", "if_id", "77"]);
+    } else {
+        ip(&["link", "add", "spare", "type", "dummy"]);
+    }
     let source = family.host("198.18.1.1", "2001:db8:3::1");
     let cidr = format!("{}/{}", source.address, source.bits());
     ip(&["addr", "add", &cidr, "dev", "spare", "nodad"]);
@@ -282,6 +314,46 @@ fn multihomed_sources_are_independent_of_egress_filters(
         .unwrap()
         .iter()
         .any(|e| e.address == source.address));
+    rpc.close();
+}
+
+#[rstest]
+#[ignore = "requires root and iproute2; creates a network namespace"]
+fn discovery_cache_tracks_link_state_changes(
+    daemon: Fixture,
+    #[values(Family::V4, Family::V6)] family: Family,
+) {
+    ip(&["link", "add", "spare", "type", "dummy"]);
+    // Keep the address present when administratively down, as for IPv4.
+    std::fs::write("/proc/sys/net/ipv6/conf/spare/keep_addr_on_down", "1").unwrap();
+    let source = family.host("198.18.1.1", "2001:db8:3::1");
+    ip(&[
+        "addr",
+        "add",
+        &format!("{}/{}", source.address, source.bits()),
+        "dev",
+        "spare",
+        "nodad",
+    ]);
+    let rpc = daemon.connect();
+    rpc.open(SessionConfig {
+        interfaces_ignore: "spare".into(),
+        ..Default::default()
+    });
+    let listed = |which| {
+        rpc.call(rpc.kernel.list_addresses(ctx(), which))
+            .unwrap()
+            .iter()
+            .any(|e| e.address == source.address)
+    };
+    assert!(!listed(5)); // REGULAR | IGNORED still excludes down interfaces.
+    assert!(listed(7)); // REGULAR | IGNORED | DOWN includes this address.
+    ip(&["link", "set", "spare", "up"]);
+    eventually(|| listed(5));
+    assert!(!listed(1));
+    ip(&["link", "set", "spare", "down"]);
+    eventually(|| !listed(5));
+    assert!(listed(7));
     rpc.close();
 }
 

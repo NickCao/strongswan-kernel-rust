@@ -271,7 +271,10 @@ impl Rpc {
         &self,
         call: impl Future<Output = std::result::Result<Result<T>, RpcError>>,
     ) -> Result<T> {
-        self.runtime.block_on(call).expect("RPC transport failed")
+        self.run(call).expect("RPC transport failed")
+    }
+    pub fn run<F: Future>(&self, future: F) -> F::Output {
+        self.runtime.block_on(future)
     }
     pub fn open(&self, config: SessionConfig) {
         self.call(self.kernel.open_session(context::current(), config))

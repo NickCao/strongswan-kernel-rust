@@ -5,8 +5,14 @@ use nix::sys::signal::Signal;
 use std::{fs, os::unix::fs::MetadataExt, process::Command};
 
 fn assert_empty() {
+    assert_empty_in_group(17227);
+}
+fn assert_empty_in_group(group: u32) {
     assert!(states().is_empty(), "SAs and larval SPIs remain");
-    assert!(owned_links().is_empty(), "owned interfaces remain");
+    assert!(
+        !links().iter().any(|l| l.group == group),
+        "owned interfaces remain"
+    );
     assert!(
         LinuxPolicies::new().unwrap().list().unwrap().is_empty(),
         "global policies remain"
@@ -99,7 +105,10 @@ fn leftovers() {
 
 #[rstest]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn session_is_connection_bound_and_clean_close_releases_it(daemon: Fixture) {
+fn session_is_connection_bound_and_clean_close_releases_it(
+    daemon: Fixture,
+    #[values(false, true)] with_sa: bool,
+) {
     let first = daemon.connect();
     assert_eq!(
         first.call(first.kernel.flush_sas(ctx())),
@@ -120,18 +129,29 @@ fn session_is_connection_bound_and_clean_close_releases_it(daemon: Fixture) {
         other.call(other.kernel.next_events(ctx())),
         Err(Error::InvalidSession)
     ));
-    active
-        .call(active.kernel.install_policy(
-            ctx(),
-            Family::V4.policy(1),
-            policy_config(Family::V4, 0x10001),
-        ))
-        .unwrap();
+    if with_sa {
+        active
+            .call(active.kernel.install_sa(
+                ctx(),
+                Family::V4.sa(0x10001),
+                sa_config(Cipher::Gcm, false, true),
+            ))
+            .unwrap();
+    } else {
+        active
+            .call(active.kernel.install_policy(
+                ctx(),
+                Family::V4.policy(1),
+                policy_config(Family::V4, 0x10001),
+            ))
+            .unwrap();
+    }
     assert_eq!(
         active.call(active.kernel.close_session(ctx())),
         Err(Error::Kernel(libc::EBUSY))
     );
     active.call(active.kernel.flush_policies(ctx())).unwrap();
+    active.call(active.kernel.flush_sas(ctx())).unwrap();
     active.close();
     drop(active);
     other.open(SessionConfig::default());
@@ -143,11 +163,45 @@ fn session_is_connection_bound_and_clean_close_releases_it(daemon: Fixture) {
 #[case::interrupt(Some(Signal::SIGINT))]
 #[case::disconnect(None)]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn active_shutdown_cleans_the_namespace(mut daemon: Fixture, #[case] signal: Option<Signal>) {
+fn active_shutdown_cleans_the_namespace(
+    mut daemon: Fixture,
+    #[case] signal: Option<Signal>,
+    #[values(false, true)] queued_request: bool,
+) {
     ip(&["link", "add", "foreign", "type", "xfrm", "if_id", "77"]);
     let rpc = daemon.session();
     populate(&rpc);
     let _idle = daemon.connect();
+    assert_eq!(states().len(), 2, "established SA and larval reservation");
+    assert_eq!(owned_links().len(), 1);
+    leftovers();
+    if queued_request {
+        use futures::SinkExt;
+        // All earlier calls have completed. Use the production transport to
+        // flush one more typed request on this connection without waiting for
+        // its response, then immediately shut down. The high request ID keeps
+        // this untracked response distinct from the generated client's calls.
+        rpc.run(async {
+            let socket = tokio::net::UnixStream::from_std(rpc.socket.try_clone().unwrap()).unwrap();
+            let mut outgoing: transport::Framed<
+                tarpc::Response<KernelResponse>,
+                tarpc::ClientMessage<KernelRequest>,
+            > = transport::framed(socket);
+            let mut id = Family::V6.policy(1);
+            id.interface_id = 99;
+            outgoing
+                .send(tarpc::ClientMessage::Request(tarpc::Request {
+                    context: ctx(),
+                    id: u64::MAX,
+                    message: KernelRequest::InstallPolicy {
+                        id,
+                        config: policy_config(Family::V4, 0x10001),
+                    },
+                }))
+                .await
+                .unwrap();
+        });
+    }
     if let Some(signal) = signal {
         daemon.signal(signal);
     } else {
@@ -193,42 +247,85 @@ fn active_session_prunes_unsolicited_native_objects(daemon: Fixture) {
 }
 
 #[rstest]
+#[case::default("ranet", 17227)]
+#[case::custom("resume", 17229)]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn fresh_session_discovers_leftovers_after_crash(namespace: common::netns::Netns) {
+fn fresh_session_discovers_leftovers_after_crash(
+    namespace: common::netns::Netns,
+    #[case] prefix: &str,
+    #[case] group: u32,
+    #[values("dummy", "bridge")] orphan_kind: &str,
+) {
     let _namespace = namespace;
     ip(&["link", "add", "foreign", "type", "xfrm", "if_id", "77"]);
-    let mut previous = Daemon::start(&[]);
+    let group_arg = group.to_string();
+    let args = ["--ifname-prefix", prefix, "--interface-group", &group_arg];
+    let owned = || {
+        links()
+            .into_iter()
+            .filter(|l| l.group == group)
+            .collect::<Vec<_>>()
+    };
+    let name = format!("{prefix}00000029");
+    let mut previous = Daemon::start(&args);
     let rpc = previous.session();
     populate(&rpc);
-    let previous_index = owned_links()[0].index;
+    let previous_index = owned()[0].index;
+    ip(&[
+        "link",
+        "set",
+        &name,
+        "alias",
+        "retained-after-crash",
+        "txqueuelen",
+        "321",
+    ]);
     previous.signal(Signal::SIGKILL);
     assert!(!previous.wait().success());
     drop(rpc);
-    assert!(!states().is_empty() && !owned_links().is_empty());
+    assert!(!states().is_empty() && !owned().is_empty());
+    assert_eq!(owned()[0].index, previous_index);
+    ip(&["link", "set", &name, "type", "xfrm", "if_id", "170"]);
+    ip(&[
+        "link",
+        "set",
+        &name,
+        "down",
+        "mtu",
+        "1280",
+        "multicast",
+        "off",
+    ]);
     ip(&[
         "link",
         "add",
         "owned-orphan",
         "group",
-        "17227",
+        &group_arg,
         "type",
-        "dummy",
+        orphan_kind,
     ]);
-    let mut next = Daemon::start(&[]);
+    let mut next = Daemon::start(&args);
     let rpc = next.session();
-    assert_empty();
+    assert_empty_in_group(group);
     rpc.call(rpc.kernel.install_sa(
         ctx(),
         Family::V4.sa(0x10002),
         sa_config(Cipher::Gcm, false, true),
     ))
     .unwrap();
-    assert_ne!(owned_links()[0].index, previous_index);
+    let recovered = owned().pop().unwrap();
+    assert_ne!(recovered.index, previous_index);
+    assert_eq!(
+        (recovered.name.as_str(), recovered.mtu, recovered.xfrm_if_id),
+        (name.as_str(), 1400, Some(41))
+    );
+    assert!(!ip(&["-d", "link", "show", "dev", &name]).contains("retained-after-crash"));
     rpc.call(rpc.kernel.flush_sas(ctx())).unwrap();
     rpc.close();
     next.signal(Signal::SIGTERM);
     assert_eq!(next.wait().code(), Some(0));
-    assert_empty();
+    assert_empty_in_group(group);
 }
 
 #[rstest]
@@ -252,6 +349,7 @@ fn custom_interface_settings_and_group_ownership(
     ]);
     let rpc = daemon.session();
     let name = format!("{prefix}00000029");
+    let foreign_name = format!("{prefix}0000002a");
     ip(&[
         "link",
         "add",
@@ -264,7 +362,7 @@ fn custom_interface_settings_and_group_ownership(
     ip(&[
         "link",
         "add",
-        "foreign",
+        &foreign_name,
         "group",
         &(group + 1).to_string(),
         "type",
@@ -281,12 +379,33 @@ fn custom_interface_settings_and_group_ownership(
         (native.group, native.mtu, native.xfrm_if_id),
         (group, mtu, Some(41))
     );
+    let foreign = links()
+        .into_iter()
+        .find(|l| l.name == foreign_name)
+        .unwrap();
+    let mut conflict = Family::V4.sa(0x10002);
+    conflict.interface_id = 42;
+    assert_eq!(
+        rpc.call(
+            rpc.kernel
+                .install_sa(ctx(), conflict, sa_config(Cipher::Gcm, false, true))
+        ),
+        Err(Error::Kernel(libc::EEXIST))
+    );
+    assert_eq!(
+        states().len(),
+        1,
+        "failed interface creation must roll back the SA"
+    );
     rpc.call(rpc.kernel.flush_sas(ctx())).unwrap();
     rpc.close();
     daemon.signal(Signal::SIGTERM);
     assert_eq!(daemon.wait().code(), Some(0));
     assert!(!links().iter().any(|l| l.group == group));
-    assert!(links().iter().any(|l| l.name == "foreign"));
+    assert!(links().iter().any(|l| l.name == foreign_name
+        && l.index == foreign.index
+        && l.group == group + 1
+        && l.xfrm_if_id.is_none()));
 }
 
 #[rstest]
@@ -342,6 +461,40 @@ fn unprivileged_socket_probe() {
     if std::env::var("KERNEL_TEST_MEMBER").unwrap() == "yes" {
         let rpc = Rpc::connect(&path.into());
         rpc.open(SessionConfig::default());
+        populate(&rpc);
+        assert_eq!(
+            rpc.call(rpc.kernel.query_sa(ctx(), Family::V4.sa(0x10001), 0))
+                .unwrap(),
+            SaUsage::default()
+        );
+        assert_eq!(
+            rpc.call(rpc.kernel.query_policy(ctx(), Family::V4.policy(1)))
+                .unwrap(),
+            0
+        );
+        for family in [Family::V4, Family::V6] {
+            assert_eq!(
+                rpc.call(rpc.kernel.get_interface(ctx(), family.local()))
+                    .unwrap(),
+                "underlay"
+            );
+            assert_eq!(
+                rpc.call(
+                    rpc.kernel
+                        .get_source_address(ctx(), family.peer(), Some(family.local()))
+                )
+                .unwrap(),
+                family.local()
+            );
+        }
+        assert!(!rpc
+            .call(rpc.kernel.list_addresses(ctx(), 1))
+            .unwrap()
+            .is_empty());
+        assert!(!rpc.call(rpc.kernel.list_subnets(ctx())).unwrap().is_empty());
+        rpc.events();
+        rpc.call(rpc.kernel.flush_sas(ctx())).unwrap();
+        rpc.call(rpc.kernel.flush_policies(ctx())).unwrap();
         rpc.close();
     } else {
         assert_eq!(

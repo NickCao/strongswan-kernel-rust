@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 use super::*;
 use charon_kernel_daemon::{
-    linux::policy::LinuxPolicies,
+    linux::{
+        netlink::{Message, Netlink, NlFamily, NlmF},
+        policy::LinuxPolicies,
+    },
     policy::{PolicyHandle, PolicyKernel, PolicyKey},
 };
+use netlink_packet_core::Parseable;
+use netlink_packet_xfrm::{self as packet, XfrmMessage, XFRM_MSG_GETPOLICY};
 use std::collections::HashMap;
 
 fn inventory() -> HashMap<PolicyKey, charon_kernel_daemon::policy::PolicyConfig> {
@@ -19,6 +24,42 @@ fn inventory() -> HashMap<PolicyKey, charon_kernel_daemon::policy::PolicyConfig>
             )
         })
         .collect()
+}
+
+fn native_inventory() -> Vec<packet::policy::ModifyMessage> {
+    let mut policies: Vec<_> = Netlink::new(NlFamily::Xfrm)
+        .unwrap()
+        .request(&Message::new(
+            XFRM_MSG_GETPOLICY,
+            NlmF::DUMP,
+            &XfrmMessage::GetPolicy(Default::default()),
+        ))
+        .unwrap()
+        .into_iter()
+        .map(|r| packet::policy::ModifyMessage::parse(r.payload.as_slice()).unwrap())
+        .collect();
+    policies.sort_by_key(|p| p.user_policy_info.index);
+    policies
+}
+
+fn install_policy_set(rpc: &Rpc, outer: Family) {
+    for inner in [Family::V4, Family::V6] {
+        assert_eq!(
+            rpc.call(rpc.kernel.bypass_port(ctx(), inner.af(), 500)),
+            Err(Error::Kernel(libc::EINVAL))
+        );
+        rpc.call(rpc.kernel.bypass_port(ctx(), inner.af(), 13000))
+            .unwrap();
+        for direction in 0..3 {
+            rpc.call(rpc.kernel.install_policy(
+                ctx(),
+                inner.policy(direction),
+                policy_config(outer, 0x10001),
+            ))
+            .unwrap();
+        }
+    }
+    assert_eq!(inventory().len(), 10, "six tunnel and four bypass policies");
 }
 
 #[rstest]
@@ -146,16 +187,7 @@ fn policy_repair_preserves_sas_and_bypasses(
         sa_config(Cipher::Gcm, false, true),
     ))
     .unwrap();
-    rpc.call(rpc.kernel.bypass_port(ctx(), family.af(), 13000))
-        .unwrap();
-    for direction in 0..3 {
-        rpc.call(rpc.kernel.install_policy(
-            ctx(),
-            family.policy(direction),
-            policy_config(family, 0x10001),
-        ))
-        .unwrap();
-    }
+    install_policy_set(&rpc, family);
     let expected = inventory();
     let states_before = states();
     let index = owned_links()[0].index;
@@ -166,6 +198,19 @@ fn policy_repair_preserves_sas_and_bypasses(
     let mut args = vec![
         "xfrm", "policy", "update", "src", subnet, "dst", subnet, "dir", "out", "if_id", "41",
     ];
+    let priority = expected
+        .iter()
+        .find(|(key, _)| {
+            key.if_id == 41
+                && key.dir == 1
+                && key.src.addr().is_ipv4() == matches!(family, Family::V4)
+        })
+        .unwrap()
+        .1
+        .priority
+        .to_string();
+    let source = family.local().address.to_string();
+    let destination = family.peer().address.to_string();
     match mutation {
         Mutation::Delete => {
             args[2] = "delete";
@@ -177,7 +222,27 @@ fn policy_repair_preserves_sas_and_bypasses(
             args.extend(["priority", "7", "action", "block"]);
         }
         Mutation::UnsupportedFlag => {
-            args.extend(["priority", "7", "flag", "localok", "action", "block"]);
+            // Keep every supported field unchanged so this only detects drift
+            // in flags that cannot be represented by the shared configuration.
+            args.extend([
+                "priority",
+                &priority,
+                "flag",
+                "localok",
+                "tmpl",
+                "src",
+                &source,
+                "dst",
+                &destination,
+                "proto",
+                "esp",
+                "spi",
+                "0x10001",
+                "mode",
+                "tunnel",
+                "reqid",
+                "42",
+            ]);
         }
     }
     ip(&args);
@@ -201,10 +266,84 @@ fn policy_repair_preserves_sas_and_bypasses(
     );
     rpc.call(rpc.kernel.flush_policies(ctx())).unwrap();
     let bypasses = inventory();
-    assert_eq!(bypasses.len(), 2);
+    assert_eq!(bypasses.len(), 4);
     assert!(bypasses.keys().all(|key| key.if_id == 0));
     rpc.close();
     assert!(inventory().is_empty());
+}
+
+#[rstest]
+#[ignore = "requires root and iproute2; creates a network namespace"]
+fn periodic_policy_audits_do_not_rewrite_or_resurrect_objects(
+    daemon: Fixture,
+    #[values(false, true)] with_sa: bool,
+) {
+    let rpc = daemon.session();
+    if with_sa {
+        rpc.call(rpc.kernel.install_sa(
+            ctx(),
+            Family::V4.sa(0x10001),
+            sa_config(Cipher::Gcm, false, true),
+        ))
+        .unwrap();
+        // Stop background traffic before XFRM so native SA counters stay stable.
+        for args in [
+            vec!["qdisc", "add", "dev", "ranet00000029", "clsact"],
+            vec![
+                "filter",
+                "add",
+                "dev",
+                "ranet00000029",
+                "egress",
+                "matchall",
+                "action",
+                "drop",
+            ],
+        ] {
+            assert!(std::process::Command::new("tc")
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+    }
+    install_policy_set(&rpc, Family::V4);
+    let before = native_inventory();
+    let states_before = states();
+    std::thread::sleep(std::time::Duration::from_millis(5300));
+    assert_eq!(
+        native_inventory(),
+        before,
+        "unchanged policies, including indices and add times, must survive an audit"
+    );
+    assert_eq!(states(), states_before);
+    // Flush while a repair is pending. Only the bypass desires may survive.
+    ip(&[
+        "xfrm",
+        "policy",
+        "delete",
+        "src",
+        "0.0.0.0/0",
+        "dst",
+        "0.0.0.0/0",
+        "dir",
+        "out",
+        "if_id",
+        "41",
+    ]);
+    rpc.call(rpc.kernel.flush_policies(ctx())).unwrap();
+    let bypasses = native_inventory();
+    assert_eq!(bypasses.len(), 4);
+    assert!(bypasses.iter().all(|p| p.user_policy_info.priority == 32));
+    std::thread::sleep(std::time::Duration::from_millis(5300));
+    assert_eq!(
+        native_inventory(),
+        bypasses,
+        "flushed desires must not return"
+    );
+    assert_eq!(states(), states_before);
+    rpc.call(rpc.kernel.flush_sas(ctx())).unwrap();
+    rpc.close();
 }
 
 #[rstest]

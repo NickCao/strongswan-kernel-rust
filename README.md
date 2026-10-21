@@ -334,6 +334,11 @@ nonzero exit. SIGKILL, aborts and crashes skip orderly cleanup; the next session
 clears leftover kernel objects. Desired state and established sessions are
 not recovered across daemon restarts.
 
+Suspending the daemon with SIGSTOP and resuming it with SIGCONT can strand
+netlink requests: the current neli receive threads exit on an interrupted
+`epoll_wait`. Recover by restarting the service pair; use ordinary service
+stop/restart instead of suspension.
+
 The eventfd signals event availability. It does not signal daemon death;
 the client detects transport failure when it next makes an RPC. The NixOS
 module also manages process failure through systemd.
@@ -375,8 +380,10 @@ The Rust suite uses `rstest` for named cases and small parameter matrices.
 Unit and RPC tests run without privileges. Daemon/kernel tests use the production
 tarpc types directly and create a fresh network namespace per case. They cover
 SA options and rejection/rollback, larval SPIs, expiry and loss notifications,
-policy selectors and repair, interface ownership/repair, FIB lookups, address
-filters, event coalescing and shutdown cleanup. Cases can run in parallel.
+policy selectors and repair, unchanged periodic audits, interface ownership
+including reused indices and crash leftovers, FIB lookups, address-cache
+invalidation, event coalescing and cleanup with queued RPCs. A capability-free
+client also exercises kernel operations through the socket. Cases can run in parallel.
 
 The `unit-tests` flake check runs `cargo test` including the privileged cases
 as root using `runInLinuxVM`. It needs neither strongSwan nor a NixOS system.

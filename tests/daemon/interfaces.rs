@@ -26,6 +26,7 @@ fn reconciles_managed_attributes(
     ))
     .unwrap();
     let index = owned_links()[0].index;
+    let states_before = states();
     ip(&[
         "link",
         "set",
@@ -59,13 +60,16 @@ fn reconciles_managed_attributes(
     assert_eq!(details.contains("user-managed"), !replacement);
     assert_eq!(addresses.contains("198.18.41.1/32"), !replacement);
     if !replacement {
+        assert!(details.contains("qlen 123"), "{details}");
         assert!(link
             .flags
             .contains(LinkFlags::Promisc | LinkFlags::Allmulti));
     }
-    let native = states();
-    assert_eq!(native.len(), 1);
-    assert_eq!(native[0].user_sa_info.id.spi, 0x10001);
+    assert_eq!(
+        states(),
+        states_before,
+        "interface repair must not modify SAs"
+    );
     rpc.call(rpc.kernel.remove_sa(ctx(), Family::V4.sa(0x10001), 0))
         .unwrap();
     assert!(owned_links().is_empty());
@@ -161,4 +165,128 @@ fn released_interface_is_not_mutated_or_deleted(
     rpc.call(rpc.kernel.flush_sas(ctx())).unwrap();
     rpc.close();
     assert!(links().iter().any(|l| l.index == link.index));
+}
+
+#[rstest]
+#[ignore = "requires root and iproute2; creates a network namespace"]
+fn foreign_replacement_at_reused_index_is_preserved(
+    daemon: Fixture,
+    #[values(false, true)] remove_sa: bool,
+) {
+    let rpc = daemon.session();
+    let id = || Family::V4.sa(0x10001);
+    rpc.call(
+        rpc.kernel
+            .install_sa(ctx(), id(), sa_config(Cipher::Gcm, false, true)),
+    )
+    .unwrap();
+    let index = owned_links()[0].index;
+    let states_before = states();
+    // Release ownership before replacement, and reserve the desired native ID
+    // so the reconciler cannot recreate its interface during this operation.
+    ip(&["link", "set", "ranet00000029", "group", "0"]);
+    ip(&[
+        "link",
+        "set",
+        "ranet00000029",
+        "type",
+        "xfrm",
+        "if_id",
+        "66",
+    ]);
+    ip(&["link", "add", "guard41", "type", "xfrm", "if_id", "41"]);
+    ip(&["link", "del", "ranet00000029"]);
+    ip(&[
+        "link",
+        "add",
+        "ranet00000029",
+        "index",
+        &index.to_string(),
+        "type",
+        "xfrm",
+        "if_id",
+        "66",
+    ]);
+    ip(&[
+        "link",
+        "set",
+        "ranet00000029",
+        "down",
+        "mtu",
+        "1280",
+        "multicast",
+        "off",
+    ]);
+    if remove_sa {
+        rpc.call(rpc.kernel.remove_sa(ctx(), id(), 0)).unwrap();
+    } else {
+        let mut update = sa_config(Cipher::Gcm, false, true);
+        update.update = true;
+        assert_eq!(
+            rpc.call(rpc.kernel.install_sa(ctx(), id(), update)),
+            Err(Error::Kernel(libc::EEXIST))
+        );
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let foreign = links()
+        .into_iter()
+        .find(|l| l.name == "ranet00000029")
+        .unwrap();
+    assert_eq!(
+        (
+            foreign.index,
+            foreign.group,
+            foreign.mtu,
+            foreign.xfrm_if_id
+        ),
+        (index, 0, 1280, Some(66))
+    );
+    assert!(!foreign
+        .flags
+        .intersects(LinkFlags::Up | LinkFlags::Multicast));
+    assert!(owned_links().is_empty());
+    if !remove_sa {
+        ip(&["link", "del", "ranet00000029"]);
+        ip(&["link", "del", "guard41"]);
+        eventually(|| !owned_links().is_empty());
+        let repaired = owned_links().pop().unwrap();
+        assert_ne!(repaired.index, index);
+        assert_eq!((repaired.mtu, repaired.xfrm_if_id), (1400, Some(41)));
+        assert!(repaired
+            .flags
+            .contains(LinkFlags::Up | LinkFlags::Multicast));
+        assert_eq!(states(), states_before);
+        rpc.call(rpc.kernel.remove_sa(ctx(), id(), 0)).unwrap();
+    }
+    rpc.close();
+    if remove_sa {
+        assert!(links().iter().any(|l| l.index == foreign.index));
+        assert!(links().iter().any(|l| l.name == "guard41"));
+    }
+}
+
+#[rstest]
+#[ignore = "requires root and iproute2; creates a network namespace"]
+fn final_sa_removal_does_not_resurrect_missing_interfaces(
+    daemon: Fixture,
+    #[values(Family::V4, Family::V6)] family: Family,
+) {
+    let rpc = daemon.session();
+    for attempt in 0..4 {
+        let id = || family.sa(0x30000 + attempt);
+        rpc.call(
+            rpc.kernel
+                .install_sa(ctx(), id(), sa_config(Cipher::Gcm, false, true)),
+        )
+        .unwrap();
+        ip(&["link", "del", "ranet00000029"]);
+        rpc.call(rpc.kernel.remove_sa(ctx(), id(), 0)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            owned_links().is_empty(),
+            "final removal resurrected an interface"
+        );
+        assert!(states().is_empty());
+    }
+    rpc.close();
 }

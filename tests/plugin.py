@@ -205,38 +205,39 @@ def run(prefix):
     with tempfile.TemporaryDirectory(prefix="kernel-rust-abi-") as directory:
         root = Path(directory)
         root.chmod(0o755)
-        socket = root / "kernel.sock"
+        kernel_socket = root / "kernel.sock"
         config = root / "strongswan.conf"
-        config.write_text(f"charon {{\n interfaces_use = test0\n plugins {{\n kernel-rust {{\n socket = {socket}\n }}\n }}\n}}\n")
+        config.write_text(f"charon {{\n interfaces_use = test0\n plugins {{\n kernel-rust {{\n socket = {kernel_socket}\n }}\n }}\n}}\n")
         script = root / "plugin.py"
         script.write_text(Path(__file__).read_text())
-        with subprocess.Popen([str(prefix / "bin/charon-kernel-daemon"), "--socket", str(socket),
-                               "--group", "65534"], stdout=subprocess.DEVNULL) as daemon:
-            try:
-                for _ in range(500):
-                    if socket.exists():
-                        break
-                    assert daemon.poll() is None
-                    time.sleep(0.01)
-                else:
-                    raise AssertionError("daemon did not start")
-                def daemon_resources():
-                    return (len(os.listdir(f"/proc/{daemon.pid}/fd")),
-                            len(os.listdir(f"/proc/{daemon.pid}/task")))
-                baseline_resources = daemon_resources()
-                subprocess.run(["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups",
-                                "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
-                                sys.executable, str(script), str(prefix), "--child", str(config)], check=True)
-                for _ in range(500):
-                    resources = daemon_resources()
-                    if all(current <= baseline for current, baseline in zip(resources, baseline_resources)):
-                        break
-                    time.sleep(0.01)
-                else:
-                    raise AssertionError(f"daemon leaked descriptors or workers: {baseline_resources} -> {resources}")
-            finally:
-                daemon.terminate()
-                daemon.wait(timeout=10)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as readiness:
+            notify_socket = root / "notify.sock"
+            readiness.bind(str(notify_socket))
+            readiness.settimeout(10)
+            with subprocess.Popen([str(prefix / "bin/charon-kernel-daemon"), "--socket", str(kernel_socket),
+                                   "--group", "65534"], stdout=subprocess.DEVNULL,
+                                  env={**os.environ, "NOTIFY_SOCKET": str(notify_socket)}) as daemon:
+                try:
+                    # Socket creation precedes Server initialization. Its session
+                    # eventfd must exist before taking the leak-check baseline.
+                    assert b"READY=1" in readiness.recv(512).splitlines(), "daemon did not become ready"
+                    def daemon_resources():
+                        return (len(os.listdir(f"/proc/{daemon.pid}/fd")),
+                                len(os.listdir(f"/proc/{daemon.pid}/task")))
+                    baseline_resources = daemon_resources()
+                    subprocess.run(["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups",
+                                    "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
+                                    sys.executable, str(script), str(prefix), "--child", str(config)], check=True)
+                    for _ in range(500):
+                        resources = daemon_resources()
+                        if all(current <= baseline for current, baseline in zip(resources, baseline_resources)):
+                            break
+                        time.sleep(0.01)
+                    else:
+                        raise AssertionError(f"daemon leaked descriptors or workers: {baseline_resources} -> {resources}")
+                finally:
+                    daemon.terminate()
+                    daemon.wait(timeout=10)
     print("PASS: owned/borrowed C hosts, Rust enumerate/venumerate C ABI, IPv4/IPv6 addresses/subnets, eight clean capability-free sessions without client/daemon descriptor or daemon worker leaks")
 
 

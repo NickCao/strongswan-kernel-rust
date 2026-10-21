@@ -33,16 +33,17 @@ fn installs_sa_options(
         assert_eq!(info.flags & flag != 0, expected, "flag {flag:#x}");
     }
     assert!(native.nlas.contains(&Attr::IfId(41)));
+    assert!(native.nlas.contains(&Attr::MarkVal(123)));
     assert!(native
         .nlas
         .iter()
         .any(|attr| matches!(attr, Attr::EncapsulationTemplate(encap)
         if encap.encap_sport == 13000 && encap.encap_dport == 13000)));
-    let (expected_name, truncation) = match cipher {
+    let (expected_name, integrity) = match cipher {
         Cipher::Gcm => ("rfc4106(gcm(aes))", None),
         Cipher::ChaCha => ("rfc7539esp(chacha20,poly1305)", None),
-        Cipher::CbcSha256 => ("cbc(aes)", Some(128)),
-        Cipher::CbcSha384 => ("cbc(aes)", Some(192)),
+        Cipher::CbcSha256 => ("cbc(aes)", Some(("hmac(sha256)", 128))),
+        Cipher::CbcSha384 => ("cbc(aes)", Some(("hmac(sha384)", 192))),
     };
     assert!(native.nlas.iter().any(|attr| match attr {
         Attr::EncryptionAlgAead(a) =>
@@ -50,11 +51,12 @@ fn installs_sa_options(
         Attr::EncryptionAlg(a) => a.alg_name.starts_with(expected_name.as_bytes()),
         _ => false,
     }));
-    if let Some(bits) = truncation {
+    if let Some((name, bits)) = integrity {
         assert!(native
             .nlas
             .iter()
-            .any(|a| matches!(a, Attr::AuthenticationAlgTrunc(a) if a.alg_trunc_len == bits)));
+            .any(|a| matches!(a, Attr::AuthenticationAlgTrunc(a)
+                if a.alg_trunc_len == bits && a.alg_name.starts_with(name.as_bytes()))));
     }
     let link = owned_links().pop().unwrap();
     assert_eq!(

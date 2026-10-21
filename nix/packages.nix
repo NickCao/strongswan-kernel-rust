@@ -153,7 +153,7 @@ let
         if grep -qw kvm-clock /sys/devices/system/clocksource/clocksource0/available_clocksource; then
           echo kvm-clock > /sys/devices/system/clocksource/clocksource0/current_clocksource
         fi
-        modprobe -a ipv6 xfrm_user xfrm_interface esp4 esp6 xfrm_iptfs vrf dummy
+        modprobe -a ipv6 xfrm_user xfrm_interface esp4 esp6 xfrm_iptfs vrf dummy bridge
       '';
       installPhase = "touch $out";
       dontFixup = true;
