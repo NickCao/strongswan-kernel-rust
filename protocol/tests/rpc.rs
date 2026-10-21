@@ -6,7 +6,7 @@ use kernel_rust_protocol::{
     notification::Notification,
     *,
 };
-use serde_json::{json, Value};
+use rstest::rstest;
 use std::{
     os::unix::net::{UnixListener, UnixStream},
     sync::{
@@ -19,12 +19,17 @@ use std::{
 use tarpc::{context::Context, server::Channel};
 
 struct State {
-    captured: Mutex<Vec<Value>>,
+    captured: Mutex<Vec<Captured>>,
     closes: AtomicUsize,
     query_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     hold_events: AtomicBool,
     event_calls: AtomicUsize,
     events: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<Event>>>,
+}
+#[derive(Debug, PartialEq, Eq)]
+enum Captured {
+    Sa(SaId, SaConfig),
+    Policy(PolicyId, PolicyConfig),
 }
 #[derive(Clone)]
 struct Fake(Arc<State>);
@@ -58,7 +63,7 @@ impl Kernel for Fake {
             .captured
             .lock()
             .unwrap()
-            .push(json!({"id":id,"config":config}));
+            .push(Captured::Sa(id, config));
         Err(api::Error::Kernel(libc::EEXIST))
     }
     async fn install_policy(
@@ -71,7 +76,7 @@ impl Kernel for Fake {
             .captured
             .lock()
             .unwrap()
-            .push(json!({"id":id,"config":config}));
+            .push(Captured::Policy(id, config));
         Err(api::Error::Kernel(libc::EOPNOTSUPP))
     }
     async fn query_sa(self, _: Context, _id: SaId, cpi: u16) -> api::Result<SaUsage> {
@@ -185,56 +190,162 @@ impl Drop for Fixture {
         self.worker.take().unwrap().join().unwrap();
     }
 }
-fn endpoint() -> Value {
-    json!({"address":"fe80::1","port":65535,"flow_info":0x12345678,"scope_id":u32::MAX})
+fn endpoint() -> Endpoint {
+    Endpoint {
+        address: "fe80::1".parse().unwrap(),
+        port: u16::MAX,
+        flow_info: 0x12345678,
+        scope_id: u32::MAX,
+    }
 }
 fn sa_id() -> SaId {
-    serde_json::from_value(json!({"src":endpoint(),"dst":endpoint(),"spi":u32::MAX,"protocol":51,"interface_id":0,"mark":{"value":u32::MAX,"mask":u32::MAX}})).unwrap()
+    SaId {
+        src: endpoint(),
+        dst: endpoint(),
+        spi: u32::MAX,
+        protocol: 51,
+        interface_id: 0,
+        mark: Mark {
+            value: u32::MAX,
+            mask: u32::MAX,
+        },
+    }
 }
-fn selector() -> Value {
-    json!({"kind":8,"dynamic":true,"from":"::","to":"ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff","protocol":255,"from_port":0,"to_port":65535})
+fn selector() -> Selector {
+    Selector {
+        kind: 8,
+        dynamic: true,
+        from: "::".parse().unwrap(),
+        to: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
+        protocol: u8::MAX,
+        from_port: 0,
+        to_port: u16::MAX,
+    }
 }
-#[test]
-fn complete_native_inputs_and_unsigned_outputs_over_tarpc_uds() {
+fn sa_config(selectors: bool, optional: bool) -> SaConfig {
+    let limit = || LifetimeLimit {
+        life: u64::MAX,
+        rekey: u64::MAX - 1,
+        jitter: u64::MAX - 2,
+    };
+    SaConfig {
+        reqid: u32::MAX,
+        acquire_sequence: u32::MAX,
+        mode: 6,
+        src_selectors: selectors.then(|| vec![selector()]),
+        dst_selectors: selectors.then(Vec::new),
+        interface: optional.then(String::new),
+        encryption: Algorithm {
+            id: u16::MAX,
+            name: "future-cipher".into(),
+            key: vec![0, 128, 255],
+        },
+        integrity: Algorithm {
+            id: u16::MAX - 1,
+            name: "future-auth".into(),
+            key: vec![255, 0, 254],
+        },
+        lifetime: optional.then(|| Lifetime {
+            time: limit(),
+            bytes: limit(),
+            packets: limit(),
+        }),
+        replay_window: u32::MAX,
+        ipcomp: u16::MAX,
+        cpi: u16::MAX,
+        cpu: u32::MAX - 1,
+        hw_offload: 3,
+        security_label: optional.then(|| vec![0, 255, 128]),
+        esn: true,
+        udp_encapsulation: true,
+        output_mark: Mark {
+            value: u32::MAX,
+            mask: u32::MAX,
+        },
+        tfc: u32::MAX,
+        copy_df: false,
+        copy_ecn: true,
+        copy_dscp: 3,
+        iptfs_dont_fragment: true,
+        forward_icmp: true,
+        initiator: true,
+        inbound: true,
+        update: true,
+    }
+}
+fn policy_id() -> PolicyId {
+    PolicyId {
+        direction: 2,
+        src: selector(),
+        dst: selector(),
+        mark: Mark {
+            value: 42,
+            mask: 255,
+        },
+        interface_id: u32::MAX,
+        interface: Some("eth0".into()),
+        security_label: Some(vec![255, 0, 128]),
+    }
+}
+fn policy_config() -> PolicyConfig {
+    PolicyConfig {
+        kind: 3,
+        priority: 3,
+        manual_priority: u32::MAX,
+        hw_offload: 3,
+        pcpu_acquires: true,
+        forward_icmp: true,
+        src: Some(endpoint()),
+        dst: Some(endpoint()),
+        sa: Some(PolicySa {
+            mode: 6,
+            reqid: u32::MAX,
+            policy_count: u32::MAX,
+            esp: ProtocolSa {
+                used: false,
+                spi: u32::MAX,
+            },
+            ah: ProtocolSa {
+                used: true,
+                spi: u32::MAX - 1,
+            },
+            ipcomp: CompressionSa {
+                transform: u16::MAX,
+                cpi: u16::MAX,
+            },
+        }),
+    }
+}
+#[rstest]
+fn complete_native_inputs_and_unsigned_outputs_over_tarpc_uds(
+    #[values(false, true)] selectors: bool,
+    #[values(false, true)] optional: bool,
+) {
     let fixture = Fixture::new();
     let client = Client::connect(&fixture.config).unwrap();
     assert_eq!(client.features(), 4);
-    let limit = json!({"life":u64::MAX,"rekey":u64::MAX-1,"jitter":u64::MAX-2});
-    let config = json!({
-        "reqid":u32::MAX,"acquire_sequence":u32::MAX,"mode":6,
-        "src_selectors":[selector()],"dst_selectors":[],"interface":"",
-        "encryption":{"id":65535,"name":"future-cipher","key":[0,128,255]},
-        "integrity":{"id":65534,"name":"future-auth","key":[255,0,254]},
-        "lifetime":{"time":limit,"bytes":limit,"packets":limit},
-        "replay_window":u32::MAX,"ipcomp":65535,"cpi":65535,"cpu":u32::MAX-1,
-        "hw_offload":3,"security_label":[0,255,128],"esn":true,"udp_encapsulation":true,
-        "output_mark":{"value":u32::MAX,"mask":u32::MAX},"tfc":u32::MAX,
-        "copy_df":false,"copy_ecn":true,"copy_dscp":3,"iptfs_dont_fragment":true,
-        "forward_icmp":true,"initiator":true,"inbound":true,"update":true,
-    });
-    let typed: SaConfig = serde_json::from_value(config.clone()).unwrap();
-    let expected = json!({"id":sa_id(),"config":typed});
     let error = client
         .request(client.rpc().install_sa(
             api::context::current(),
             sa_id(),
-            serde_json::from_value(config).unwrap(),
+            sa_config(selectors, optional),
         ))
         .unwrap_err();
     assert_eq!(error.errno, Some(libc::EEXIST));
-    assert_eq!(fixture.state.captured.lock().unwrap()[0], expected);
-    let policy_id = json!({"direction":2,"src":selector(),"dst":selector(),"mark":{"value":42,"mask":255},"interface_id":u32::MAX,"interface":"eth0","security_label":[255,0,128]});
-    let policy = json!({"kind":3,"priority":3,"manual_priority":u32::MAX,"hw_offload":3,"pcpu_acquires":true,"forward_icmp":true,"src":endpoint(),"dst":endpoint(),"sa":{"mode":6,"reqid":u32::MAX,"policy_count":u32::MAX,"esp":{"used":false,"spi":u32::MAX},"ah":{"used":true,"spi":u32::MAX-1},"ipcomp":{"transform":65535,"cpi":65535}}});
+    assert_eq!(
+        fixture.state.captured.lock().unwrap()[0],
+        Captured::Sa(sa_id(), sa_config(selectors, optional))
+    );
     client
-        .request(client.rpc().install_policy(
-            api::context::current(),
-            serde_json::from_value(policy_id.clone()).unwrap(),
-            serde_json::from_value(policy.clone()).unwrap(),
-        ))
+        .request(
+            client
+                .rpc()
+                .install_policy(api::context::current(), policy_id(), policy_config()),
+        )
         .unwrap_err();
     assert_eq!(
         fixture.state.captured.lock().unwrap()[1],
-        json!({"id":policy_id,"config":policy})
+        Captured::Policy(policy_id(), policy_config())
     );
     let usage = client
         .request(
@@ -251,8 +362,12 @@ fn complete_native_inputs_and_unsigned_outputs_over_tarpc_uds() {
     client.close().unwrap();
     assert_eq!(fixture.state.closes.load(Ordering::Relaxed), 1);
 }
-#[test]
-fn empty_and_large_batches_share_one_connection_and_disconnect_disables_control() {
+#[rstest]
+#[case::single_event(1)]
+#[case::large_batch(300)]
+fn empty_and_large_batches_share_one_connection_and_disconnect_disables_control(
+    #[case] count: usize,
+) {
     let fixture = Fixture::new();
     let client = Client::connect(&fixture.config).unwrap();
     let stop = CancellationToken::new();
@@ -262,7 +377,7 @@ fn empty_and_large_batches_share_one_connection_and_disconnect_disables_control(
         expiry: Some(Expiry {
             protocol: 50,
             spi: u32::MAX,
-            destination: serde_json::from_value(endpoint()).unwrap(),
+            destination: endpoint(),
             hard: true,
         }),
         acquire: None,
@@ -271,10 +386,10 @@ fn empty_and_large_batches_share_one_connection_and_disconnect_disables_control(
     };
     fixture
         .events
-        .blocking_send(vec![event.clone(); 300])
+        .blocking_send(vec![event.clone(); count])
         .unwrap();
     let batch = client.next_events(&stop).unwrap().unwrap();
-    assert_eq!(batch.len(), 300);
+    assert_eq!(batch.len(), count);
     for received in batch {
         assert_eq!(
             received.expiry.unwrap().destination,

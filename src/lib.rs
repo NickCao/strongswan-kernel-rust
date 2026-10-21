@@ -17,3 +17,7 @@ pub mod transport;
 pub use kernel_rust_protocol as rpc_api;
 
 pub mod service;
+
+#[cfg(test)]
+#[path = "../tests/common/netns.rs"]
+mod test_netns;

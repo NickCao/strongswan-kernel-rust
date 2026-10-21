@@ -371,20 +371,32 @@ from XFRM expiry/acquire/mapping events.
 
 ## Tests
 
-The NixOS test uses actual strongSwan with this backend on one machine and
+The Rust suite uses `rstest` for named cases and small parameter matrices.
+Unit and RPC tests run without privileges. Daemon/kernel tests use the production
+tarpc types directly and create a fresh network namespace per case. They cover
+SA options and rejection/rollback, larval SPIs, expiry and loss notifications,
+policy selectors and repair, interface ownership/repair, FIB lookups, address
+filters, event coalescing and shutdown cleanup. Cases can run in parallel.
+
+The `unit-tests` flake check runs `cargo test` including the privileged cases
+as root using `runInLinuxVM`. It needs neither strongSwan nor a NixOS system.
+
+The separate NixOS test uses actual strongSwan with this backend on one machine and
 upstream `kernel-netlink` on the other. It checks both initiation directions,
-encrypted IPv4/IPv6 traffic, AES-GCM, AES-CBC/HMAC, ESN, TFC and ICMP flags,
+PSK and Ed25519 raw-public-key authentication, encrypted IPv4/IPv6 traffic,
+AES-GCM, AES-CBC/HMAC, ESN, TFC and ICMP flags,
 IP-TFS aggregation/fragmentation, rekeying, policy/interface repair, SA-loss
 recovery, VICI loading/reloading of 200 unreachable-peer configurations under
 route churn, socket access, service hardening and paired restart/shutdown behavior.
-It also runs the RPC and ABI checks inside the VM.
+It also checks the plugin ABI against actual strongSwan libraries.
 
 ```sh
 nix flake check -L
+nix build .#checks.x86_64-linux.unit-tests -L
 nix build .#checks.x86_64-linux.end-to-end -L
 ```
 
-The VM check requires KVM. The flake defines checks for both supported
+Both VM checks require KVM. The flake defines checks for both supported
 architectures; the Python ABI fixture targets strongSwan 6.1.0 layouts.
 
 For local unit/protocol tests, and Clippy with matching strongSwan header
@@ -395,33 +407,23 @@ cargo test --locked -p charon-kernel-daemon -p kernel-rust-protocol
 cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
-Kernel integration tests require root, iproute2 (including `tc`) and
-util-linux. They must run in disposable network namespaces:
+To also run the daemon/kernel cases locally, use root with iproute2 and
+util-linux available. Each privileged test creates and restores its own network
+namespace; no outer `unshare` or serial test execution is required:
 
 ```sh
-cargo build --release --locked -p charon-kernel-daemon --features test-client --bins
-unshare --net -- python3 tests/integration.py target/release/charon-kernel-daemon \
-    target/release/kernel-rpc-test-client
-unshare --net -- cargo test --locked -p charon-kernel-daemon \
-    -- --ignored --test-threads=1
+cargo test --locked -p charon-kernel-daemon -p kernel-rust-protocol \
+    -- --include-ignored --test-threads=4
 ```
 
-With a disposable prefix containing the daemon, plugin and matching strongSwan
-libraries/executables, run the ABI and two-Rust-peer tunnel tests.
-The tunnel test additionally needs OpenSSL, ping and Python VICI:
+Run an individual group or case by its Cargo test filter, for example:
 
 ```sh
-unshare --net -- python3 tests/plugin.py /tmp/strongswan-install
-unshare --net -- python3 tests/tunnel.py /tmp/strongswan-install \
-    --vici-python /path/to/strongswan/src/libcharon/plugins/vici/python
-unshare --net -- python3 tests/tunnel.py /tmp/strongswan-install --cbc \
-    --vici-python /path/to/strongswan/src/libcharon/plugins/vici/python
+cargo test --locked --test daemon policy_repair -- --ignored
 ```
 
-The tunnel test uses Ed25519 raw public keys and capability-free charons.
-Its `--dynamic-user` option additionally exercises real systemd dynamic users;
-it needs a system systemd instance and the existing `nogroup` group.
-The test scripts remove their temporary processes, namespaces and files.
+The Python helpers under `tests/` are used only by the strongSwan NixOS test
+for ABI calls, VICI operations, sandbox probes and forced RPC disconnects.
 
 ## Source layout
 

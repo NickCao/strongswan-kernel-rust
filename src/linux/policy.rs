@@ -347,14 +347,9 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    #[ignore = "requires root in a disposable network namespace"]
+    #[ignore = "requires root; creates a network namespace"]
     fn global_inventory_and_mutations_use_native_policy_indices() {
-        assert_eq!(nix::unistd::Uid::effective().as_raw(), 0);
-        assert_ne!(
-            std::fs::read_link("/proc/self/ns/net").unwrap(),
-            std::fs::read_link("/proc/1/ns/net").unwrap(),
-            "run with unshare --net"
-        );
+        let _namespace = crate::test_netns::Netns::new();
         let mut kernel = LinuxPolicies::new().unwrap();
         let mut spec = PolicySpec {
             id: PolicyKey {
@@ -437,21 +432,27 @@ mod tests {
         // qualifier when deleting by index, even with identical selectors.
         let mut sub = LinuxPolicies::policy_spec(&spec);
         sub.nlas.push(Attr::PolicyType(packet::UserPolicyType {
-            ptype: 1,
+            ptype: packet::XFRM_POLICY_TYPE_SUB,
             ..Default::default()
         }));
-        kernel
+        match kernel
             .socket
             .ack(&message(NlmF::ACK, &XfrmMessage::AddPolicy(sub)))
-            .unwrap();
-        let inventory = kernel.list().unwrap();
-        assert_eq!(inventory.len(), 2);
-        let sub = inventory
-            .iter()
-            .find(|entry| entry.handle.policy_type == 1)
-            .unwrap();
-        assert!(sub.handle.id().is_none());
-        kernel.delete(&sub.handle).unwrap();
+        {
+            Ok(()) => {
+                let inventory = kernel.list().unwrap();
+                assert_eq!(inventory.len(), 2);
+                let sub = inventory
+                    .iter()
+                    .find(|entry| entry.handle.policy_type == packet::XFRM_POLICY_TYPE_SUB)
+                    .unwrap();
+                assert!(sub.handle.id().is_none());
+                kernel.delete(&sub.handle).unwrap();
+            }
+            // CONFIG_XFRM_SUB_POLICY is optional. Linux rejects SUB with
+            // EINVAL when it is disabled; the main policy must be unaffected.
+            Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EINVAL)),
+        }
         assert_eq!(
             kernel.get(&spec.id).unwrap().config.as_ref(),
             Some(&spec.config)

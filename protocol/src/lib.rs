@@ -38,7 +38,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub interfaces_use: String,
     pub interfaces_ignore: String,
@@ -79,7 +79,7 @@ impl SessionConfig {
         }
     }
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub features: u32,
 }
@@ -100,7 +100,7 @@ pub struct Mark {
     pub value: u32,
     pub mask: u32,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selector {
     pub kind: i32,
     pub dynamic: bool,
@@ -110,7 +110,7 @@ pub struct Selector {
     pub from_port: u16,
     pub to_port: u16,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SaId {
     pub src: Endpoint,
     pub dst: Endpoint,
@@ -119,7 +119,7 @@ pub struct SaId {
     pub mark: Mark,
     pub interface_id: u32,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 pub struct Algorithm {
     pub id: u16,
     pub name: String,
@@ -138,19 +138,19 @@ impl Drop for Algorithm {
         zeroize::Zeroize::zeroize(&mut self.key);
     }
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifetimeLimit {
     pub life: u64,
     pub rekey: u64,
     pub jitter: u64,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lifetime {
     pub time: LifetimeLimit,
     pub bytes: LifetimeLimit,
     pub packets: LifetimeLimit,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SaConfig {
     pub reqid: u32,
     pub acquire_sequence: u32,
@@ -180,7 +180,7 @@ pub struct SaConfig {
     pub inbound: bool,
     pub update: bool,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SaUpdate {
     pub mode: i32,
     pub cpi: u16,
@@ -203,7 +203,7 @@ pub struct SaUsage {
     /// Last use in monotonic seconds, or zero if unused/unavailable.
     pub last_use: u64,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyId {
     pub direction: i32,
     pub src: Selector,
@@ -213,17 +213,17 @@ pub struct PolicyId {
     pub interface: Option<String>,
     pub security_label: Option<Vec<u8>>,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolSa {
     pub used: bool,
     pub spi: u32,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompressionSa {
     pub transform: u16,
     pub cpi: u16,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicySa {
     pub mode: i32,
     pub reqid: u32,
@@ -232,7 +232,7 @@ pub struct PolicySa {
     pub ah: ProtocolSa,
     pub ipcomp: CompressionSa,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyConfig {
     pub kind: i32,
     pub priority: i32,
@@ -244,45 +244,45 @@ pub struct PolicyConfig {
     pub dst: Option<Endpoint>,
     pub sa: Option<PolicySa>,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subnet {
     pub address: Endpoint,
     pub prefix: u8,
     pub interface: String,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NextHop {
     pub gateway: Endpoint,
     pub interface: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Expiry {
     pub protocol: u8,
     pub spi: u32,
     pub destination: Endpoint,
     pub hard: bool,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Acquire {
     pub reqid: u32,
     pub src: Selector,
     pub dst: Selector,
     pub sequence: u32,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mapping {
     pub spi: u32,
     pub destination: Endpoint,
     pub remote: Endpoint,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
     Expire,
     Acquire,
     Mapping,
     Roam,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub kind: EventKind,
     pub expiry: Option<Expiry>,

@@ -44,6 +44,7 @@
 
       checks = forAllSystems (system: {
         package = self.packages.${system}.default;
+        unit-tests = builds.${system}.unitTests;
         end-to-end = builds.${system}.pkgs.testers.runNixOSTest (
           import ./nix/test.nix {
             inherit (builds.${system}) pkgs;

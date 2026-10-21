@@ -240,6 +240,65 @@ fn policy_endpoint(endpoint: Endpoint) -> io::Result<Endpoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::any_port(0, u16::MAX, true)]
+    #[case::single_port(443, 443, true)]
+    #[case::aligned_range(1024, 2047, true)]
+    #[case::unaligned_range(1025, 2047, false)]
+    #[case::reversed_range(2047, 1024, false)]
+    fn selector_port_ranges(
+        #[values("192.0.2.0/24", "2001:db8::/64")] cidr: ipnet::IpNet,
+        #[case] from_port: u16,
+        #[case] to_port: u16,
+        #[case] valid: bool,
+    ) {
+        let input = rpc::Selector {
+            kind: if cidr.addr().is_ipv4() { 7 } else { 8 },
+            dynamic: false,
+            from: cidr.network(),
+            to: cidr.broadcast(),
+            protocol: libc::IPPROTO_TCP as u8,
+            from_port,
+            to_port,
+        };
+        let actual = selector(input.clone());
+        if valid {
+            assert_eq!(rpc_selector(actual.unwrap()), input);
+        } else {
+            assert_eq!(actual.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        }
+    }
+
+    #[rstest]
+    #[case::ipv4_range("192.0.2.1", "192.0.2.254", false)]
+    #[case::ipv6_range("2001:db8::1", "2001:db8::ffff", false)]
+    #[case::mixed_families("192.0.2.1", "2001:db8::1", false)]
+    #[case::reversed_range("192.0.2.2", "192.0.2.1", false)]
+    #[case::ipv4_host("192.0.2.1", "192.0.2.1", true)]
+    #[case::ipv6_host("2001:db8::1", "2001:db8::1", true)]
+    fn selector_address_ranges(
+        #[case] from: std::net::IpAddr,
+        #[case] to: std::net::IpAddr,
+        #[case] valid: bool,
+    ) {
+        let input = rpc::Selector {
+            kind: if from.is_ipv4() { 7 } else { 8 },
+            dynamic: false,
+            from,
+            to,
+            protocol: 0,
+            from_port: 0,
+            to_port: u16::MAX,
+        };
+        let actual = selector(input.clone());
+        if valid {
+            assert_eq!(rpc_selector(actual.unwrap()), input);
+        } else {
+            assert_eq!(actual.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        }
+    }
 
     #[test]
     fn shared_endpoints_retain_metadata_while_sa_keys_keep_native_identity() {

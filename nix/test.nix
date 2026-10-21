@@ -11,55 +11,81 @@ let
       package
     ];
   };
+  # Disposable credentials for raw-public-key authentication coverage.
+  testKeys = pkgs.runCommand "kernel-rust-test-keys" { nativeBuildInputs = [ pkgs.openssl ]; } ''
+    mkdir -p "$out"
+    for peer in 1 2; do
+      openssl genpkey -algorithm ED25519 -out "$out/peer-$peer.pem"
+      openssl pkey -in "$out/peer-$peer.pem" -pubout -out "$out/peer-$peer.pub.pem"
+    done
+  '';
   connection = peer: proposal: connectionWithMode peer proposal "tunnel";
   connectionWithMode =
     peer: proposal: mode:
-    pkgs.writeText "swanctl-${toString peer}-${proposal}-${mode}.conf" ''
-      connections {
-        tunnel {
-          version = 2
-          local_addrs = 192.0.2.${toString peer}
-          remote_addrs = 192.0.2.${toString (3 - peer)}
-          local_port = 13000
-          remote_port = 13000
-          proposals = aes128-sha256-x25519
-          # The Rust backend must force ESP-in-UDP without a connection override.
-          encap = no
-          mobike = no
-          if_id_in = ${if peer == 1 then "%unique" else "42"}
-          if_id_out = ${if peer == 1 then "%unique" else "42"}
-          local {
-            auth = psk
-            id = peer-${toString peer}
-          }
-          remote {
-            auth = psk
-            id = peer-${toString (3 - peer)}
-          }
-          children {
-            net {
-              local_ts = 0.0.0.0/0, ::/0
-              remote_ts = 0.0.0.0/0, ::/0
-              mode = ${mode}
-              icmp = yes
-              esp_proposals = ${proposal}
-              tfc_padding = ${if mode == "iptfs" then "0" else "256"}
-              set_mark_out = 123
-              rekey_time = 300s
-              life_time = 600s
-              rand_time = 0s
+    connectionWithAuth peer proposal mode "psk";
+  connectionWithAuth =
+    peer: proposal: mode: auth:
+    let
+      config = pkgs.writeText "swanctl-${toString peer}-${proposal}-${mode}-${auth}.conf" ''
+        connections {
+          tunnel {
+            version = 2
+            local_addrs = 192.0.2.${toString peer}
+            remote_addrs = 192.0.2.${toString (3 - peer)}
+            local_port = 13000
+            remote_port = 13000
+            proposals = aes128-sha256-x25519
+            # The Rust backend must force ESP-in-UDP without a connection override.
+            encap = no
+            mobike = no
+            if_id_in = ${if peer == 1 then "%unique" else "42"}
+            if_id_out = ${if peer == 1 then "%unique" else "42"}
+            local {
+              auth = ${auth}
+              ${pkgs.lib.optionalString (
+                auth == "pubkey"
+              ) "pubkeys = ${testKeys}/peer-${toString peer}.pub.pem"}
+              id = peer-${toString peer}
+            }
+            remote {
+              auth = ${auth}
+              ${pkgs.lib.optionalString (
+                auth == "pubkey"
+              ) "pubkeys = ${testKeys}/peer-${toString (3 - peer)}.pub.pem"}
+              id = peer-${toString (3 - peer)}
+            }
+            children {
+              net {
+                local_ts = 0.0.0.0/0, ::/0
+                remote_ts = 0.0.0.0/0, ::/0
+                mode = ${mode}
+                icmp = yes
+                esp_proposals = ${proposal}
+                tfc_padding = ${if mode == "iptfs" then "0" else "256"}
+                set_mark_out = 123
+                rekey_time = 300s
+                life_time = 600s
+                rand_time = 0s
+              }
             }
           }
         }
-      }
-      secrets {
-        ike-test {
-          id-1 = peer-1
-          id-2 = peer-2
-          secret = "only-for-the-nixos-vm-test"
+        secrets {
+          ike-test {
+            id-1 = peer-1
+            id-2 = peer-2
+            secret = "only-for-the-nixos-vm-test"
+          }
         }
-      }
-    '';
+      '';
+      # --file makes swanctl search beside that configuration for credentials.
+      credentials = pkgs.runCommand "swanctl-${toString peer}-${proposal}-${mode}-pubkey" { } ''
+        mkdir -p "$out/private"
+        cp ${config} "$out/swanctl.conf"
+        ln -s ${testKeys}/peer-${toString peer}.pem "$out/private/test.pem"
+      '';
+    in
+    if auth == "pubkey" then "${credentials}/swanctl.conf" else config;
 
   node =
     peer:
@@ -456,13 +482,6 @@ in
             )
             assert "kernel-rust" in controller
 
-    with subtest("kernel RPC contracts in an isolated network namespace"):
-        daemon = left.succeed("command -v charon-kernel-daemon").strip()
-        bypasses = left.succeed("ip xfrm policy list nosock")
-        left.succeed("unshare --net python3 ${../tests/integration.py} " + daemon + " ${package.testClient}/bin/kernel-rpc-test-client")
-        assert not links(left) and not spis(left)
-        assert left.succeed("ip xfrm policy list nosock") == bypasses
-
     with subtest("C ABI and complete IPv6 endpoints through tarpc"):
         left.succeed("unshare --net python3 ${../tests/plugin.py} ${abiPrefix}")
 
@@ -476,6 +495,9 @@ in
     proposals = [
         ("AES-GCM", "${connection 1 "aes128gcm128-esn"}", "${connection 2 "aes128gcm128-esn"}", "rfc4106(gcm(aes))"),
         ("AES-CBC/HMAC", "${connection 1 "aes128-sha256-esn"}", "${connection 2 "aes128-sha256-esn"}", "cbc(aes)"),
+        ("Ed25519/AES-GCM", "${connectionWithAuth 1 "aes128gcm128-esn" "tunnel" "pubkey"}", "${
+          connectionWithAuth 2 "aes128gcm128-esn" "tunnel" "pubkey"
+        }", "rfc4106(gcm(aes))"),
     ]
     for proposal_index, (name, left_config, right_config, algorithm) in enumerate(proposals):
         with subtest(name + ": IKE, ESP-in-UDP, wildcard selectors and IPv4/IPv6 traffic"):

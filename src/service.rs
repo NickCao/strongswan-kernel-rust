@@ -633,8 +633,9 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires CAP_NET_ADMIN and an isolated network namespace"]
+    #[ignore = "requires root; creates a network namespace"]
     async fn failed_session_wakes_shutdown_without_waiting_for_connection_drop() {
+        let _namespace = crate::test_netns::Netns::new();
         let server = Arc::new(Server::new("tst".into(), None, 1400, 17227).unwrap());
         let (socket, _peer) = UnixStream::pair().unwrap();
         let service = Service::new(server.clone(), socket);
@@ -667,8 +668,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires CAP_NET_ADMIN and an isolated network namespace"]
+    #[ignore = "requires root; creates a network namespace"]
     async fn urgent_push_preserves_the_pending_roam_deadline() {
+        let _namespace = crate::test_netns::Netns::new();
         let server = Arc::new(Server::new("tst".into(), None, 1400, 17227).unwrap());
         let (socket, _peer) = UnixStream::pair().unwrap();
         let service = Service::new(server.clone(), socket);

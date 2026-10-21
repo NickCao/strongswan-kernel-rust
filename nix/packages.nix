@@ -12,7 +12,7 @@ let
       ../src
       ../plugin
       ../protocol
-      ../tests/support/rpc_client.rs
+      (lib.fileset.fileFilter (file: file.hasExt "rs") ../tests)
     ];
   };
   toolchain = pkgs.rust-bin.fromRustupToolchainFile ../rust-toolchain.toml;
@@ -82,6 +82,7 @@ let
     common
     // {
       pname = "charon-kernel-daemon";
+      doCheck = false; # Run the complete Rust suite in the unit-tests VM check.
       cargoBuildFlags = [
         "-p"
         "charon-kernel-daemon"
@@ -127,23 +128,36 @@ let
     }
   );
 
-  testClient = rustPlatform.buildRustPackage (
-    common
-    // {
-      pname = "kernel-rpc-test-client";
-      cargoBuildFlags = [
-        "--features"
-        "test-client"
-        "--bin"
-        "kernel-rpc-test-client"
+  # The Rust test harness needs a real kernel and root for its isolated
+  # namespaces. Keep this independent of the strongSwan NixOS integration test.
+  unitTests = pkgs.vmTools.runInLinuxVM (
+    daemon.overrideAttrs (_: {
+      pname = "kernel-rust-tests";
+      dontBuild = true; # cargo test builds the daemon and test executables itself.
+      doCheck = true;
+      cargoCheckType = "debug";
+      enableParallelBuilding = true;
+      memSize = 4096;
+      nativeCheckInputs = [
+        pkgs.iproute2
+        pkgs.util-linux
+        pkgs.kmod
       ];
-      doCheck = false;
-      installPhase = ''
-        runHook preInstall
-        install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/kernel-rpc-test-client "$out/bin/kernel-rpc-test-client"
-        runHook postInstall
+      checkFlags = [
+        "--include-ignored"
+        "--test-threads=4"
+      ];
+      preCheck = ''
+        # Nested KVM may choose the emulated ACPI clock. Use the paravirtual
+        # clock when available, as in the strongSwan NixOS test.
+        if grep -qw kvm-clock /sys/devices/system/clocksource/clocksource0/available_clocksource; then
+          echo kvm-clock > /sys/devices/system/clocksource/clocksource0/current_clocksource
+        fi
+        modprobe -a ipv6 xfrm_user xfrm_interface esp4 esp6 xfrm_iptfs vrf dummy
       '';
-    }
+      installPhase = "touch $out";
+      dontFixup = true;
+    })
   );
 
   kernelRust = pkgs.symlinkJoin {
@@ -155,7 +169,6 @@ let
     ];
     passthru = {
       inherit
-        testClient
         strongswan
         headers
         daemon
@@ -177,5 +190,6 @@ in
     strongswan
     headers
     kernelRust
+    unitTests
     ;
 }

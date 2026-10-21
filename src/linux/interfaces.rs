@@ -191,7 +191,7 @@ impl InterfaceKernel for LinuxInterfaces {
 mod tests {
     use super::*;
     use crate::interfaces::InterfaceHandle as _;
-    use std::{fs, process::Command};
+    use std::process::Command;
 
     fn ip(args: &[&str]) {
         let output = Command::new("ip").args(args).output().unwrap();
@@ -203,14 +203,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires root in a disposable network namespace"]
+    #[ignore = "requires root and iproute2; creates a network namespace"]
     fn mutations_target_the_current_interface_at_the_handle_index() {
-        assert_eq!(nix::unistd::Uid::effective().as_raw(), 0);
-        assert_ne!(
-            fs::read_link("/proc/self/ns/net").unwrap(),
-            fs::read_link("/proc/1/ns/net").unwrap(),
-            "run with unshare --net"
-        );
+        let _namespace = crate::test_netns::Netns::new();
         let mut kernel = LinuxInterfaces::new("idx".into(), DEFAULT_INTERFACE_GROUP).unwrap();
         let mut net = Network::new().unwrap();
         let mut spec = InterfaceSpec {
