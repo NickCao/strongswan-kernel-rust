@@ -81,6 +81,7 @@ impl Server {
 pub struct Session {
     backend: Mutex<Backend>,
     events: tokio::sync::mpsc::Sender<Option<Vec<Event>>>,
+    event_wakeup: Arc<tokio::sync::Notify>,
     connected: AtomicBool,
     closed: AtomicBool,
     roam: AtomicU8,
@@ -93,6 +94,7 @@ impl Session {
     fn fail(&self) {
         self.connected.store(false, Ordering::Release);
         let _ = self.repair_wakeup.try_send(());
+        self.event_wakeup.notify_one();
         let _ = self.control.shutdown(std::net::Shutdown::Both);
     }
     fn stop_workers(&self) {
@@ -103,6 +105,14 @@ impl Session {
         // worker was woken above; event polls also check the closed flag.
         self.event_sockets.lock().unwrap().take();
         let _ = self.events.try_send(None);
+        self.event_wakeup.notify_one();
+    }
+    fn emit_events(&self, events: Vec<Event>) {
+        if self.events.try_send(Some(events)).is_err() {
+            self.fail();
+        } else {
+            self.event_wakeup.notify_one();
+        }
     }
 }
 #[derive(Clone)]
@@ -112,11 +122,13 @@ pub struct Connection {
     socket: UnixStream,
     control: Mutex<Option<Arc<Session>>>,
     watch: tokio::sync::Mutex<Option<Watch>>,
+    event_wakeup: Arc<tokio::sync::Notify>,
 }
 struct Watch {
     session: Arc<Session>,
     receiver: tokio::sync::mpsc::Receiver<Option<Vec<Event>>>,
     next_roam: Instant,
+    notified: bool,
 }
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -142,7 +154,48 @@ impl Service {
             socket,
             control: Mutex::new(None),
             watch: tokio::sync::Mutex::new(None),
+            event_wakeup: Arc::new(tokio::sync::Notify::new()),
         }))
+    }
+    /// One coalesced transport wakeup per change. XFRM batches wake immediately;
+    /// a pending roam waits until its existing coalescing deadline, and a new
+    /// XFRM batch can interrupt that wait. No backend lock is held while waiting.
+    pub async fn next_notification(&self) -> Option<()> {
+        loop {
+            let due = {
+                let mut guard = self.watch.lock().await;
+                if let Some(watch) = guard.as_mut() {
+                    let session = &watch.session;
+                    if session.closed.load(Ordering::Acquire)
+                        || !session.connected.load(Ordering::Acquire)
+                    {
+                        return None;
+                    }
+                    let roam = session.roam.load(Ordering::Relaxed) != 0;
+                    if !watch.notified
+                        && (!watch.receiver.is_empty() || roam && Instant::now() >= watch.next_roam)
+                    {
+                        watch.notified = true;
+                        return Some(());
+                    }
+                    if !watch.notified && roam {
+                        Some(watch.next_roam)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(due) = due {
+                tokio::select! {
+                    _ = self.event_wakeup.notified() => (),
+                    _ = tokio::time::sleep_until(due.into()) => (),
+                }
+            } else {
+                self.event_wakeup.notified().await;
+            }
+        }
     }
     fn request<T>(&self, operation: impl FnOnce(&mut Backend) -> io::Result<T>) -> Result<T> {
         let session = self
@@ -192,7 +245,9 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
                 }
                 _ => ROUTE_CHANGED,
             };
-            session.roam.fetch_or(change, Ordering::Relaxed);
+            if session.roam.fetch_or(change, Ordering::Relaxed) == 0 {
+                session.event_wakeup.notify_one();
+            }
             continue;
         }
         if matches!(
@@ -224,9 +279,7 @@ fn event_loop(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
         };
         match result {
             Ok(Some(event)) if session.connected.load(Ordering::Acquire) => {
-                if session.events.try_send(Some(vec![event])).is_err() {
-                    session.fail();
-                }
+                session.emit_events(vec![event]);
             }
             Err(e) => eprintln!("kernel-daemon: kernel event: {e}"),
             _ => (),
@@ -279,8 +332,8 @@ fn repair_loop(session: Arc<Session>, wakeup: Receiver<()>) {
                         address_changed: None,
                     })
                     .collect();
-                if !events.is_empty() && session.events.try_send(Some(events)).is_err() {
-                    session.fail();
+                if !events.is_empty() {
+                    session.emit_events(events);
                 }
             }
             Err(error) => eprintln!("kernel-daemon: SA inventory: {error}"),
@@ -333,6 +386,7 @@ impl Kernel for Service {
             let session = Arc::new(Session {
                 backend: Mutex::new(backend),
                 events: tx,
+                event_wakeup: self.event_wakeup.clone(),
                 connected: AtomicBool::new(true),
                 closed: AtomicBool::new(false),
                 roam: AtomicU8::new(0),
@@ -350,6 +404,7 @@ impl Kernel for Service {
             session: session.clone(),
             receiver,
             next_roam: Instant::now() + ROAM_DELAY,
+            notified: false,
         });
         let worker = session.clone();
         thread::spawn(move || event_loop(worker, true, xfrm));
@@ -378,6 +433,7 @@ impl Kernel for Service {
         if !session.connected.load(Ordering::Acquire) || session.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidSession);
         }
+        watch.notified = false;
         let mut batch = match watch.receiver.try_recv() {
             Ok(Some(batch)) => batch,
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Vec::new(),
@@ -396,6 +452,7 @@ impl Kernel for Service {
                 });
             }
         }
+        self.event_wakeup.notify_one();
         Ok(batch)
     }
 
@@ -568,5 +625,96 @@ impl Kernel for Service {
                     .collect()
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires CAP_NET_ADMIN and an isolated network namespace"]
+    async fn urgent_push_preserves_the_pending_roam_deadline() {
+        let server = Arc::new(Server::new("tst".into(), None, 1400, 17227));
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let service = Service::new(server.clone(), socket);
+        service
+            .clone()
+            .open_session(
+                context::current(),
+                SessionConfig {
+                    interfaces_use: String::new(),
+                    interfaces_ignore: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let session = {
+            let mut guard = service.watch.lock().await;
+            let watch = guard.as_mut().unwrap();
+            watch.next_roam = Instant::now() + Duration::from_millis(150);
+            watch.session.roam.store(ROUTE_CHANGED, Ordering::Relaxed);
+            watch.session.clone()
+        };
+        session.event_wakeup.notify_one();
+        let pending = tokio::spawn({
+            let service = service.clone();
+            async move { service.next_notification().await }
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        session.emit_events(vec![Event {
+            kind: EventKind::Expire,
+            expiry: Some(Expiry {
+                protocol: 50,
+                spi: 7,
+                destination: Endpoint {
+                    address: "192.0.2.1".parse().unwrap(),
+                    port: 0,
+                    flow_info: 0,
+                    scope_id: 0,
+                },
+                hard: true,
+            }),
+            acquire: None,
+            mapping: None,
+            address_changed: None,
+        }]);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), pending)
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(())
+        );
+        let batch = service
+            .clone()
+            .next_events(context::current())
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert!(matches!(batch[0].kind, EventKind::Expire));
+        // No further route change or XFRM event arrives. The original pending
+        // roam must still produce its own push at the coalescing deadline.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), service.next_notification())
+                .await
+                .unwrap(),
+            Some(())
+        );
+        let batch = service
+            .clone()
+            .next_events(context::current())
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert!(matches!(batch[0].kind, EventKind::Roam));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), service.next_notification())
+                .await
+                .is_err(),
+            "no periodic pushes when idle"
+        );
+        service.close_session(context::current()).await.unwrap();
+        server.shutdown().unwrap();
     }
 }

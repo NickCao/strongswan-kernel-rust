@@ -106,6 +106,7 @@ struct Fixture {
     config: Config,
     state: Arc<State>,
     events: tokio::sync::mpsc::Sender<Vec<Event>>,
+    notifications: tokio::sync::broadcast::Sender<()>,
     sockets: mpsc::Receiver<UnixStream>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     worker: Option<thread::JoinHandle<()>>,
@@ -117,6 +118,8 @@ impl Fixture {
         let listener = UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (events, receiver) = tokio::sync::mpsc::channel(8);
+        let (notifications, _) = tokio::sync::broadcast::channel(16);
+        let notify = notifications.clone();
         let state = Arc::new(State {
             captured: Mutex::new(Vec::new()),
             closes: AtomicUsize::new(0),
@@ -143,9 +146,18 @@ impl Fixture {
                             let socket = connection.unwrap().0.into_std().unwrap();
                             accepted.send(socket.try_clone().unwrap()).unwrap();
                             let stream = tokio::net::UnixStream::from_std(socket).unwrap();
-                            let channel = tarpc::server::BaseChannel::with_defaults(transport::framed(stream));
+                            let notifications = futures::stream::unfold(notify.subscribe(), |mut receiver| async move {
+                                receiver.recv().await.ok().map(|()| ((), receiver))
+                            });
+                            let (transport, driver) = transport::server(stream, notifications);
+                            let channel = tarpc::server::BaseChannel::with_defaults(transport);
                             let fake = server.clone();
-                            tokio::spawn(channel.execute(fake.serve()).for_each(|response| async move { tokio::spawn(response); }));
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    _ = driver => (),
+                                    _ = channel.execute(fake.serve()).for_each(|response| async move { tokio::spawn(response); }) => (),
+                                }
+                            });
                         }
                     }
                 }
@@ -160,6 +172,7 @@ impl Fixture {
             _directory: directory,
             state,
             events,
+            notifications,
             sockets,
             stop: Some(stop),
             worker: Some(worker),
@@ -308,6 +321,49 @@ fn different_calling_threads_share_the_current_thread_runtime() {
             });
         }
     });
+    client.close().unwrap();
+}
+#[test]
+fn server_push_wakes_an_idle_client_without_periodic_event_rpcs() {
+    let fixture = Fixture::new();
+    let client = Client::connect(&fixture.config).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(fixture.state.event_calls.load(Ordering::Relaxed), 0);
+    fixture
+        .events
+        .blocking_send(vec![Event {
+            kind: EventKind::Roam,
+            expiry: None,
+            acquire: None,
+            mapping: None,
+            address_changed: Some(true),
+        }])
+        .unwrap();
+    fixture.notifications.send(()).unwrap();
+    // No runtime is running in the client. Its UDS nevertheless becomes ready
+    // for the host watcher, which can then drive a blocking batch fetch.
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    let mut ready = [PollFd::new(client.socket(), PollFlags::IN)];
+    assert_eq!(
+        poll(
+            &mut ready,
+            Some(&Timespec {
+                tv_sec: 2,
+                tv_nsec: 0
+            })
+        )
+        .unwrap(),
+        1
+    );
+    assert!(client.events_ready().unwrap());
+    let batch = client
+        .next_events(&CancellationToken::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].address_changed, Some(true));
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(fixture.state.event_calls.load(Ordering::Relaxed), 1);
     client.close().unwrap();
 }
 #[test]

@@ -38,6 +38,7 @@ pub struct Client {
     failed: AtomicBool,
     closing: AtomicBool,
     features: u32,
+    signal: Arc<transport::EventSignal>,
     // Concurrent block_on calls are supported by Tokio. One caller owns the
     // current-thread scheduler/driver; other callers poll their own RPC futures.
     // Do not serialize whole calls behind a mutex.
@@ -51,11 +52,14 @@ impl Client {
         let socket = UnixStream::connect(&config.path)?;
         socket.set_nonblocking(true)?;
         let control = socket.try_clone()?;
+        let signal = Arc::new(transport::EventSignal::default());
         let (rpc, session) = runtime.block_on(async {
             let socket = tokio::net::UnixStream::from_std(socket)?;
-            let rpc =
-                KernelClient::new(tarpc::client::Config::default(), transport::framed(socket))
-                    .spawn();
+            let rpc = KernelClient::new(
+                tarpc::client::Config::default(),
+                transport::client(socket, signal.clone()),
+            )
+            .spawn();
             let session = rpc
                 .open_session(
                     context::current(),
@@ -75,6 +79,7 @@ impl Client {
             failed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             features: session.features,
+            signal,
             runtime,
         }))
     }
@@ -83,6 +88,23 @@ impl Client {
     }
     pub fn features(&self) -> u32 {
         self.features
+    }
+    pub fn event_signal(&self) -> &Arc<transport::EventSignal> {
+        &self.signal
+    }
+    pub fn socket(&self) -> &UnixStream {
+        &self.socket
+    }
+    /// A socket wakeup may have been consumed by another RPC before the pool
+    /// job runs. Skip a redundant drain unless transport data remains pending.
+    pub fn events_ready(&self) -> io::Result<bool> {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        if self.signal.is_pending() {
+            return Ok(true);
+        }
+        let mut ready = [PollFd::new(&self.socket, PollFlags::IN)];
+        poll(&mut ready, Some(&Timespec::default()))?;
+        Ok(!ready[0].revents().is_empty())
     }
     pub fn request<T>(
         &self,
@@ -116,6 +138,7 @@ impl Client {
     /// Drain one event batch. Cancellation stops a pool job during shutdown
     /// without closing the shared connection or canceling other callers.
     pub fn next_events(&self, stop: &CancellationToken) -> Result<Option<Vec<api::Event>>, Error> {
+        self.signal.take();
         let result = self.request(async {
             tokio::select! {
                 biased;

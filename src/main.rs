@@ -70,25 +70,22 @@ fn connection(socket: UnixStream, server: Arc<Server>) -> io::Result<()> {
         .build()?;
     runtime.block_on(async {
         let socket = tokio::net::UnixStream::from_std(socket)?;
-        let channel = tarpc::server::BaseChannel::with_defaults(
-            charon_kernel_daemon::rpc_api::transport::framed(socket),
-        );
+        let notifications = futures::stream::unfold(service.clone(), |service| async move {
+            service.next_notification().await.map(|()| ((), service))
+        });
+        let (transport, driver) =
+            charon_kernel_daemon::rpc_api::transport::server(socket, notifications);
+        tokio::pin!(driver);
+        let channel = tarpc::server::BaseChannel::with_defaults(transport);
         let mut requests = channel.requests();
         let mut tasks = tokio::task::JoinSet::new();
         let result = loop {
             tokio::select! {
+                result = &mut driver => break result,
                 request = requests.next() => match request {
                     Some(Ok(request)) => { tasks.spawn(request.execute(service.clone().serve())); }
                     // Do not log decode errors: a failed frame can contain keys.
-                    Some(Err(error)) => {
-                        use tarpc::ChannelError::*;
-                        let kind = match error {
-                            Read(error) | Ready(error) | Write(error) | Flush(error) | Close(error) => error.kind(),
-                        };
-                        break if matches!(kind, io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe) {
-                            Ok(())
-                        } else { Err(kind.into()) };
-                    },
+                    Some(Err(_)) => break Err(io::ErrorKind::ConnectionAborted.into()),
                     None => break Ok(()),
                 },
                 _ = tasks.join_next(), if !tasks.is_empty() => (),

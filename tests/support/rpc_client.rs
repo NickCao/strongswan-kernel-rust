@@ -8,6 +8,7 @@ use std::{
     collections::HashMap,
     io::{self, BufRead, Write},
     os::unix::net::UnixStream,
+    sync::Arc,
     time::Duration,
 };
 use tarpc::{client, context};
@@ -16,6 +17,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 type Channel = client::Channel<KernelRequest, KernelResponse>;
 struct Connection {
     channel: Channel,
+    signal: Arc<transport::EventSignal>,
     socket: UnixStream,
     sender: mpsc::UnboundedSender<Value>,
     receiver: mpsc::UnboundedReceiver<Value>,
@@ -65,17 +67,26 @@ async fn dispatch(command: Value, connections: &mut HashMap<u64, Connection>) ->
                 Err(error) => return json!({"connect_error":error.to_string()}),
             };
             socket.set_nonblocking(true).unwrap();
-            let channel = if let Some(connection) = reused {
-                connection.channel.clone()
+            let (channel, signal) = if let Some(connection) = reused {
+                (connection.channel.clone(), connection.signal.clone())
             } else {
                 let stream = tokio::net::UnixStream::from_std(socket.try_clone().unwrap()).unwrap();
-                client::new(client::Config::default(), transport::framed(stream)).spawn()
+                let signal = Arc::new(transport::EventSignal::default());
+                (
+                    client::new(
+                        client::Config::default(),
+                        transport::client(stream, signal.clone()),
+                    )
+                    .spawn(),
+                    signal,
+                )
             };
             let (sender, receiver) = mpsc::unbounded_channel();
             connections.insert(
                 id,
                 Connection {
                     channel,
+                    signal,
                     socket,
                     sender,
                     receiver,
@@ -103,26 +114,41 @@ async fn dispatch(command: Value, connections: &mut HashMap<u64, Connection>) ->
             let mut parameters = command["parameters"].clone();
             if method == "WatchEvents" {
                 let channel = connection.channel.clone();
+                let signal = connection.signal.clone();
                 let sender = connection.sender.clone();
                 connection.tasks.push(tokio::spawn(async move {
                     let _ = sender.send(json!({"parameters":{"event":{"kind":"ready"}}}));
+                    let mut first = true;
                     loop {
-                        let mut ctx = context::current();
-                        ctx.deadline = std::time::Instant::now() + Duration::from_secs(60);
-                        match channel.call(ctx, KernelRequest::NextEvents {}).await {
-                            Ok(KernelResponse::NextEvents(Ok(events))) => {
-                                for event in events {
-                                    let mut event = serde_json::to_value(event).unwrap();
-                                    event["kind"] =
-                                        event["kind"].as_str().unwrap().to_lowercase().into();
-                                    if sender.send(json!({"parameters":{"event":event}})).is_err() {
-                                        return;
+                        if !first {
+                            signal.notified().await;
+                        }
+                        first = false;
+                        signal.take();
+                        loop {
+                            let mut ctx = context::current();
+                            ctx.deadline = std::time::Instant::now() + Duration::from_secs(60);
+                            match channel.call(ctx, KernelRequest::NextEvents {}).await {
+                                Ok(KernelResponse::NextEvents(Ok(events))) => {
+                                    if events.is_empty() {
+                                        break;
+                                    }
+                                    for event in events {
+                                        let mut event = serde_json::to_value(event).unwrap();
+                                        event["kind"] =
+                                            event["kind"].as_str().unwrap().to_lowercase().into();
+                                        if sender
+                                            .send(json!({"parameters":{"event":event}}))
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
                                     }
                                 }
-                            }
-                            _ => {
-                                let _ = sender.send(json!({"eof":true}));
-                                return;
+                                _ => {
+                                    let _ = sender.send(json!({"eof":true}));
+                                    return;
+                                }
                             }
                         }
                     }

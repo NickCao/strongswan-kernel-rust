@@ -404,9 +404,8 @@ invalidates it. Interface ownership checks always query the kernel.
 ## Safety boundaries
 
 The daemon and shared protocol crate use `#![forbid(unsafe_code)]`, including
-the RPC client and socket framing. Linux calls use safe library APIs, and peer
-credentials use Nix's raw PID representation, which also handles a peer PID of
-zero across PID namespaces. [neli](https://docs.rs/neli/0.7.4/neli/)
+the RPC client and socket framing. Linux calls use safe library APIs.
+[neli](https://docs.rs/neli/0.7.4/neli/)
 handles Netlink sockets and headers, multipart replies, ACKs, sequence/PID
 checks, and multicast notifications. Network discovery and XFRM interface
 operations use [netlink-packet-route](https://docs.rs/netlink-packet-route/0.33.0/netlink_packet_route/).
@@ -418,7 +417,8 @@ The daemon translates kernel errors to errno replies. Closing a session drops
 its notification routers and wakes the event workers.
 
 tarpc generates typed clients and dispatch from the shared Rust service trait,
-with Bincode over length-delimited Unix socket frames. Inputs use native integer
+with Bincode over length-delimited Unix socket frames. Server frames wrap replies
+or a typed `EventsReady` notification. Inputs use native integer
 widths, including full-range `u64` lifetimes and counters, and byte vectors for
 keys and security labels. Endpoints retain IP, port, IPv6 flow information and
 scope ID. SA inputs include mode, selectors, interface restrictions, lifetime
@@ -435,11 +435,19 @@ The plugin shares one Tokio current-thread runtime and one Unix connection.
 StrongSwan's synchronous callbacks call `Runtime::block_on()` on their own
 calling threads. Tokio drives the RPC dispatch task during these calls and
 coordinates concurrent callers without a mutex held over an entire RPC. No
-plugin thread is created. A low-priority job on charon's existing processor
-calls `NextEvents`, handles its batch after returning from the runtime, and
-fairly requeues itself, including after empty replies. There is no separate
-event connection, watcher bridge, wakeup socket or client event queue. The
-runtime drops when the last client reference is released.
+plugin thread is created. Charon's shared watcher monitors that same socket for
+readability. Its short callback suspends watching and queues a cancellable,
+low-priority processor job. The job calls `NextEvents`, handles its batch after
+returning from the runtime, and fairly requeues while batches remain. Once empty,
+it stops and rearms the watcher. There is no periodic polling, separate event
+connection, wakeup socket or client event queue. The runtime drops when the last
+client reference is released.
+
+The transport also wakes the job when an RPC reads ahead into a following frame,
+or consumes an `EventsReady` notification while another call is active. This
+covers notifications already buffered in userspace, which socket readiness
+alone would miss. A coalesced local flag retains wakeups until the job fetches
+events; it also handles notifications arriving during plugin initialization.
 
 The plugin still implements strongSwan's C interfaces. Its remaining unsafe
 code borrows C callback arguments, invokes host functions, manages the exported
@@ -448,8 +456,10 @@ Validation, RPC calls, counters, and snapshot construction run in safe Rust.
 Owned and borrowed C objects use [foreign-types](https://docs.rs/foreign-types/0.5.0/foreign_types/)
 to pair construction with the matching strongSwan destructor. The shared
 client registry uses `Weak`/`Arc` instead of untyped C pointers.
-The event job uses weak client ownership and cancellation; unloading stops
-and joins active callbacks before closing the session. Charon destroys queued
+The event job uses weak client ownership and cancellation; unloading removes
+the watcher and joins active event dispatch before closing the session. Blocking
+Rust RPCs never run inside the watcher's pthread-cancellable callback. Charon
+destroys queued
 jobs before unloading plugin libraries. No pointers or descriptors cross the RPC
 connection.
 
@@ -459,11 +469,11 @@ The daemon serves one charon session at a time, with control calls and event
 polls on the same Unix connection. `NextEvents` immediately drains one queued
 batch or returns an empty batch. The daemon's bounded event queue retains
 notifications until the next poll; overflow invalidates the session. The
-plugin's job fairly requeues at low priority without a fixed polling interval,
-so event delivery can be delayed by higher-priority work. Idle operation
-continuously performs empty RPCs; fairness yields to other jobs but does not
-rate-limit polling. A transport failure disables the connection without
-replaying mutations.
+daemon pushes a coalesced `EventsReady` frame when a batch is available or a
+pending roam reaches its 100 ms coalescing deadline. The next fetch rearms that
+notification. The plugin drains batches at low priority; higher-priority work
+can delay event delivery. Idle operation sends no periodic RPCs or heartbeats.
+A transport failure disables the connection without replaying mutations.
 A clean close requires all tunnel SAs/policies removed, cleans larval SPI
 reservations and all remaining global policies, and permits a new session.
 The `FlushSas` RPC clears desired SAs and flushes the whole state table. Flushing
@@ -664,9 +674,9 @@ network namespaces and leave the caller's network namespace untouched:
 cargo build --release --locked --features test-client --bin kernel-rpc-test-client
 unshare --net -- python3 tests/integration.py target/release/charon-kernel-daemon \
     target/release/kernel-rpc-test-client
-# Direct backend checks, including mutations through reused native indices:
+# Privileged checks share the namespace and must run serially:
 unshare --net -- cargo test --locked -p charon-kernel-daemon \
-    linux:: -- --ignored
+    -- --ignored --test-threads=1
 unshare --net -- python3 tests/plugin.py /tmp/strongswan-install
 unshare --net -- python3 tests/tunnel.py /tmp/strongswan-install \
     --vici-python /path/to/strongswan/src/libcharon/plugins/vici/python
