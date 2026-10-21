@@ -30,6 +30,7 @@ const ADDRESS_CHANGED: u8 = 2;
 pub struct Server {
     active: Mutex<Option<Arc<Session>>>,
     stopping: AtomicBool,
+    session_failure: Arc<notification::Notification>,
     pub prefix: String,
     pub master_device: Option<String>,
     pub mtu: u32,
@@ -41,15 +42,20 @@ impl Server {
         master_device: Option<String>,
         mtu: u32,
         interface_group: u32,
-    ) -> Self {
-        Self {
+    ) -> io::Result<Self> {
+        Ok(Self {
             active: Mutex::new(None),
             stopping: AtomicBool::new(false),
+            session_failure: Arc::new(notification::Notification::new()?),
             prefix,
             master_device,
             mtu,
             interface_group,
-        }
+        })
+    }
+    /// Readable after an opened session fails, including a lost connection.
+    pub fn session_failure(&self) -> &notification::Notification {
+        &self.session_failure
     }
     pub fn shutdown(&self) -> io::Result<()> {
         let session = {
@@ -84,6 +90,7 @@ pub struct Session {
     event_wakeup: Arc<tokio::sync::Notify>,
     connected: AtomicBool,
     closed: AtomicBool,
+    session_failure: Arc<notification::Notification>,
     roam: AtomicU8,
     network_changed: AtomicBool,
     repair_wakeup: SyncSender<()>,
@@ -92,7 +99,11 @@ pub struct Session {
 }
 impl Session {
     fn fail(&self) {
-        self.connected.store(false, Ordering::Release);
+        if self.connected.swap(false, Ordering::AcqRel) {
+            if let Err(error) = self.session_failure.notify() {
+                eprintln!("kernel-daemon: session failure notification: {error}");
+            }
+        }
         let _ = self.repair_wakeup.try_send(());
         self.event_wakeup.notify_one();
         let _ = self.control.shutdown(std::net::Shutdown::Both);
@@ -136,7 +147,6 @@ impl Drop for Connection {
         if let Some(s) = control {
             if !s.closed.load(Ordering::Acquire) {
                 s.fail();
-                eprintln!("kernel-daemon: client disconnected; preserving tunnel objects; replacement sessions require daemon restart");
             }
         }
     }
@@ -389,6 +399,7 @@ impl Kernel for Service {
                 event_wakeup: self.event_wakeup.clone(),
                 connected: AtomicBool::new(true),
                 closed: AtomicBool::new(false),
+                session_failure: self.server.session_failure.clone(),
                 roam: AtomicU8::new(0),
                 network_changed: AtomicBool::new(false),
                 repair_wakeup,
@@ -634,8 +645,41 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires CAP_NET_ADMIN and an isolated network namespace"]
+    async fn failed_session_wakes_shutdown_without_waiting_for_connection_drop() {
+        let server = Arc::new(Server::new("tst".into(), None, 1400, 17227).unwrap());
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let service = Service::new(server.clone(), socket);
+        service
+            .clone()
+            .open_session(
+                context::current(),
+                SessionConfig {
+                    interfaces_use: String::new(),
+                    interfaces_ignore: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let session = service.control.lock().unwrap().clone().unwrap();
+        assert!(!server.session_failure().drain().unwrap());
+        // Losing an event invalidates the whole session, even while the
+        // connection and service objects are still alive.
+        for _ in 0..=256 {
+            session.emit_events(Vec::new());
+        }
+        assert!(server.session_failure().drain().unwrap());
+        assert!(!session.connected.load(Ordering::Acquire));
+        assert!(matches!(
+            service.clone().next_events(context::current()).await,
+            Err(Error::InvalidSession)
+        ));
+        server.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires CAP_NET_ADMIN and an isolated network namespace"]
     async fn urgent_push_preserves_the_pending_roam_deadline() {
-        let server = Arc::new(Server::new("tst".into(), None, 1400, 17227));
+        let server = Arc::new(Server::new("tst".into(), None, 1400, 17227).unwrap());
         let (socket, _peer) = UnixStream::pair().unwrap();
         let service = Service::new(server.clone(), socket);
         service

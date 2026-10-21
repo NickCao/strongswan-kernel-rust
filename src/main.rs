@@ -133,10 +133,10 @@ fn run() -> io::Result<()> {
         "kernel-daemon: tarpc listening on {} with socket group {gid}",
         path.display()
     );
-    let server = Arc::new(Server::new(prefix, master_device, mtu, interface_group));
+    let server = Arc::new(Server::new(prefix, master_device, mtu, interface_group)?);
     let result = serve(&listener, &signals, &server);
-    let cleanup = server.shutdown();
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
+    let cleanup = server.shutdown();
     if let Err(error) = &cleanup {
         eprintln!("kernel-daemon: shutdown cleanup: {error}");
     }
@@ -149,6 +149,7 @@ fn serve(listener: &UnixListener, signals: &SignalFd, server: &Arc<Server>) -> i
         let mut ready = [
             PollFd::new(listener, PollFlags::IN),
             PollFd::new(signals, PollFlags::IN),
+            PollFd::new(server.session_failure(), PollFlags::IN),
         ];
         match poll(&mut ready, None) {
             Err(rustix::io::Errno::INTR) => continue,
@@ -157,6 +158,13 @@ fn serve(listener: &UnixListener, signals: &SignalFd, server: &Arc<Server>) -> i
         if ready[1].revents().contains(PollFlags::IN) && signals.read_signal()?.is_some() {
             eprintln!("kernel-daemon: shutting down");
             return Ok(());
+        }
+        if ready[2].revents().contains(PollFlags::IN) {
+            eprintln!("kernel-daemon: active session lost; shutting down");
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "active kernel session lost",
+            ));
         }
         if !ready[0].revents().contains(PollFlags::IN) {
             continue;

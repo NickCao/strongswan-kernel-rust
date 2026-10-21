@@ -280,9 +280,51 @@ in
         )
         assert property(machine, unit, "MainPID") == "0"
 
+    def assert_start_order(machine):
+        daemon_ready = int(property(machine, "charon-kernel.service", "ActiveEnterTimestampMonotonic"))
+        ike_started = int(property(machine, "strongswan-swanctl.service", "ExecMainStartTimestampMonotonic"))
+        assert 0 < daemon_ready < ike_started, (daemon_ready, ike_started)
+
+    def assert_stop_order(machine):
+        ike_exited = int(property(machine, "strongswan-swanctl.service", "InactiveEnterTimestampMonotonic"))
+        daemon_exited = int(property(machine, "charon-kernel.service", "ExecMainExitTimestampMonotonic"))
+        assert 0 < ike_exited < daemon_exited, (ike_exited, daemon_exited)
+
     def assert_empty(machine):
         assert not spis(machine) and not links(machine)
         assert not machine.succeed("ip xfrm policy list nosock").strip()
+
+    def pair_pids(machine):
+        return {
+            unit: property(machine, unit, "MainPID")
+            for unit in ["strongswan-swanctl.service", "charon-kernel.service"]
+        }
+
+    def assert_recovered(machine, previous):
+        # No systemctl start/restart here: recovery must be automatic.
+        for unit, pid in previous.items():
+            machine.wait_until_succeeds(
+                "systemctl is-active --quiet " + unit
+                + " && test $(systemctl show " + unit + " -p MainPID --value) != " + pid
+            )
+            machine.wait_for_unit(unit)
+        assert_start_order(machine)
+        assert "kernel-rust" in ctl(machine, "--stats")
+        assert not spis(machine) and not links(machine)
+        remaining = policy_specs(machine)
+        assert remaining and all(
+            "priority 32" in policy and "proto udp" in policy and "if_id" not in policy
+            for policy in remaining
+        ), remaining
+        ike_pid = property(machine, "strongswan-swanctl.service", "MainPID")
+        bound_ports = {
+            int(line.split()[3].rsplit(":", 1)[1])
+            for line in machine.succeed("ss -H -u -l -n -p").splitlines()
+            if "pid=" + ike_pid + "," in line
+        }
+        bypass_ports = {int(matched_value(r"[sd]port (\d+)", policy)) for policy in remaining}
+        assert bound_ports and bypass_ports == bound_ports, (bound_ports, remaining)
+        assert len(remaining) == 4 * len(bound_ports), remaining
 
     def ping_overlay(machine, peer):
         other = 3 - peer
@@ -345,6 +387,15 @@ in
                 wait_overlay_config(machine, peer, "stock0000002a")
                 continue
             machine.wait_for_unit("charon-kernel.service")
+            assert_start_order(machine)
+            assert "charon-kernel.service" in property(machine, "strongswan-swanctl.service", "Requires").split()
+            assert not property(machine, "strongswan-swanctl.service", "BindsTo").split()
+            assert "charon-kernel.service" in property(machine, "strongswan-swanctl.service", "After").split()
+            assert "strongswan-swanctl.service" in property(machine, "charon-kernel.service", "PartOf").split()
+            assert "strongswan-swanctl.service" in property(machine, "charon-kernel.service", "Wants").split()
+            assert property(machine, "charon-kernel.service", "StopWhenUnneeded") == "yes"
+            for unit in ["strongswan-swanctl.service", "charon-kernel.service"]:
+                assert property(machine, unit, "Restart") == "always"
             machine.succeed("test -S /run/charon-kernel/charon-kernel.sock")
             assert property(machine, "charon-kernel.service", "Type") == "notify"
             backend = process_status(machine, "charon-kernel.service")
@@ -629,6 +680,7 @@ in
             left.wait_for_unit(unit)
             assert property(left, unit, "MainPID") != pid
         assert "kernel-rust" in ctl(left, "--stats")
+        assert_start_order(left)
         for machine in machines:
             machine.wait_until_succeeds("test -z \"$(ip xfrm state)\"")
         assert not links(left)
@@ -640,31 +692,59 @@ in
         left.wait_for_unit("strongswan-swanctl.service")
         assert property(left, "strongswan-swanctl.service", "MainPID") != previous
         assert "kernel-rust" in ctl(left, "--stats")
+        assert_start_order(left)
 
-    with subtest("daemon SIGTERM cleans reconciled resources with an active strongSwan tunnel"):
+    with subtest("stopping the backend stops charon before backend exit"):
+        for machine, config_file in zip(machines, [proposals[0][1], proposals[0][2]]):
+            ctl(machine, "--load-all --noprompt --file " + config_file)
+        assert "established" in ctl(left, "--initiate --child net")
+        left.succeed("systemctl stop charon-kernel.service")
+        assert_stopped(left, "strongswan-swanctl.service")
+        assert_stopped(left, "charon-kernel.service")
+        assert_stop_order(left)
+        assert_empty(left)
+        left.succeed("systemctl start strongswan-swanctl.service")
+        assert_start_order(left)
+
+    with subtest("daemon SIGTERM cleans an active tunnel and automatically restarts the pair"):
         for machine, config_file in zip(machines, [proposals[0][1], proposals[0][2]]):
             ctl(machine, "--load-all --noprompt --file " + config_file)
         assert "established" in ctl(left, "--initiate --child net")
         retained = spis(left)
         assert retained and links(left)
+        previous = pair_pids(left)
         left.succeed("systemctl kill --signal=TERM --kill-whom=main charon-kernel.service")
-        assert_stopped(left, "charon-kernel.service")
-        assert property(left, "charon-kernel.service", "ExecMainStatus") == "0"
-        assert_stopped(left, "strongswan-swanctl.service")
-        assert not links(left)
-        assert not left.succeed("ip xfrm policy list nosock").strip()
-        assert not spis(left), "daemon shutdown must flush the XFRM state table"
-        left.succeed("systemctl start strongswan-swanctl.service")
-        assert "kernel-rust" in ctl(left, "--stats")
+        assert_recovered(left, previous)
 
-    with subtest("strongSwan exiting without a stop job stops the unused backend"):
+    with subtest("lost RPC cleans the kernel and automatically restarts both services"):
+        for machine, config_file in zip(machines, [proposals[0][1], proposals[0][2]]):
+            ctl(machine, "--load-all --noprompt --file " + config_file)
+        assert "established" in ctl(left, "--initiate --child net")
+        previous = pair_pids(left)
+        assert spis(left) and links(left)
+        left.succeed("python3 ${../tests/disconnect.py} " + previous["strongswan-swanctl.service"]
+                     + " /run/charon-kernel/charon-kernel.sock")
+        assert_recovered(left, previous)
+
+    with subtest("strongSwan exiting without a stop job automatically restarts the pair"):
+        previous = pair_pids(left)
         left.succeed("systemctl kill --signal=TERM --kill-whom=main strongswan-swanctl.service")
-        assert_stopped(left, "strongswan-swanctl.service")
-        assert_stopped(left, "charon-kernel.service")
-        assert_empty(left)
-        left.succeed("test ! -e /run/strongswan && test ! -e /run/charon-kernel")
-        left.succeed("systemctl start strongswan-swanctl.service")
-        assert "kernel-rust" in ctl(left, "--stats")
+        assert_recovered(left, previous)
+
+    with subtest("charon crash cleans its failed session and automatically restarts the pair"):
+        for machine, config_file in zip(machines, [proposals[0][1], proposals[0][2]]):
+            ctl(machine, "--load-all --noprompt --file " + config_file)
+        assert "established" in ctl(left, "--initiate --child net")
+        assert spis(left) and links(left)
+        previous = pair_pids(left)
+        left.succeed("systemctl kill --signal=KILL --kill-whom=main strongswan-swanctl.service")
+        assert_recovered(left, previous)
+        for machine, config_file in zip(machines, [proposals[0][1], proposals[0][2]]):
+            ctl(machine, "--load-all --noprompt --file " + config_file)
+        assert "established" in ctl(left, "--initiate --child net")
+        for peer, machine in enumerate(machines, 1):
+            wait_overlay_config(machine, peer, links(machine)[0]["ifname"])
+            ping_overlay(machine, peer)
 
     with subtest("stopping strongSwan stops the backend and removes runtime directories"):
         for machine in machines:
@@ -672,12 +752,13 @@ in
             machine.succeed("test ! -e /run/strongswan")
             machine.succeed("test ! -e /run/charon-kernel")
         assert_stopped(left, "charon-kernel.service")
+        assert_stop_order(left)
         assert_empty(left)
         assert not spis(right)
         assert indices(right) == original_indices[1]
         assert not right.succeed("ip xfrm policy list nosock").strip()
 
-    with subtest("failed backend startup prevents strongSwan startup"):
+    with subtest("persistent backend startup failure blocks charon and rate-limits retries"):
         left.succeed("mkdir -p /run/systemd/system/charon-kernel.service.d")
         left.succeed(
             "printf '[Service]\\nExecStartPre=/run/current-system/sw/bin/false\\n' "
@@ -685,18 +766,34 @@ in
         )
         left.succeed("systemctl daemon-reload")
         left.fail("systemctl start strongswan-swanctl.service")
+        left.wait_until_succeeds(
+            "test $(systemctl show charon-kernel.service -p Result --value) = start-limit-hit"
+        )
         assert_stopped(left, "strongswan-swanctl.service")
         assert_stopped(left, "charon-kernel.service")
         left.succeed("rm /run/systemd/system/charon-kernel.service.d/test-failure.conf")
         left.succeed("systemctl daemon-reload && systemctl reset-failed")
         left.succeed("systemctl start strongswan-swanctl.service")
         assert "kernel-rust" in ctl(left, "--stats")
+        assert_start_order(left)
 
-    with subtest("backend process failure stops strongSwan"):
+    with subtest("backend crash automatically replaces charon and retires leftover kernel objects"):
+        right.succeed("systemctl start strongswan-swanctl.service")
+        for machine, config_file in zip(machines, [proposals[0][1], proposals[0][2]]):
+            ctl(machine, "--load-all --noprompt --file " + config_file)
+        assert "established" in ctl(left, "--initiate --child net")
+        previous = pair_pids(left)
+        assert spis(left) and links(left)
         left.succeed("systemctl kill --signal=KILL --kill-whom=main charon-kernel.service")
-        assert_stopped(left, "charon-kernel.service")
-        assert_stopped(left, "strongswan-swanctl.service")
-        left.succeed("test ! -e /run/strongswan && test ! -e /run/charon-kernel")
+        assert_recovered(left, previous)
+        for machine, config_file in zip(machines, [proposals[0][1], proposals[0][2]]):
+            ctl(machine, "--load-all --noprompt --file " + config_file)
+        assert "established" in ctl(left, "--initiate --child net")
+        for peer, machine in enumerate(machines, 1):
+            wait_overlay_config(machine, peer, links(machine)[0]["ifname"])
+            ping_overlay(machine, peer)
+        left.succeed("systemctl stop strongswan-swanctl.service")
+        assert_empty(left)
 
     with subtest("a fresh strongSwan session retires global policy and SA leftovers"):
         left.succeed(

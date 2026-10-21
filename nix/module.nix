@@ -95,9 +95,14 @@ in
     };
 
     systemd.services.strongswan-swanctl = {
-      bindsTo = [ "charon-kernel.service" ];
+      # BindsTo would turn backend failure into a stop job, suppressing recovery.
+      # Requires propagates restarts; After orders shutdown and fresh startup.
+      requires = [ "charon-kernel.service" ];
       after = [ "charon-kernel.service" ];
       serviceConfig = hardening // {
+        # PartOf propagates automatic charon restarts to the kernel daemon.
+        Restart = lib.mkForce "always";
+        RestartSec = "2s";
         DynamicUser = lib.mkDefault true;
         Group = lib.mkDefault cfg.group;
         CapabilityBoundingSet = lib.mkDefault "";
@@ -115,10 +120,15 @@ in
 
     systemd.services.charon-kernel = {
       description = "strongSwan Rust kernel backend";
+      # Pull charon back in after an automatic backend restart, even if it
+      # already exited. Requires/After orders the fresh pair in either case.
+      wants = [ "strongswan-swanctl.service" ];
       partOf = [ "strongswan-swanctl.service" ];
       unitConfig.StopWhenUnneeded = true;
       serviceConfig = hardening // {
         Type = "notify";
+        Restart = "always";
+        RestartSec = "2s";
         ExecStart = lib.escapeShellArgs [
           "${cfg.package}/bin/charon-kernel-daemon"
           "--group"

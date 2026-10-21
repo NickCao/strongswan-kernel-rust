@@ -138,12 +138,20 @@ directories use mode 0750 and the static access group. Charon permits Unix,
 IPv4, IPv6 and Netlink sockets; the kernel daemon permits only Unix and
 Netlink sockets.
 
-StrongSwan pulls in the kernel service with `BindsTo` and `After` and waits
+StrongSwan pulls in the kernel service with `Requires` and `After` and waits
 for its readiness notification after the socket is ready. `PartOf` propagates
 strongSwan stops/restarts to the daemon, with strongSwan stopping first so it
-can remove its SAs. `StopWhenUnneeded` also stops the daemon if IKE exits on
-its own. Losing the kernel daemon stops IKE. The kernel daemon starts only as
-a dependency of IKE.
+can remove its SAs. `StopWhenUnneeded` also stops the daemon when no active or
+pending IKE service needs it. Both services use `Restart=always` with a
+two-second delay, covering unexpected clean exits as well as failures.
+The daemon's `Wants` pulls charon back in after a backend restart, including
+when charon has already exited. Automatic restarts replace both processes,
+wait for daemon cleanup, and start a ready daemon before charon. Explicitly
+stopping either unit stops the pair without automatic recovery.
+Systemd stop/restart jobs keep the daemon alive until charon has stopped.
+Unexpected daemon termination cannot preserve that ordering; charon stops
+when systemd schedules the restart, after the restart delay. `BindsTo` is
+deliberately avoided: its failure-triggered stop job would suppress restart.
 
 The module does not write strongSwan configuration or firewall rules.
 Use `services.strongswan-swanctl.strongswan.extraConfig` and `swanctl` to
@@ -508,6 +516,11 @@ replaying mutations. The eventfd signals event availability only; an idle
 connection does not probe for daemon failure.
 A clean close requires all tunnel SAs/policies removed, cleans larval SPI
 reservations and all remaining global policies, and permits a new session.
+Losing an opened session or overflowing its event queue triggers daemon
+shutdown: it clears all global policies, SAs and SPI reservations and removes
+owned interfaces, then exits with an error. Connections that never opened a
+session and clean session closes do not trigger shutdown. The daemon never
+accepts a replacement for a failed session.
 The `FlushSas` RPC clears desired SAs and flushes the whole state table. Flushing
 tunnel policies clears their desired references and reconciles the whole policy table,
 preserving desired IKE port bypasses until close. Opening a new session first
@@ -578,8 +591,8 @@ interpreting the logical ID. Missing interfaces are created and changed settings
 are repaired. Unchanged links do not call `update()`. Repairs share the policy worker and
 backend lock, so deleting the final SA or rolling back a failed installation
 cannot race with recreation. Policies alone do not keep interfaces alive.
-Repairs stop when the session disconnects; hard expiry still removes unused
-interfaces.
+Repairs stop when the session disconnects; shutdown clears the desired objects
+and reconciles policies and interfaces to empty.
 
 Its separate `InterfaceKernel` trait provides only list/create/update/delete
 operations. Listing returns every backend-owned object as an `ObservedInterface`
@@ -660,37 +673,21 @@ their normal kernel timeout; startup, explicit flush and shutdown also clear
 these objects, including ones without an addressable SPI. Live packet state is
 not mirrored or restored by reconciliation.
 
-If charon or its connection disappears unexpectedly, installed tunnel
-objects are preserved and replacement sessions are rejected. Hard expiry
-still releases the last SA's interface. Interface ownership survives daemon
-restarts through the reserved group. A new session retires old SAs, SPI
-reservations, global policies and owned interfaces before installing fresh
-resources. This does not recover desired SAs or established IKE
-sessions. Automatic full restart recovery is not implemented. Endpoint or
-encapsulation migration requires reestablishing the SAs. This
-is an experimental backend with a coordinated restart requirement: stop
-protected traffic before removing leftover objects and restarting the pair.
+If charon or its connection disappears unexpectedly, the daemon cleans the
+kernel objects and exits. A failed RPC may have applied a mutation without
+delivering its reply, so reconnecting cannot reliably recover charon's desired
+policies or established SAs. Restart the pair and negotiate fresh IKE/CHILD_SAs.
+Endpoint or encapsulation migration also requires reestablishing the SAs.
 Routes through deleted interfaces disappear with the links.
 
-Full crash recovery is deferred. Proposed follow-up work is:
-
-- If charon crashes while the daemon survives, retire the failed session,
-  stop its repairs, and remove the namespace's SAs, policies and larval SPI
-  reservations along with daemon-owned interfaces. Accept a replacement session
-  only after cleanup succeeds. The SA controller already provides the bulk
-  cleanup used at orderly shutdown and session startup.
-- If the daemon crashes, systemd already stops charon, but the kernel objects
-  can outlive both processes. Interfaces are discoverable by group, and all
-  global policies and SAs are owned and retired at session startup. This cleanup
-  is implemented; automatic coordination outside the supplied systemd module
-  and recovery of a disconnected client remain future work.
-- Reload connection configuration and negotiate fresh IKE/CHILD_SAs after
-  cleanup. Preserving established SAs across crashes is outside this proposal.
-
-Verification should kill charon and the daemon separately with active tunnels,
-then check cleanup, successful tunnel reestablishment, and preservation of
-interfaces outside the reserved group. Interrupted cleanup and recovery also need
-coverage before automatic daemon-crash recovery is enabled.
+If the daemon crashes or cleanup fails, kernel objects can outlive both
+processes. Interface ownership survives daemon restarts through the reserved
+group. A new session retires old SAs, SPI reservations, global policies and
+owned interfaces before installing fresh resources. This does not recover
+desired SAs or established IKE sessions. The NixOS module automatically restarts
+the pair after failures; normal strongSwan configuration loading and connection
+initiation rules determine which tunnels are negotiated again. Coordination
+outside that module and preservation of established SAs remain future work.
 
 ## Verification
 
@@ -731,11 +728,14 @@ logical identity, preservation of unmanaged settings, rekey references and teard
 interface rollback, foreign objects, overlapping SAs, policy flushes (including missing policies),
 SA loss and configuration drift retirement, route withdrawal, 300-SA flush
 notifications, unwanted state cleanup, larval maturation including an expired
-reservation, hard expiry, and expiry after losing the client. The NixOS tunnel
+reservation, hard expiry, and daemon exit and cleanup after losing the client. The NixOS tunnel
 tests additionally exercise inbound/outbound state deletion, full state flush,
 native configuration drift and loss during rekey with AES-GCM and AES-CBC/HMAC;
 new SPIs and working traffic must return without replacing the IKE session or
-charon process. The tunnel tests use
+charon process. They also check service readiness and shutdown ordering,
+automatic paired recovery after RPC loss and process termination, startup
+failure rate limiting, intentional stops, crash inventory cleanup, and fresh
+IPv4/IPv6 traffic against an upstream kernel-netlink peer. The tunnel tests use
 capability-free charons, Ed25519 raw public keys, ranet's wildcard IPv4/IPv6
 selectors, high ports, output marks, traffic counters, actual rekeying with
 stable interface indices, and final-SA interface deletion. The ABI test uses

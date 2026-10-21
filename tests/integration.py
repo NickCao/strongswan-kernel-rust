@@ -159,6 +159,10 @@ def run(binary):
                 assert daemon.poll() is None
                 info = os.stat(path)
                 assert info.st_uid == 0 and info.st_gid == 65534 and info.st_mode & 0o777 == 0o660
+                # A connection that never opened a session must not stop the daemon.
+                probe = Rpc(path)
+                assert probe.call("FlushSas")["error"].endswith("InvalidSession")
+                probe.socket.close()
                 # No UID or primary/supplementary group matching the socket:
                 # Linux must reject the connection before any RPC is sent.
                 subprocess.run([
@@ -521,22 +525,21 @@ def run(binary):
                 multihomed_source()
                 ip("route", "del", "198.19.0.2/32")
                 assert "error" not in filtered.call("CloseSession"); filtered.socket.close()
-                # Losing charon preserves active kernel objects, while the
-                # daemon still cleans an interface when its last SA expires.
+                # Losing the opened session exits and cleans its objects,
+                # without waiting for the SA's lifetime to expire.
                 lost = Rpc(path); assert "error" not in lost.call("OpenSession",dict(interfaces_use="",interfaces_ignore=""))
-                assert "error" not in lost.call("InstallSa",dict(id=sa_id(spi=0x12345,interface=50),config=sa_config(life=3,inbound=True)))
+                assert "error" not in lost.call("InstallSa",dict(id=sa_id(spi=0x12345,interface=50),config=sa_config()))
                 lost.socket.close()
-                assert "0x00012345" in states()
-                probe = Rpc(path)
-                assert probe.call("OpenSession",dict(interfaces_use="",interfaces_ignore=""))["error"].endswith("SessionBusy")
-                probe.socket.close()
-                wait(lambda: [l["ifname"] for l in links()] == ["foreign"])
-                print("PASS: socket group authorization and denied nonmember, typed tarpc, IPv4/IPv6 FIB lookups and routing policy, address scope/type filtering, multihomed sources and egress-interface exclusions, ICMP policy priorities, policy and interface repair without SA changes, rekey references and teardown, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, immutable SA loss notification, IPv4/IPv6 acquire events, rollback, foreign replacements, larval SPI, hard expiry, namespace cleanup including missing objects, and disconnected-client expiry")
+                assert daemon.wait(timeout=5) == 1
+                assert [l["ifname"] for l in links()] == ["foreign"]
+                assert not states().strip() and not ip("xfrm", "policy").strip()
+                print("PASS: socket group authorization and denied nonmember, typed tarpc, IPv4/IPv6 FIB lookups and routing policy, address scope/type filtering, multihomed sources and egress-interface exclusions, ICMP policy priorities, policy and interface repair without SA changes, rekey references and teardown, coalesced route/address events, capability-free client, SA/interface lifetime, overlapping rekey, immutable SA loss notification, IPv4/IPv6 acquire events, rollback, foreign replacements, larval SPI, hard expiry, namespace cleanup including missing objects, and session-loss exit and cleanup")
             except BaseException:
                 log.seek(0); print(log.read(),file=sys.stderr); raise
             finally:
                 if child and child.poll() is None: child.kill(); child.wait()
-                daemon.terminate(); daemon.wait(timeout=5)
+                if daemon.poll() is None:
+                    daemon.terminate(); daemon.wait(timeout=5)
 
     with tempfile.TemporaryDirectory(prefix="kernel-rust-sa-audit-") as d:
         path = str(Path(d) / "kernel.sock")
@@ -628,7 +631,7 @@ def run(binary):
                       "dir", "out", "if_id", "77"]
     ip("xfrm", "policy", "add", *foreign_policy, "priority", "1234", "action", "block")
     for attempt, (signum, disconnect) in enumerate([
-        (signal.SIGTERM, False), (signal.SIGINT, False), (signal.SIGTERM, True),
+        (signal.SIGTERM, False), (signal.SIGINT, False), (None, True),
     ]):
         with tempfile.TemporaryDirectory(prefix="kernel-rust-shutdown-") as d:
             path = str(Path(d) / "kernel.sock")
@@ -662,11 +665,12 @@ def run(binary):
                         config=policy_config(spi=owned["spi"])))
                     assert len(links()) == 2
                     assert f"{allocated:08x}" in states() and f"{owned['spi']:08x}" in states()
+                    ip("xfrm", "policy", "add", *foreign_policy, "priority", "1234", "action", "block")
                     if disconnect:
                         control.socket.close()
-                    ip("xfrm", "policy", "add", *foreign_policy, "priority", "1234", "action", "block")
-                    daemon.send_signal(signum)
-                    assert daemon.wait(timeout=10) == 0
+                    else:
+                        daemon.send_signal(signum)
+                    assert daemon.wait(timeout=10) == (1 if disconnect else 0)
                     idle.socket.close()
                     assert not ip("xfrm", "policy").strip()
                     assert [link["ifname"] for link in links()] == ["foreign"]
@@ -678,7 +682,7 @@ def run(binary):
                         control.socket.close()
                     if daemon.poll() is None:
                         daemon.kill(); daemon.wait()
-    print("PASS: SIGTERM/SIGINT clear all global policies, SAs, SPI reservations and owned interfaces with active or disconnected clients, preserving foreign interfaces")
+    print("PASS: SIGTERM/SIGINT and session loss clear all global policies, SAs, SPI reservations and owned interfaces, preserving foreign interfaces")
 
     for clean_close in [False, True]:
         with tempfile.TemporaryDirectory(prefix="kernel-rust-idle-shutdown-") as d:

@@ -35,8 +35,9 @@ the denylist. `next_events` uses that same connection and immediately returns
 one queued batch of typed expiry, acquire, NAT mapping, or network change
 notifications, or an empty batch when idle. No subscription token or second
 connection is needed. The daemon queue is bounded; overflow invalidates the
-connection instead of silently losing expiry events. The daemon keeps receiving
-hard expiry events after a client disconnects to release expired SA interfaces.
+connection instead of silently losing expiry events. A failed opened session
+wakes the daemon's main loop to clean kernel objects and exit with an error.
+Unopened connections and successful clean closes do not trigger shutdown.
 
 The daemon writes to the eventfd when a batch becomes available, coalescing
 wakeups until a batch is fetched. XFRM batches wake immediately. A pending roam
@@ -93,6 +94,8 @@ change notifications are coalesced at 100 ms intervals; XFRM events are
 delivered separately without that delay.
 
 A failed transport exchange leaves mutation results uncertain. The client
-does not replay or reconnect automatically. Unexpected disconnects preserve
-kernel objects and reject replacement sessions until a coordinated daemon
-restart. The protocol has no restart recovery or persistent ownership journal.
+does not replay or reconnect automatically. Unexpected session disconnects
+trigger daemon shutdown and removal of all global policies, SAs, SPI
+reservations and owned interfaces. Failed sessions cannot be replaced;
+recovery requires restarting the pair and negotiating fresh SAs. The protocol
+has no state replay or persistent ownership journal.
