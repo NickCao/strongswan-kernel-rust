@@ -35,13 +35,13 @@ counts still differed: initial/reload counts were 1610/760 for the Tokio worker,
 Churn comparisons are descriptive, not measurements at an identical update rate.
 The remaining callback/notification methodology is described below.
 
-Raw samples, scripts, exact package paths and logs are preserved in
-`/root/charon-kernel-eventfd-benchmark/`. The eventfd release package is
+Temporary raw samples, scripts and logs were removed during workspace cleanup.
+The measurements and methodology are retained in this document.
+The eventfd release package was
 `/nix/store/v12lg3zhhjpaxavkdxlgsgyac8nga2cf-strongswan-kernel-rust-0.1.0`.
 The full mixed-peer x86_64 NixOS test passed in 303.29 seconds, with the Rust
 backend on one peer and upstream `kernel-netlink` on the other, including traffic
 in both directions, both cipher cases, recovery, hardening and shutdown.
-Its log is `/root/charon-kernel-mixed-peer-final-nix.log`.
 
 ## Earlier full comparison
 
@@ -109,7 +109,7 @@ or latency guarantees under higher-priority saturation. The ABI fixture uses
 a fresh real kernel interface with an observation listener; full IKE/CHILD
 handling is covered by the NixOS test.
 
-## Validation and artifacts
+## Validation
 
 The implementation passed 33 regular tests, three privileged tests run
 serially in an isolated namespace, six native kernel integration scenario
@@ -120,10 +120,5 @@ AES-CBC/HMAC IPv4/IPv6 traffic, rekey, SA loss, interface/policy recovery,
 DynamicUser hardening, service dependencies and shutdown cleanup. aarch64
 outputs were evaluated but not executed.
 
-This VM's reproducible harness, package paths, full trial results, aggregates,
-validation records and logs are preserved in
-`/root/charon-kernel-event-driven-benchmark/`. See its `README.md`, `compare.py`,
-`results.json`, `summary.json` and `validation.json`. Validation logs are
-`/root/charon-kernel-event-driven-{unit,native,integration,abi,clippy,nix}.log`.
-The measured event-driven package is
+The measured event-driven package was
 `/nix/store/54zls8vhjl66ykvg5mcm4xy3qdzzl6c8-strongswan-kernel-rust-0.1.0`.
