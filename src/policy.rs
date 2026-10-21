@@ -94,6 +94,7 @@ impl PolicyKey {
                     && data.kind == POLICY_IPSEC
                     && self.dir != POLICY_IN,
                 template: (data.kind == POLICY_IPSEC && data.reqid != 0).then(|| PolicyTemplate {
+                    mode: data.mode,
                     src: data.src.address,
                     dst: data.dst.address,
                     reqid: data.reqid,
@@ -108,10 +109,11 @@ impl PolicyKey {
     }
 }
 
-/// The supported protection template: tunnel-mode ESP, with SPI zero accepting
+/// The supported protection template: tunnel/AGGFRAG ESP, with SPI zero accepting
 /// any matching SA (including overlapping inbound SAs during rekey).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyTemplate {
+    pub mode: TunnelMode,
     pub src: IpAddr,
     pub dst: IpAddr,
     pub reqid: u32,
@@ -329,6 +331,7 @@ impl<K: PolicyKernel> Policies<K> {
                 continue;
             }
             let data = PolicyData {
+                mode: TunnelMode::Tunnel,
                 kind: 2,
                 prio: 0,
                 manual_prio: 32,
@@ -455,6 +458,7 @@ mod tests {
                 if_id: 41,
             },
             PolicyData {
+                mode: TunnelMode::Tunnel,
                 src,
                 dst,
                 kind: 1,
@@ -475,6 +479,7 @@ mod tests {
         let old_spec = key.spec(&old);
         let mut new = old.clone();
         new.esp = Some(0x10204);
+        new.mode = TunnelMode::Iptfs;
         new.forward_icmp = true;
         let new_spec = key.spec(&new);
         let mut foreign = id.clone();

@@ -4,6 +4,23 @@ pub use crate::rpc_api::{Endpoint, Mark, SaConfig, SessionConfig};
 use ipnet::IpNet;
 use std::io;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunnelMode {
+    Tunnel,
+    Iptfs,
+}
+impl TryFrom<i32> for TunnelMode {
+    type Error = io::Error;
+
+    fn try_from(mode: i32) -> io::Result<Self> {
+        match mode {
+            crate::rpc_api::mode::TUNNEL => Ok(Self::Tunnel),
+            crate::rpc_api::mode::IPTFS => Ok(Self::Iptfs),
+            _ => Err(crate::error::unsupported()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Ts {
     pub from: Endpoint,
@@ -89,6 +106,7 @@ pub struct PolicyId {
 /// removal. Multiple references may share one installed policy during rekeying.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyData {
+    pub mode: TunnelMode,
     pub kind: u8,
     pub prio: u8,
     pub manual_prio: u32,

@@ -12,6 +12,12 @@ mod endpoint;
 pub mod notification;
 pub mod transport;
 
+/// strongSwan ipsec_types.h values, distinct from Linux XFRM mode numbers.
+pub mod mode {
+    pub const TUNNEL: i32 = 2;
+    pub const IPTFS: i32 = 6;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Error {
     Kernel(i32),
@@ -36,6 +42,32 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct SessionConfig {
     pub interfaces_use: String,
     pub interfaces_ignore: String,
+    #[serde(default)]
+    pub iptfs: IptfsConfig,
+}
+
+/// charon.iptfs settings. Times are microseconds; queue/packet sizes are bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IptfsConfig {
+    pub drop_time: u32,
+    pub reorder_window: u16,
+    pub init_delay: u32,
+    pub max_queue_size: u32,
+    pub packet_size: u32,
+    pub dont_fragment: bool,
+}
+impl Default for IptfsConfig {
+    fn default() -> Self {
+        // Defaults used by strongSwan's kernel-netlink backend.
+        Self {
+            drop_time: 1_000_000,
+            reorder_window: 3,
+            init_delay: 0,
+            max_queue_size: 1024 * 1024,
+            packet_size: 0,
+            dont_fragment: false,
+        }
+    }
 }
 impl SessionConfig {
     pub fn usable(&self, interface: &str) -> bool {

@@ -645,6 +645,7 @@ mod tests {
                 SessionConfig {
                     interfaces_use: String::new(),
                     interfaces_ignore: String::new(),
+                    ..SessionConfig::default()
                 },
             )
             .await
@@ -678,6 +679,7 @@ mod tests {
                 SessionConfig {
                     interfaces_use: String::new(),
                     interfaces_ignore: String::new(),
+                    ..SessionConfig::default()
                 },
             )
             .await

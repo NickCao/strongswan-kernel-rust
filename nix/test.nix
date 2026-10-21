@@ -11,9 +11,10 @@ let
       package
     ];
   };
-  connection =
-    peer: proposal:
-    pkgs.writeText "swanctl-${toString peer}-${proposal}.conf" ''
+  connection = peer: proposal: connectionWithMode peer proposal "tunnel";
+  connectionWithMode =
+    peer: proposal: mode:
+    pkgs.writeText "swanctl-${toString peer}-${proposal}-${mode}.conf" ''
       connections {
         tunnel {
           version = 2
@@ -39,10 +40,10 @@ let
             net {
               local_ts = 0.0.0.0/0, ::/0
               remote_ts = 0.0.0.0/0, ::/0
-              mode = tunnel
+              mode = ${mode}
               icmp = yes
               esp_proposals = ${proposal}
-              tfc_padding = 256
+              tfc_padding = ${if mode == "iptfs" then "0" else "256"}
               set_mark_out = 123
               rekey_time = 300s
               life_time = 600s
@@ -86,6 +87,7 @@ let
         "xfrm_interface"
         "esp4"
         "esp6"
+        "xfrm_iptfs"
         "vrf"
       ];
       # Tokio/tarpc read the clock frequently. The test harness's emulated ACPI
@@ -213,6 +215,13 @@ let
           port_nat_t = 13000
           install_routes = no
           load_modular = yes
+          iptfs {
+            drop_time = 500000
+            reorder_window = 5
+            init_delay = 100000
+            max_queue_size = 262144
+            packet_size = 512
+          }
           plugins {
             include ${config.services.strongswan-swanctl.package}/share/strongswan/templates/config/plugins/*.conf
             kernel-netlink {
@@ -672,6 +681,60 @@ in
                 else:
                     # The native backend's bypasses are socket policies.
                     assert not policies.strip(), policies
+
+    with subtest("IP-TFS interoperates with kernel-netlink, aggregates and fragments"):
+        for machine, config_file in zip(machines, [
+                "${connectionWithMode 1 "aes128gcm128-esn" "iptfs"}",
+                "${connectionWithMode 2 "aes128gcm128-esn" "iptfs"}"]):
+            ctl(machine, "--load-all --noprompt --file " + config_file)
+        ctl(left, "--initiate --child net")
+        iptfs_indices = [indices(machine) for machine in machines]
+        # iproute2 7.1 prints the native XFRM_MODE_IPTFS value without a name.
+        iptfs_mode = r"\bmode (?:iptfs|5)\b"
+        for peer, machine in enumerate(machines, 1):
+            wait_overlay_config(machine, peer, next(iter(iptfs_indices[peer - 1])))
+            state = machine.succeed("ip -s xfrm state")
+            assert len(re.findall(iptfs_mode, state)) == 2, state
+            assert "tfcpad" not in state, state
+            assert all(re.search(iptfs_mode, policy) for policy in policy_specs(machine) if "if_id" in policy)
+            ping_overlay(machine, peer)
+
+        def outbound_packets():
+            state = left.succeed("ip -s xfrm state")
+            block = next(block for block in re.split(r"(?=^src )", state, flags=re.M)[1:]
+                         if "dir out" in block)
+            return int(matched_value(r"(\d+)\(packets\)", block))
+
+        before = outbound_packets()
+        left.succeed("ip vrf exec overlay ping -c 4 -i 0.01 -W 3 -s 32 -I 10.1.0.1 10.2.0.1")
+        assert 0 < outbound_packets() - before < 4, "small packets were not aggregated"
+        before = outbound_packets()
+        left.succeed("ip vrf exec overlay ping -c 1 -W 3 -M do -s 1200 -I 10.1.0.1 10.2.0.1")
+        assert outbound_packets() - before > 1, "large inner packet was not fragmented"
+        # A periodic audit and policy repair must preserve the mode/settings.
+        expected_policies = policy_specs(left)
+        previous_spis = spis(left)
+        left.succeed("ip xfrm policy flush")
+        for attempt in range(100):
+            if policy_specs(left) == expected_policies:
+                break
+            time.sleep(0.1)
+        assert policy_specs(left) == expected_policies
+        time.sleep(5.3)
+        assert spis(left) == previous_spis
+        assert indices(left) == iptfs_indices[0]
+        ctl(left, "--rekey --child net")
+        for attempt in range(100):
+            if spis(left) - previous_spis:
+                break
+            time.sleep(0.1)
+        assert spis(left) - previous_spis, "IP-TFS rekey did not install new SAs"
+        ping_overlay(left, 1)
+        assert indices(left) == iptfs_indices[0]
+        ctl(left, "--terminate --ike tunnel")
+        for machine in machines:
+            machine.wait_until_succeeds("test -z \"$(ip xfrm state)\"")
+        assert not links(left)
 
     with subtest("strongSwan restart restarts the backend after cleaning live SAs"):
         for machine, config_file in zip(machines, [proposals[0][1], proposals[0][2]]):

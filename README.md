@@ -17,11 +17,11 @@ orderly daemon shutdown flush the entire state table, including larval SPI
 reservations. Per-socket policies remain owned by their sockets.
 
 The scope follows [ranet's VICI configuration](https://github.com/NickCao/ranet/blob/b0e52359f7c5816263f83cd5f12065945c5e4eaa/src/vici.rs):
-tunnel-mode ESP, nonzero XFRM interface IDs, forced UDP encapsulation, high
+tunnel/AGGFRAG-mode ESP, nonzero XFRM interface IDs, forced UDP encapsulation, high
 IKE ports, IPv4/IPv6 selectors, SA output marks, statistics, expiry events,
 and CHILD_SA rekeying. Both default ESP proposals (including AES-GCM and
 AES-CBC with HMAC) and ESN are supported. MOBIKE, transport/BEET mode, AH,
-IPComp, IP-TFS, hardware offload, labels, virtual IPs, and host route/rule
+IPComp, hardware offload, labels, virtual IPs, and host route/rule
 installation are outside this backend's scope. The daemon rejects unsupported SA and policy options. The plugin forwards
 all input fields, including options that future backends may support.
 
@@ -41,6 +41,22 @@ It enables ICMP checking on inbound SAs and sets policy flags as requested by
 strongSwan; reconciliation preserves these settings. Algorithm mappings use
 named strongSwan transform IDs and explicit AEAD tag and standard SHA-2/AES
 MAC lengths. Linux determines which algorithms the running kernel supports.
+
+`mode = iptfs` enables Linux's AGGFRAG mode (Linux 6.14+ with `xfrm_iptfs`
+support). The kernel aggregates small inner packets and fragments large ones
+across ESP packets. This does not provide constant-rate traffic-flow concealment.
+Both peers must support the mode; strongSwan may otherwise negotiate ordinary
+tunnel mode. Leave `tfc_padding = 0` (the default) for IP-TFS connections.
+
+The plugin forwards `charon.iptfs.drop_time`, `reorder_window`, `init_delay`,
+`max_queue_size`, `packet_size`, and `dont_fragment` to the daemon at session
+opening, using the same defaults as kernel-netlink. Restart strongSwan to
+apply changes to these settings. Times are microseconds; queue and packet
+sizes are bytes. `charon.iptfs.accept_fragments` stays with
+strongSwan's IKE negotiation. The daemon also honors the peer's negotiated
+request to disable inner-packet fragmentation. IP-TFS SAs have the same
+interface lifetime and immutable-SA audit behavior as ordinary tunnel SAs;
+policy repair preserves their mode.
 
 An interface named `ranet<if_id in eight hex digits>` is created and brought
 up **before its first SA is installed**. Its default MTU is 1400. Every SA
@@ -220,8 +236,8 @@ service setup, and remove the updown script that creates/deletes interfaces.
 The daemon attaches interfaces to the existing `gravity` VRF (the module's
 default `masterDevice`), enables multicast, and sets the MTU. Networkd no
 longer needs to perform that attachment or enable multicast. Keep overlay
-addresses, routes, and the VRF itself in the network configuration, and keep
-gravity's IP-TFS option disabled. This describes the integration changes;
+addresses, routes, and the VRF itself in the network configuration. Gravity's
+IP-TFS option requires kernel support on both peers. This describes the integration changes;
 the VM check exercises the backend and shared VICI access, not gravity's
 external registry and credential services.
 
@@ -742,8 +758,11 @@ new SPIs and working traffic must return without replacing the IKE session or
 charon process. They also check service readiness and shutdown ordering,
 automatic paired recovery after RPC loss and process termination, startup
 failure rate limiting, intentional stops, crash inventory cleanup, and fresh
-IPv4/IPv6 traffic against an upstream kernel-netlink peer. The tunnel tests use
-capability-free charons, Ed25519 raw public keys, ranet's wildcard IPv4/IPv6
+IPv4/IPv6 traffic against an upstream kernel-netlink peer.
+An IP-TFS case against that peer checks IPv4/IPv6 traffic, aggregation,
+fragmentation, policy repair, rekeying, and final-SA cleanup.
+The tunnel tests use capability-free charons, Ed25519 raw public keys,
+ranet's wildcard IPv4/IPv6
 selectors, high ports, output marks, traffic counters, actual rekeying with
 stable interface indices, and final-SA interface deletion. The ABI test uses
 the stock strongSwan 6.1 function tables to exercise both variadic `enumerate`

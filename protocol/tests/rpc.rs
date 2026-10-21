@@ -166,6 +166,7 @@ impl Fixture {
                 session: SessionConfig {
                     interfaces_use: "eth0".into(),
                     interfaces_ignore: String::new(),
+                    ..SessionConfig::default()
                 },
             },
             _directory: directory,

@@ -56,10 +56,26 @@ pub unsafe fn setting_int(key: &CStr, default: i32) -> i32 {
     }
 }
 
+unsafe fn setting_bool(key: &CStr, default: bool) -> bool {
+    unsafe {
+        let settings = (*ffi::lib).settings;
+        (*settings).get_bool.unwrap()(
+            settings,
+            key.as_ptr().cast_mut(),
+            i32::from(default),
+            (*ffi::lib).ns,
+        )
+    }
+}
+
 /// # Safety
 /// The host library and its settings must be initialized for this call.
 pub unsafe fn config() -> Result<kernel_rust_protocol::client::Config> {
     unsafe {
+        let defaults = api::IptfsConfig::default();
+        let unsigned = |key: &CStr, default: u32| {
+            u32::try_from(setting_int(key, default as i32)).map_err(|_| status_t_FAILED)
+        };
         Ok(kernel_rust_protocol::client::Config {
             path: setting_str(
                 c"%s.plugins.kernel-rust.socket",
@@ -68,6 +84,19 @@ pub unsafe fn config() -> Result<kernel_rust_protocol::client::Config> {
             session: api::SessionConfig {
                 interfaces_use: setting_str(c"%s.interfaces_use", c"")?,
                 interfaces_ignore: setting_str(c"%s.interfaces_ignore", c"")?,
+                iptfs: api::IptfsConfig {
+                    drop_time: unsigned(c"%s.iptfs.drop_time", defaults.drop_time)?,
+                    reorder_window: unsigned(
+                        c"%s.iptfs.reorder_window",
+                        defaults.reorder_window.into(),
+                    )?
+                    .try_into()
+                    .map_err(|_| status_t_FAILED)?,
+                    init_delay: unsigned(c"%s.iptfs.init_delay", defaults.init_delay)?,
+                    max_queue_size: unsigned(c"%s.iptfs.max_queue_size", defaults.max_queue_size)?,
+                    packet_size: unsigned(c"%s.iptfs.packet_size", defaults.packet_size)?,
+                    dont_fragment: setting_bool(c"%s.iptfs.dont_fragment", defaults.dont_fragment),
+                },
             },
         })
     }

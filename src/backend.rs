@@ -28,10 +28,11 @@ impl Backend {
             return Err(invalid());
         }
         let mut net = Network::new()?;
+        let sas = LinuxSas::new(config.iptfs)?;
         // Host routes, policy rules and virtual addresses belong to ranet.
         net.config = config;
         Ok(Self {
-            sas: Sas::new(LinuxSas::new()?),
+            sas: Sas::new(sas),
             net,
             policies: Policies::new(LinuxPolicies::new()?),
             interfaces: Interfaces::new(
@@ -63,8 +64,7 @@ impl Backend {
         let id = sa_id(id)?;
         // These checks used to run in the plugin. All options now arrive at
         // this boundary, even when the current backend does not support them.
-        if config.mode != 2
-            || config.ipcomp != 0
+        if config.ipcomp != 0
             || config.cpi != 0
             || config.security_label.is_some()
             || config.hw_offload != 0
@@ -204,15 +204,11 @@ pub fn policy_id(p: rpc::PolicyId) -> io::Result<PolicyId> {
 }
 pub fn policy_config(p: rpc::PolicyConfig) -> io::Result<PolicyData> {
     let sa = p.sa.ok_or_else(unsupported)?;
-    if sa.mode != 2
-        || sa.ah.used
-        || sa.ipcomp.transform != 0
-        || p.hw_offload != 0
-        || p.pcpu_acquires
-    {
+    if sa.ah.used || sa.ipcomp.transform != 0 || p.hw_offload != 0 || p.pcpu_acquires {
         return Err(unsupported());
     }
     let d = PolicyData {
+        mode: TunnelMode::try_from(sa.mode)?,
         kind: number(p.kind)?,
         prio: number(p.priority)?,
         manual_prio: p.manual_priority,

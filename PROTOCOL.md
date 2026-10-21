@@ -36,10 +36,12 @@ cancellation, framing and transport errors.
 `open_session` binds the connection to the daemon's single active session and
 returns feature flags. Its `interfaces_use` and `interfaces_ignore` arguments
 carry charon's interface filters; a nonempty allowlist takes precedence over
-the denylist. `next_events` uses that same connection and immediately returns
-one queued batch of typed expiry, acquire, NAT mapping, or network change
-notifications, or an empty batch when idle. No subscription token or second
-connection is needed. The daemon queue is bounded; overflow invalidates the
+the denylist. Its `iptfs` configuration carries the global `charon.iptfs`
+settings, while each SA's `iptfs_dont_fragment` carries the peer's negotiated
+fragmentation restriction. `next_events` uses that same connection and
+immediately returns one queued batch of typed expiry, acquire, NAT mapping,
+or network change notifications, or an empty batch when idle. No subscription
+token or second connection is needed. The daemon queue is bounded; overflow invalidates the
 connection instead of silently losing expiry events. A failed opened session
 wakes the daemon's main loop to clean kernel objects and exit with an error.
 Unopened connections and successful clean closes do not trigger shutdown.
@@ -68,18 +70,26 @@ IDs use native `u32` values. Endpoints retain `IpAddr`, port, IPv6 flow informat
 and scope ID. Counters and all lifetime limits/jitter use `u64`. Last-use
 timestamps are monotonic seconds, matching the kernel interface. SA and policy
 inputs carry the complete strongSwan callback data, including unsupported
-options; the daemon's adapter rejects unsupported configurations before calling
-the existing backend. Its supported kernel model remains tunnel-mode ESP over
-XFRM interfaces. Discovery's backend currently uses IP and port; transporting
+options; the daemon and its platform backend reject unsupported configurations.
+The supported kernel model is tunnel/AGGFRAG-mode ESP over XFRM interfaces.
+Discovery's backend currently uses IP and port; transporting
 IPv6 metadata does not add scoped routing support.
 
-`install_sa` currently requires tunnel-mode ESP with a nonzero interface ID. It
+`install_sa` requires tunnel/AGGFRAG-mode ESP with a nonzero interface ID. It
 creates an up XFRM interface when necessary; no route, address, or explicit
 interface-management methods exist. `remove_sa`, `flush_sas`, or a hard expiry
 release an unused interface. Policy reference counts preserve overlapping
 rekey policies. `flush_policies` clears desired tunnel policies and reconciles,
 retaining port bypasses. `close_session` succeeds only with no tunnel
 SAs/policies and then removes bypasses and larval allocations.
+
+For endpoint migration, strongSwan calls the plugin's `update_sa` callback
+with the old SA identity and a `SaUpdate` containing new endpoints, old/new
+encapsulation and request IDs, mode, selectors, interface, offload and direction.
+The plugin forwards this as `update_sa` on the existing tarpc channel. The
+daemon currently returns unsupported; it does not mutate established SAs.
+strongSwan's host-update path responds to an unsupported update by requesting
+a fresh CHILD_SA rekey. This fallback is separate from in-place MOBIKE support.
 
 `bypass_port` takes an address family (AF_INET/AF_INET6) and a UDP port at least
 1024. Charon binds and enables UDP encapsulation itself. The plugin receives

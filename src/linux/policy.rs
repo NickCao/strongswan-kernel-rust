@@ -3,6 +3,7 @@
 // Tobias Brunner and contributors; Copyright secunet Security Networks AG).
 // Packet layouts and serialization are supplied by netlink-packet-xfrm.
 use super::{
+    iptfs,
     netlink::{Message, Netlink, NlFamily, NlmF},
     xfrm::{host, id_attrs, message, missing, monotonic_use_time},
 };
@@ -131,7 +132,7 @@ impl LinuxPolicies {
                 saddr: packet::Address::from_ip(&template.src),
                 family: Endpoint::new(template.src, 0).family(),
                 reqid: template.reqid,
-                mode: packet::XFRM_MODE_TUNNEL,
+                mode: iptfs::mode(template.mode),
                 share: packet::XFRM_SHARE_ANY,
                 optional: 0,
                 aalgos: u32::MAX,
@@ -195,6 +196,7 @@ impl LinuxPolicies {
         let template = match templates {
             None | Some([]) => None,
             Some([template]) => Some(PolicyTemplate {
+                mode: iptfs::observed_mode(template.mode)?,
                 src: host(template.family, template.saddr, 0).ok()?.address,
                 dst: host(template.family, template.id.daddr, 0).ok()?.address,
                 reqid: template.reqid,
@@ -485,6 +487,7 @@ mod tests {
                 block: false,
                 forward_icmp: true,
                 template: Some(PolicyTemplate {
+                    mode: crate::model::TunnelMode::Iptfs,
                     src: src.address,
                     dst: dst.address,
                     reqid: 42,
@@ -529,6 +532,7 @@ mod tests {
                 if_id: 41,
             };
             let data = PolicyData {
+                mode: crate::model::TunnelMode::Tunnel,
                 kind: 1,
                 prio: 1,
                 manual_prio: 0,

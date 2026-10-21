@@ -3,6 +3,7 @@
 // Tobias Brunner and contributors; Copyright secunet Security Networks AG).
 // Packet layouts and serialization are supplied by netlink-packet-xfrm.
 use super::{
+    iptfs,
     netlink::{Message, Netlink, NlFamily, NlmF, Reply},
     policy::LinuxPolicies,
 };
@@ -175,9 +176,10 @@ pub struct LinuxSas {
     socket: Netlink,
     pub sa_dir: bool,
     pub lastused: bool,
+    iptfs: rpc::IptfsConfig,
 }
 impl LinuxSas {
-    pub fn new() -> io::Result<Self> {
+    pub fn new(iptfs: rpc::IptfsConfig) -> io::Result<Self> {
         // The service's ProcSubset=pid sandbox hides global /proc files.
         let uname = rustix::system::uname();
         let release = uname.release().to_str().map_err(io::Error::other)?;
@@ -190,6 +192,7 @@ impl LinuxSas {
             socket: Netlink::new(NlFamily::Xfrm)?,
             sa_dir: version >= (6, 10),
             lastused: version >= (6, 2),
+            iptfs,
         })
     }
     fn feature_flags(&self) -> u32 {
@@ -249,6 +252,10 @@ impl LinuxSas {
         Err(invalid())
     }
     fn sa_message(&self, id: &SaId, data: &SaConfig) -> io::Result<XfrmMessage> {
+        let mode = TunnelMode::try_from(data.mode)?;
+        if mode == TunnelMode::Iptfs && data.tfc != 0 {
+            return Err(unsupported());
+        }
         // strongSwan has already jittered the rekey limits. Tunnel selectors
         // are represented by policies, not installed on the SA itself.
         let lifetime = data.lifetime.as_ref().ok_or_else(invalid)?;
@@ -281,7 +288,7 @@ impl LinuxSas {
                 proto: id.proto,
             },
             family: id.src.family(),
-            mode: packet::XFRM_MODE_TUNNEL,
+            mode: iptfs::mode(mode),
             reqid: data.reqid,
             seq: data.acquire_sequence,
             flags,
@@ -384,6 +391,13 @@ impl LinuxSas {
         if self.sa_dir {
             nlas.push(direction(data.inbound));
         }
+        if mode == TunnelMode::Iptfs {
+            nlas.extend(iptfs::attributes(
+                &self.iptfs,
+                data.inbound,
+                data.iptfs_dont_fragment,
+            ));
+        }
         let request = packet::state::ModifyMessage {
             user_sa_info: info,
             nlas,
@@ -468,7 +482,7 @@ impl LinuxSas {
         };
         let created_at = info.lifetime_cur.add_time;
         let supported = state == SaState::Installed
-            && info.mode == packet::XFRM_MODE_TUNNEL
+            && iptfs::observed_mode(info.mode).is_some()
             && id.proto == ipproto::ESP.as_raw().get() as u8;
         // Keep static settings only. The kernel's canonical representation
         // resolves algorithm aliases/default ICV lengths at first installation.
@@ -754,7 +768,7 @@ mod tests {
 
     #[test]
     fn snapshots_ignore_packet_state_but_detect_managed_configuration_drift() {
-        let backend = LinuxSas::new().unwrap();
+        let backend = LinuxSas::new(Default::default()).unwrap();
         let sa = packet::state::ModifyMessage {
             user_sa_info: packet::UserSaInfo {
                 family: libc::AF_INET as u16,

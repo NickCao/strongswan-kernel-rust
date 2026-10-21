@@ -3,6 +3,7 @@
 //! reconciliation controllers live in the platform-independent modules.
 
 pub mod interfaces;
+mod iptfs;
 pub mod netlink;
 pub mod network;
 pub mod policy;
