@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Filesystem socket setup and peer credentials; tarpc owns the protocol.
-pub use kernel_rust_protocol::transport::{peer, Peer};
+//! Filesystem socket setup; tarpc owns the protocol.
 use std::{
     io,
     os::unix::{fs::PermissionsExt, net::UnixListener},

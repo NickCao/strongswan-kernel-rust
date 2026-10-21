@@ -51,6 +51,19 @@ class SockaddrIn6(c.Structure):
     _fields_ = [("family", c.c_uint16), ("port", c.c_uint16), ("flow", c.c_uint32),
                 ("address", c.c_ubyte * 16), ("scope", c.c_uint32)]
 
+class Library(c.Structure):
+    # strongSwan 6.1 library_t prefix through its processor pointer.
+    _fields_ = [(name, c.c_void_p) for name in (
+        "get", "set", "ns", "conf", "printf_hook", "proposal", "caps", "crypto",
+        "creds", "credmgr", "encoding", "ocsp", "metadata", "fetcher", "resolver",
+        "db", "plugins", "processor")]
+
+
+class Processor(c.Structure):
+    _fields_ = [(name, c.c_void_p) for name in (
+        "get_total_threads", "get_idle_threads", "get_working_threads",
+        "get_job_load", "queue_job", "execute_job", "set_threads", "cancel", "destroy")]
+
 
 def method(pointer, table, field, result, *arguments):
     address = c.cast(pointer, c.POINTER(table)).contents
@@ -72,17 +85,23 @@ def child(prefix, config):
     charon.libcharon_init.restype = c.c_bool
     assert library.library_init(os.fsencode(config), b"charon")
     assert charon.libcharon_init()
+    # Exercise the event job and concurrent block_on calls on actual host
+    # workers. These threads belong to the host, and exist before plugin load.
+    processor = Library.from_address(c.c_void_p.in_dll(library, "lib").value).processor
+    method(processor, Processor, "set_threads", None, c.c_uint)(processor, 4)
     c.c_void_p.in_dll(library, "dbg").value = c.cast(library.dbg_default, c.c_void_p).value
     module = c.CDLL(str(prefix / "lib/ipsec/plugins/libstrongswan-kernel-rust.so"))
     assert c.c_char_p.in_dll(module, "kernel_rust_plugin_version").value == b"6.1.0"
     module.kernel_rust_plugin_create.restype = c.c_void_p
     library.enumerator_enumerate_default.argtypes = [c.c_void_p]
     library.enumerator_enumerate_default.restype = c.c_bool
-    baseline_fds = None  # The host watcher may lazily open its notification pipe.
+    baseline_fds = None
+    baseline_threads = set(os.listdir("/proc/self/task"))
     try:
         for session in range(8):
             plugin = module.kernel_rust_plugin_create()
             assert plugin, f"plugin creation failed for session {session}"
+            assert set(os.listdir("/proc/self/task")) == baseline_threads, "plugin created a thread"
             features = c.POINTER(Feature)()
             count = method(plugin, Plugin, "get_features", c.c_int, c.POINTER(c.POINTER(Feature)))(plugin, c.byref(features))
             assert count == 4

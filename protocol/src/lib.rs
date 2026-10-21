@@ -29,7 +29,6 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
-pub type SessionToken = [u8; 32];
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionConfig {
@@ -38,7 +37,6 @@ pub struct SessionConfig {
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionInfo {
-    pub token: SessionToken,
     pub features: u32,
 }
 
@@ -252,8 +250,7 @@ pub struct Event {
 pub trait Kernel {
     async fn open_session(config: SessionConfig) -> Result<SessionInfo>;
     async fn close_session() -> Result<()>;
-    async fn subscribe_events(token: SessionToken) -> Result<()>;
-    // Wait for the next batch, without timer-based event polling.
+    // Drain one queued batch, returning an empty batch when idle.
     async fn next_events() -> Result<Vec<Event>>;
     async fn allocate_spi(
         src: Endpoint,

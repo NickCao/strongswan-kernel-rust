@@ -62,9 +62,9 @@ fn interface_name(value: &str) -> Result<String, String> {
     }
     Ok(value.to_owned())
 }
-fn connection(socket: UnixStream, peer: transport::Peer, server: Arc<Server>) -> io::Result<()> {
+fn connection(socket: UnixStream, server: Arc<Server>) -> io::Result<()> {
     socket.set_nonblocking(true)?;
-    let service = Service::new(server, socket.try_clone()?, peer);
+    let service = Service::new(server, socket.try_clone()?);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -160,18 +160,15 @@ fn serve(listener: &UnixListener, signals: &SignalFd, server: &Arc<Server>) -> i
             }
             Err(error) => return Err(error),
         };
-        let peer = transport::peer(&socket)?;
         // The filesystem socket's 0660 mode authorizes the connecting process,
-        // including its supplementary groups. SO_PEERCRED only reports its
-        // primary GID, so checking that here would break DynamicUser clients.
-        // Bind the control and event connections to their actual PID/UID below.
+        // including its supplementary groups, for DynamicUser clients too.
         if pending.fetch_add(1, Ordering::AcqRel) >= 8 {
             pending.fetch_sub(1, Ordering::AcqRel);
             continue;
         }
         let (server, pending) = (server.clone(), pending.clone());
         thread::spawn(move || {
-            if let Err(e) = connection(socket, peer, server) {
+            if let Err(e) = connection(socket, server) {
                 if e.kind() != io::ErrorKind::UnexpectedEof {
                     eprintln!("kernel-daemon: client connection closed ({:?})", e.kind());
                 }

@@ -329,10 +329,10 @@ its entries. The daemon refuses to unlink an existing socket path.
 The socket remains owned by the daemon, has
 mode **0660**, and uses the group selected by `--group NAME|GID` (default GID
 0). Linux authorizes connections using filesystem permissions, including
-supplementary groups. There is no configured charon UID. `SO_PEERCRED` binds
-the two connections of a session to the same actual PID/UID; its primary GID
-alone cannot authorize supplementary-group membership. The client trusts
-the protected socket path; no daemon UID is configured or pinned.
+supplementary groups. There is no configured charon UID. Control calls and
+event polls share one connection and its session; there is no token or
+second-connection authentication. The client trusts the protected socket path;
+no daemon UID is configured or pinned.
 
 Example strongswan.conf excerpt, with ranet's endpoint port set to 13000:
 
@@ -425,17 +425,21 @@ scope ID. SA inputs include mode, selectors, interface restrictions, lifetime
 jitter, compression, offload, CPU selection and all flags. Policy inputs retain
 the complete associated ESP/AH/IPComp configuration. Capability checks run in
 the daemon's adapter; the kernel CRUD and reconciliation implementations are
-unchanged. Socket credentials and session ownership/disconnect rules remain in
-this repository. Subnet arithmetic uses `ipnet`, tokens use `rand`, and daemon
-arguments use `clap`. Library buffers use their normal allocation and release
+unchanged. Filesystem socket permissions authorize the connection, whose
+session ownership and disconnect rules remain in this repository. Subnet
+arithmetic uses `ipnet`, and daemon arguments use `clap`. Library buffers use their normal allocation and release
 behavior. Install matching plugin and daemon builds; this internal binary RPC
 contract does not support mixing versions.
 
-The plugin shares one Tokio runtime with a single worker. StrongSwan's
-synchronous callbacks use `Runtime::block_on()` to wait for control replies.
-The Tokio worker drives socket I/O and receives event batches into a bounded
-queue, waking charon's watcher through a local socket pair. StrongSwan event
-callbacks run on its own workers. The runtime drops when the plugin unloads.
+The plugin shares one Tokio current-thread runtime and one Unix connection.
+StrongSwan's synchronous callbacks call `Runtime::block_on()` on their own
+calling threads. Tokio drives the RPC dispatch task during these calls and
+coordinates concurrent callers without a mutex held over an entire RPC. No
+plugin thread is created. A low-priority job on charon's existing processor
+calls `NextEvents`, handles its batch after returning from the runtime, and
+fairly requeues itself, including after empty replies. There is no separate
+event connection, watcher bridge, wakeup socket or client event queue. The
+runtime drops when the last client reference is released.
 
 The plugin still implements strongSwan's C interfaces. Its remaining unsafe
 code borrows C callback arguments, invokes host functions, manages the exported
@@ -444,18 +448,22 @@ Validation, RPC calls, counters, and snapshot construction run in safe Rust.
 Owned and borrowed C objects use [foreign-types](https://docs.rs/foreign-types/0.5.0/foreign_types/)
 to pair construction with the matching strongSwan destructor. The shared
 client registry uses `Weak`/`Arc` instead of untyped C pointers.
-The watcher owns its callback state and event socket and waits for active
-callbacks before releasing them. No pointers or descriptors cross the RPC
+The event job uses weak client ownership and cancellation; unloading stops
+and joins active callbacks before closing the session. Charon destroys queued
+jobs before unloading plugin libraries. No pointers or descriptors cross the RPC
 connection.
 
 ## Session and recovery behavior
 
-The daemon serves one charon session at a time. An independently authenticated
-second connection from the same PID/UID subscribes to typed event batches.
-The event connection waits asynchronously; quiet subscriptions return an empty
-heartbeat every 30 seconds without querying the backend. A bounded local queue
-and socket-pair wakeups deliver batches to charon's synchronous watcher. A
-transport failure disables the control connection without replaying mutations.
+The daemon serves one charon session at a time, with control calls and event
+polls on the same Unix connection. `NextEvents` immediately drains one queued
+batch or returns an empty batch. The daemon's bounded event queue retains
+notifications until the next poll; overflow invalidates the session. The
+plugin's job fairly requeues at low priority without a fixed polling interval,
+so event delivery can be delayed by higher-priority work. Idle operation
+continuously performs empty RPCs; fairness yields to other jobs but does not
+rate-limit polling. A transport failure disables the connection without
+replaying mutations.
 A clean close requires all tunnel SAs/policies removed, cleans larval SPI
 reservations and all remaining global policies, and permits a new session.
 The `FlushSas` RPC clears desired SAs and flushes the whole state table. Flushing
@@ -610,7 +618,7 @@ their normal kernel timeout; startup, explicit flush and shutdown also clear
 these objects, including ones without an addressable SPI. Live packet state is
 not mirrored or restored by reconciliation.
 
-If charon or its event connection disappears unexpectedly, installed tunnel
+If charon or its connection disappears unexpectedly, installed tunnel
 objects are preserved and replacement sessions are rejected. Hard expiry
 still releases the last SA's interface. Interface ownership survives daemon
 restarts through the reserved group. A new session retires old SAs, SPI

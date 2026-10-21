@@ -2,15 +2,14 @@
 use futures::StreamExt;
 use kernel_rust_protocol::{
     self as api,
-    client::{Client, Config},
+    client::{CancellationToken, Client, Config},
     *,
 };
 use serde_json::{json, Value};
 use std::{
-    io,
     os::unix::net::{UnixListener, UnixStream},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -21,7 +20,9 @@ use tarpc::{context::Context, server::Channel};
 struct State {
     captured: Mutex<Vec<Value>>,
     closes: AtomicUsize,
-    reject_watch: bool,
+    delay_query: AtomicBool,
+    hold_events: AtomicBool,
+    event_calls: AtomicUsize,
     events: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<Event>>>,
 }
 #[derive(Clone)]
@@ -36,31 +37,20 @@ macro_rules! unsupported {
 impl Kernel for Fake {
     async fn open_session(self, _: Context, config: SessionConfig) -> api::Result<SessionInfo> {
         assert_eq!(config.interfaces_use, "eth0");
-        Ok(SessionInfo {
-            token: [42; 32],
-            features: 4,
-        })
+        Ok(SessionInfo { features: 4 })
     }
     async fn close_session(self, _: Context) -> api::Result<()> {
         self.0.closes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
-    async fn subscribe_events(self, _: Context, token: SessionToken) -> api::Result<()> {
-        assert_eq!(token, [42; 32]);
-        if self.0.reject_watch {
-            Err(api::Error::InvalidSession)
-        } else {
-            Ok(())
-        }
-    }
     async fn next_events(self, _: Context) -> api::Result<Vec<Event>> {
-        self.0
-            .events
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(api::Error::InvalidSession)
+        self.0.event_calls.fetch_add(1, Ordering::Relaxed);
+        let mut events = self.0.events.lock().await;
+        if self.0.hold_events.load(Ordering::Relaxed) {
+            events.recv().await.ok_or(api::Error::InvalidSession)
+        } else {
+            Ok(events.try_recv().unwrap_or_default())
+        }
     }
     async fn install_sa(self, _: Context, id: SaId, config: SaConfig) -> api::Result<()> {
         self.0
@@ -85,6 +75,9 @@ impl Kernel for Fake {
     }
     async fn query_sa(self, _: Context, _id: SaId, cpi: u16) -> api::Result<SaUsage> {
         assert_eq!(cpi, u16::MAX);
+        if self.0.delay_query.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         Ok(SaUsage {
             bytes: u64::MAX,
             packets: u64::MAX - 1,
@@ -118,7 +111,7 @@ struct Fixture {
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Fixture {
-    fn new(reject_watch: bool) -> Self {
+    fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("kernel.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -127,7 +120,9 @@ impl Fixture {
         let state = Arc::new(State {
             captured: Mutex::new(Vec::new()),
             closes: AtomicUsize::new(0),
-            reject_watch,
+            delay_query: AtomicBool::new(false),
+            hold_events: AtomicBool::new(false),
+            event_calls: AtomicUsize::new(0),
             events: tokio::sync::Mutex::new(receiver),
         });
         let server = Fake(state.clone());
@@ -188,8 +183,8 @@ fn selector() -> Value {
 }
 #[test]
 fn complete_native_inputs_and_unsigned_outputs_over_tarpc_uds() {
-    let fixture = Fixture::new(false);
-    let (client, events) = Client::connect(&fixture.config).unwrap();
+    let fixture = Fixture::new();
+    let client = Client::connect(&fixture.config).unwrap();
     assert_eq!(client.features(), 4);
     let limit = json!({"life":u64::MAX,"rekey":u64::MAX-1,"jitter":u64::MAX-2});
     let config = json!({
@@ -242,18 +237,13 @@ fn complete_native_inputs_and_unsigned_outputs_over_tarpc_uds() {
     client.close().unwrap();
     client.close().unwrap();
     assert_eq!(fixture.state.closes.load(Ordering::Relaxed), 1);
-    drop(events);
 }
 #[test]
-fn rejected_event_subscription_releases_empty_session() {
-    let fixture = Fixture::new(true);
-    assert!(Client::connect(&fixture.config).is_err());
-    assert_eq!(fixture.state.closes.load(Ordering::Relaxed), 1);
-}
-#[test]
-fn event_batches_wake_the_sync_client_and_disconnect_disables_control() {
-    let fixture = Fixture::new(false);
-    let (client, mut events) = Client::connect(&fixture.config).unwrap();
+fn empty_and_large_batches_share_one_connection_and_disconnect_disables_control() {
+    let fixture = Fixture::new();
+    let client = Client::connect(&fixture.config).unwrap();
+    let stop = CancellationToken::new();
+    assert!(client.next_events(&stop).unwrap().unwrap().is_empty());
     let event = Event {
         kind: EventKind::Expire,
         expiry: Some(Expiry {
@@ -270,57 +260,80 @@ fn event_batches_wake_the_sync_client_and_disconnect_disables_control() {
         .events
         .blocking_send(vec![event.clone(); 300])
         .unwrap();
-    let mut poll = [rustix::event::PollFd::new(
-        &events,
-        rustix::event::PollFlags::IN,
-    )];
-    assert_eq!(
-        rustix::event::poll(
-            &mut poll,
-            Some(&rustix::time::Timespec {
-                tv_sec: 2,
-                tv_nsec: 0
-            })
-        )
-        .unwrap(),
-        1
-    );
-    for _ in 0..300 {
-        let received = events.next_event().unwrap();
+    let batch = client.next_events(&stop).unwrap().unwrap();
+    assert_eq!(batch.len(), 300);
+    for received in batch {
         assert_eq!(
             received.expiry.unwrap().destination,
             event.expiry.as_ref().unwrap().destination
         );
     }
-    assert_eq!(
-        events.next_event().unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
+    assert!(client.next_events(&stop).unwrap().unwrap().is_empty());
+    let socket = fixture
+        .sockets
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert!(
+        fixture.sockets.try_recv().is_err(),
+        "only one UDS connection"
     );
-    let control = fixture
-        .sockets
-        .recv_timeout(Duration::from_secs(2))
-        .unwrap();
-    let watch = fixture
-        .sockets
-        .recv_timeout(Duration::from_secs(2))
-        .unwrap();
-    watch.shutdown(std::net::Shutdown::Both).unwrap();
-    let mut poll = [rustix::event::PollFd::new(
-        &events,
-        rustix::event::PollFlags::IN,
-    )];
-    rustix::event::poll(
-        &mut poll,
-        Some(&rustix::time::Timespec {
-            tv_sec: 2,
-            tv_nsec: 0,
-        }),
-    )
-    .unwrap();
-    assert!(events.next_event().is_err());
-    client.event_disconnected();
+    socket.shutdown(std::net::Shutdown::Both).unwrap();
+    assert!(client.next_events(&stop).is_err());
     assert!(client
-        .request(client.rpc().query_sa(api::context::current(), sa_id(), 0))
+        .request(
+            client
+                .rpc()
+                .query_sa(api::context::current(), sa_id(), u16::MAX)
+        )
         .is_err());
-    drop(control);
+}
+#[test]
+fn different_calling_threads_share_the_current_thread_runtime() {
+    let fixture = Fixture::new();
+    let client = Client::connect(&fixture.config).unwrap();
+    thread::scope(|scope| {
+        for _ in 0..8 {
+            let client = client.clone();
+            scope.spawn(move || {
+                for _ in 0..25 {
+                    let usage = client
+                        .request(
+                            client
+                                .rpc()
+                                .query_sa(api::context::current(), sa_id(), u16::MAX),
+                        )
+                        .unwrap();
+                    assert_eq!(usage.bytes, u64::MAX);
+                }
+            });
+        }
+    });
+    client.close().unwrap();
+}
+#[test]
+fn canceling_an_event_poll_does_not_block_or_cancel_control_calls() {
+    let fixture = Fixture::new();
+    fixture.state.hold_events.store(true, Ordering::Relaxed);
+    let client = Client::connect(&fixture.config).unwrap();
+    let stop = CancellationToken::new();
+    thread::scope(|scope| {
+        let events = scope.spawn(|| client.next_events(&stop).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while fixture.state.event_calls.load(Ordering::Relaxed) == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let usage = client
+            .request(
+                client
+                    .rpc()
+                    .query_sa(api::context::current(), sa_id(), u16::MAX),
+            )
+            .unwrap();
+        assert_eq!(usage.bytes, u64::MAX);
+        stop.cancel();
+        assert!(events.join().unwrap().is_none());
+    });
+    client.close().unwrap();
+    assert_eq!(fixture.state.closes.load(Ordering::Relaxed), 1);
 }

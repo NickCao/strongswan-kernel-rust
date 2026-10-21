@@ -7,7 +7,6 @@ use crate::{
         xfrm,
     },
     rpc_api::*,
-    transport,
 };
 use neli::consts::rtnl::Rtm;
 use std::{
@@ -80,12 +79,8 @@ impl Server {
     }
 }
 pub struct Session {
-    uid: u32,
-    pid: i32,
-    token: SessionToken,
     backend: Mutex<Backend>,
     events: tokio::sync::mpsc::Sender<Option<Vec<Event>>>,
-    receiver: Mutex<Option<tokio::sync::mpsc::Receiver<Option<Vec<Event>>>>>,
     connected: AtomicBool,
     closed: AtomicBool,
     roam: AtomicU8,
@@ -104,8 +99,8 @@ impl Session {
         self.connected.store(false, Ordering::Release);
         self.closed.store(true, Ordering::Release);
         let _ = self.repair_wakeup.try_send(());
-        // Dropping the routers wakes the notification workers. WatchEvents
-        // and the repair worker are woken separately below and above.
+        // Dropping the routers wakes the notification workers. The repair
+        // worker was woken above; event polls also check the closed flag.
         self.event_sockets.lock().unwrap().take();
         let _ = self.events.try_send(None);
     }
@@ -115,7 +110,6 @@ pub struct Service(Arc<Connection>);
 pub struct Connection {
     server: Arc<Server>,
     socket: UnixStream,
-    peer: transport::Peer,
     control: Mutex<Option<Arc<Session>>>,
     watch: tokio::sync::Mutex<Option<Watch>>,
 }
@@ -127,8 +121,7 @@ struct Watch {
 impl Drop for Connection {
     fn drop(&mut self) {
         let control = self.control.get_mut().unwrap().as_ref();
-        let watch = self.watch.get_mut().as_ref().map(|w| &w.session);
-        if let Some(s) = control.or(watch) {
+        if let Some(s) = control {
             if !s.closed.load(Ordering::Acquire) {
                 s.fail();
                 eprintln!("kernel-daemon: client disconnected; preserving tunnel objects; replacement sessions require daemon restart");
@@ -143,11 +136,10 @@ impl std::ops::Deref for Service {
     }
 }
 impl Service {
-    pub fn new(server: Arc<Server>, socket: UnixStream, peer: transport::Peer) -> Self {
+    pub fn new(server: Arc<Server>, socket: UnixStream) -> Self {
         Self(Arc::new(Connection {
             server,
             socket,
-            peer,
             control: Mutex::new(None),
             watch: tokio::sync::Mutex::new(None),
         }))
@@ -308,6 +300,7 @@ impl Kernel for Service {
         _: tarpc::context::Context,
         config: SessionConfig,
     ) -> Result<SessionInfo> {
+        let mut watch = self.watch.lock().await;
         let mut active = self.server.active.lock().unwrap();
         if self.server.stopping.load(Ordering::Acquire) {
             return Err(Error::InvalidSession);
@@ -334,17 +327,12 @@ impl Kernel for Service {
             backend.sas.clear()?;
             backend.reconcile_interfaces()?;
             let (xfrm_socket, xfrm) = Netlink::subscribe(NlFamily::Xfrm, 1 | 2 | 4 | 8 | 128)?;
-            let token = rand::random::<SessionToken>();
             let features = backend.sas.features();
             let (tx, rx) = tokio::sync::mpsc::channel(256);
             let (repair_wakeup, repair_receiver) = mpsc::sync_channel(1);
             let session = Arc::new(Session {
-                uid: self.peer.uid,
-                pid: self.peer.pid,
-                token,
                 backend: Mutex::new(backend),
                 events: tx,
-                receiver: Mutex::new(Some(rx)),
                 connected: AtomicBool::new(true),
                 closed: AtomicBool::new(false),
                 roam: AtomicU8::new(0),
@@ -353,17 +341,22 @@ impl Kernel for Service {
                 control: self.socket.try_clone()?,
                 event_sockets: Mutex::new(Some([xfrm_socket, route_socket])),
             });
-            Ok((session, token, features, xfrm, route, repair_receiver))
+            Ok((session, rx, features, xfrm, route, repair_receiver))
         };
-        let (session, token, features, xfrm, route, repair_receiver) = create()?;
+        let (session, receiver, features, xfrm, route, repair_receiver) = create()?;
         *active = Some(session.clone());
         *self.control.lock().unwrap() = Some(session.clone());
+        *watch = Some(Watch {
+            session: session.clone(),
+            receiver,
+            next_roam: Instant::now() + ROAM_DELAY,
+        });
         let worker = session.clone();
         thread::spawn(move || event_loop(worker, true, xfrm));
         let worker = session.clone();
         thread::spawn(move || repair_loop(worker, repair_receiver));
         thread::spawn(move || event_loop(session, false, route));
-        Ok(SessionInfo { token, features })
+        Ok(SessionInfo { features })
     }
     async fn close_session(self, _: tarpc::context::Context) -> Result<()> {
         self.request(|backend| {
@@ -378,71 +371,34 @@ impl Kernel for Service {
             Ok(())
         })
     }
-    async fn subscribe_events(self, _: tarpc::context::Context, token: SessionToken) -> Result<()> {
-        let mut watch = self.watch.lock().await;
-        if watch.is_some() {
-            return Err(Error::SessionBusy);
-        }
-        let session = self
-            .server
-            .active
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(Error::InvalidSession)?;
-        if session.uid != self.peer.uid
-            || session.pid != self.peer.pid
-            || session.token != token
-            || !session.connected.load(Ordering::Acquire)
-        {
-            return Err(Error::InvalidSession);
-        }
-        let receiver = session
-            .receiver
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or(Error::SessionBusy)?;
-        *watch = Some(Watch {
-            session,
-            receiver,
-            next_roam: Instant::now() + ROAM_DELAY,
-        });
-        Ok(())
-    }
     async fn next_events(self, _: tarpc::context::Context) -> Result<Vec<Event>> {
         let mut guard = self.watch.lock().await;
         let watch = guard.as_mut().ok_or(Error::InvalidSession)?;
-        let heartbeat = tokio::time::sleep(Duration::from_secs(30));
-        tokio::pin!(heartbeat);
-        loop {
-            let session = &watch.session;
-            if !session.connected.load(Ordering::Acquire) || session.closed.load(Ordering::Acquire)
-            {
-                return Err(Error::InvalidSession);
-            }
-            if Instant::now() >= watch.next_roam {
-                watch.next_roam = Instant::now() + ROAM_DELAY;
-                let changes = session.roam.swap(0, Ordering::Relaxed);
-                if changes != 0 {
-                    return Ok(vec![Event {
-                        kind: EventKind::Roam,
-                        address_changed: Some(changes & ADDRESS_CHANGED != 0),
-                        expiry: None,
-                        acquire: None,
-                        mapping: None,
-                    }]);
-                }
-            }
-            tokio::select! {
-                batch = watch.receiver.recv() => return batch.flatten().ok_or(Error::InvalidSession),
-                _ = tokio::time::sleep_until(watch.next_roam.into()) => (),
-                // Keep a quiet subscription within tarpc's request deadline.
-                // No backend inventory or mutation is triggered by heartbeats.
-                _ = &mut heartbeat => return Ok(Vec::new()),
+        let session = &watch.session;
+        if !session.connected.load(Ordering::Acquire) || session.closed.load(Ordering::Acquire) {
+            return Err(Error::InvalidSession);
+        }
+        let mut batch = match watch.receiver.try_recv() {
+            Ok(Some(batch)) => batch,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Vec::new(),
+            _ => return Err(Error::InvalidSession),
+        };
+        if Instant::now() >= watch.next_roam {
+            watch.next_roam = Instant::now() + ROAM_DELAY;
+            let changes = session.roam.swap(0, Ordering::Relaxed);
+            if changes != 0 {
+                batch.push(Event {
+                    kind: EventKind::Roam,
+                    address_changed: Some(changes & ADDRESS_CHANGED != 0),
+                    expiry: None,
+                    acquire: None,
+                    mapping: None,
+                });
             }
         }
+        Ok(batch)
     }
+
     async fn allocate_spi(
         self,
         _: tarpc::context::Context,

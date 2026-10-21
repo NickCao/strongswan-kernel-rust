@@ -37,11 +37,12 @@ def bridge(command):
     return json.loads(line)
 
 class Rpc:
-    def __init__(self, path):
+    def __init__(self, path, reuse=None):
         global _next_connection
         _next_connection += 1
         self.id, self.timeout, self.closed = _next_connection, 10, False
-        result = bridge(dict(operation="connect", connection=self.id, path=path))
+        result = bridge(dict(operation="connect", connection=self.id, path=path,
+                             reuse=reuse.id if reuse else None))
         assert not result, result
     @property
     def socket(self): return self
@@ -91,8 +92,7 @@ def client(path):
     for cap in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"]: assert f"{cap}:\t0000000000000000" in status
     control = Rpc(path)
     opened = control.call("OpenSession", dict(interfaces_use="", interfaces_ignore=""))
-    token = opened["parameters"]["token"]
-    watch = Rpc(path); watch.send("io.ranet.Kernel.WatchEvents", dict(token=token), more=True)
+    watch = Rpc(path, reuse=control); watch.send("io.ranet.Kernel.WatchEvents", more=True)
     assert watch.receive()["parameters"]["event"]["kind"] == "ready"
     print(json.dumps(opened), flush=True)
     for line in sys.stdin:
@@ -172,7 +172,7 @@ def run(binary):
                 client_file = directory / "client.py"; client_file.write_text(Path(__file__).read_text()); client_file.chmod(0o644)
                 helper_file = directory / "rpc-client"; shutil.copy2(RPC_HELPER, helper_file); helper_file.chmod(0o755)
                 child = subprocess.Popen(["setpriv","--reuid=65534","--regid=65534","--clear-groups","--bounding-set=-all","--inh-caps=-all","--ambient-caps=-all",sys.executable,str(client_file),"--client",path,str(helper_file)], stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
-                assert "token" in json.loads(child.stdout.readline())["parameters"]
+                assert "features" in json.loads(child.stdout.readline())["parameters"]
                 assert not states().strip(), "startup must retire untracked SAs"
                 def raw(method=None, parameters=None, **kwargs):
                     child.stdin.write(json.dumps(dict(method=method,parameters=parameters or {},**kwargs))+"\n"); child.stdin.flush()
@@ -183,6 +183,7 @@ def run(binary):
                     reply = raw(method,parameters); assert reply == {"error":"Kernel","parameters":{"errno":err}}, reply
                 assert raw("OpenSession",dict(interfaces_use="",interfaces_ignore=""),other=True)["error"].endswith("SessionBusy")
                 assert raw("FlushSas",other=True)["error"].endswith("InvalidSession")
+                assert raw("NextEvents",other=True)["error"].endswith("InvalidSession")
                 assert raw("UnknownMethod")["error"] == "InvalidRequest"
                 assert raw("AllocateSpi",dict(src=endpoint()))["error"] == "InvalidRequest"
                 rpc("BypassPort",family=2,port=13000); rpc("BypassPort",family=10,port=13000)
@@ -550,9 +551,9 @@ def run(binary):
                     reply = control.call(method, parameters)
                     assert "error" not in reply, reply
                     return reply.get("parameters", {})
-                token = call("OpenSession", interfaces_use="", interfaces_ignore="")["token"]
-                watch = Rpc(path)
-                watch.send("io.ranet.Kernel.WatchEvents", dict(token=token), more=True)
+                call("OpenSession", interfaces_use="", interfaces_ignore="")
+                watch = Rpc(path, reuse=control)
+                watch.send("io.ranet.Kernel.WatchEvents", more=True)
                 assert watch.receive()["parameters"]["event"]["kind"] == "ready"
                 def expiries(expected):
                     found = []

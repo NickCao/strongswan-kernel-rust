@@ -6,25 +6,34 @@ Connections are Unix SOCK_STREAM sockets carrying Bincode-encoded tarpc messages
 in length-delimited frames, with an 8 MiB frame limit. Install matching plugin
 and daemon builds; this internal binary API does not support mixing versions.
 
-The plugin bridges strongSwan's synchronous callbacks using `Runtime::block_on()`
-on charon's calling threads. One shared Tokio worker drives socket I/O and
-receives events into a bounded queue, waking charon's watcher, which invokes
-strongSwan callbacks on its own workers.
+The plugin calls `Runtime::block_on()` directly on charon's calling threads,
+using one shared Tokio current-thread runtime and one Unix connection. No plugin
+thread is created. Tokio coordinates concurrent callers and drives its RPC
+dispatch task while a call is active. A low-priority charon job calls
+`next_events`, delivers the returned batch after leaving the runtime, and
+returns `JOB_REQUEUE_FAIR`, including after an empty batch. There is no watcher
+bridge or additional client event queue.
 Application errors distinguish invalid sessions, an occupied session and kernel
 errors carrying a positive errno. tarpc handles request IDs, deadlines,
 cancellation, framing and transport errors.
 
-`open_session` authenticates ownership of the control connection and returns
-feature flags plus a random token. Its `interfaces_use` and `interfaces_ignore`
-arguments carry charon's interface filters; a nonempty allowlist takes
-precedence over the denylist. `subscribe_events` requires a second connection
-from the same UID/PID and that token. After successful subscription,
-`next_events` waits for a batch of typed expiry, acquire, NAT mapping, or
-network change notifications. Quiet
-subscriptions return an empty heartbeat after 30 seconds; the plugin uses a
-60-second event deadline. The event queue is bounded; a broken or stalled event channel invalidates control
-instead of silently losing expiry events. The daemon keeps receiving hard
-expiry events after a client disconnects to release expired SA interfaces.
+`open_session` binds the connection to the daemon's single active session and
+returns feature flags. Its `interfaces_use` and `interfaces_ignore` arguments
+carry charon's interface filters; a nonempty allowlist takes precedence over
+the denylist. `next_events` uses that same connection and immediately returns
+one queued batch of typed expiry, acquire, NAT mapping, or network change
+notifications, or an empty batch when idle. No subscription token or second
+connection is needed. The daemon queue is bounded; overflow invalidates the
+connection instead of silently losing expiry events. The daemon keeps receiving
+hard expiry events after a client disconnects to release expired SA interfaces.
+
+Event polling runs whenever charon's worker pool gives the job a turn, without
+a fixed polling interval. Higher-priority eligible jobs take precedence, and
+fair requeue places the poll at the tail of its own priority queue. This allows
+event delivery to be delayed by other work and continuously performs empty
+RPCs when idle. Job cancellation wakes an in-flight poll without closing the
+shared connection; unloading stops and joins active event dispatch before
+closing the session. There is no pthread cancellation through Rust frames.
 
 SA keys and security labels use byte vectors. Algorithm identifiers use
 strongSwan's encryption/integrity identifiers; optional kernel names support

@@ -34,7 +34,7 @@ fn main() {
         .header("wrapper.h")
         .clang_args(["-include", config.to_str().unwrap()])
         .allowlist_type("kernel_.*|plugin_.*|host_t|traffic_selector_t|library_t|daemon_t")
-        .allowlist_function("kernel_(ipsec|net)_register|host_create_from_sockaddr|traffic_selector_create_from_bytes")
+        .allowlist_function("kernel_(ipsec|net)_register|host_create_from_sockaddr|traffic_selector_create_from_bytes|callback_job_create_with_prio")
         .allowlist_var("lib|charon|dbg|VERSION|KERNEL_SPI_(MIN|MAX)|CPU_ID_MAX")
         .generate_comments(false)
         .layout_tests(false)

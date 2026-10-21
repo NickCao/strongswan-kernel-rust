@@ -17,7 +17,7 @@ pub fn current_client() -> Option<Arc<Client>> {
 struct Plugin {
     public: ffi::plugin_t,
     client: Arc<Client>,
-    _watcher: events::Watcher,
+    events: events::EventJob,
     features: [ffi::plugin_feature_t; 4],
 }
 
@@ -31,11 +31,11 @@ pub unsafe extern "C" fn kernel_rust_plugin_create() -> *mut ffi::plugin_t {
     if slot.upgrade().is_some() {
         return ptr::null_mut();
     }
-    // SAFETY: charon initializes lib/settings/watcher before this entry point.
+    // SAFETY: charon initializes lib/settings/processor before this entry point.
     let Ok(config) = (unsafe { host::config() }) else {
         return ptr::null_mut();
     };
-    let (client, events) = match Client::connect(&config) {
+    let client = match Client::connect(&config) {
         Ok(session) => session,
         Err(error) => {
             log(&format!("connecting to {} failed: {error}", config.path));
@@ -43,7 +43,7 @@ pub unsafe extern "C" fn kernel_rust_plugin_create() -> *mut ffi::plugin_t {
         }
     };
     // SAFETY: this plugin owns the registration and drops it before unload.
-    let watcher = unsafe { events::Watcher::register(client.clone(), events) };
+    let events = unsafe { events::EventJob::register(&client) };
     *slot = Arc::downgrade(&client);
     let plugin = Box::new(Plugin {
         public: ffi::plugin_t {
@@ -53,7 +53,7 @@ pub unsafe extern "C" fn kernel_rust_plugin_create() -> *mut ffi::plugin_t {
             destroy: Some(destroy),
         },
         client,
-        _watcher: watcher,
+        events,
         features: [
             callback(
                 Some(ffi::kernel_ipsec_register),
@@ -109,9 +109,9 @@ unsafe extern "C" fn destroy(this: *mut ffi::plugin_t) {
     // SAFETY: this is the exact pointer returned by our constructor, once only.
     let plugin = unsafe { Box::from_raw(this.cast::<Plugin>()) };
     *CLIENT.lock().unwrap() = Weak::new();
+    // Stop and join event callbacks before closing the shared session.
+    drop(plugin.events);
     if let Err(error) = plugin.client.close() {
         log(&error.to_string());
     }
-    // Watcher::drop joins callbacks before its owned state and stream are freed.
-    drop(plugin);
 }

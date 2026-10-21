@@ -1,25 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Blocking bridge for charon's synchronous callbacks. tarpc owns wire framing,
-//! typed dispatch and async I/O; a local socket pair only wakes charon's watcher.
+//! Blocking RPCs driven directly by charon's calling threads.
 use crate::{self as api, transport, KernelClient};
 use std::{
-    collections::VecDeque,
     fmt,
     future::Future,
-    io::{self, Read, Write},
+    io,
     net::Shutdown,
-    os::{
-        fd::{AsFd, BorrowedFd},
-        unix::net::UnixStream,
-    },
+    os::unix::net::UnixStream,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        Arc,
     },
-    time::Duration,
 };
 use tarpc::{client::RpcError, context};
-use tokio::{runtime::Runtime, task::JoinHandle};
+use tokio::runtime::Runtime;
+pub use tokio_util::sync::CancellationToken;
 
 pub struct Config {
     pub path: String,
@@ -37,81 +32,26 @@ impl fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
-struct State {
-    failed: AtomicBool,
-    closing: AtomicBool,
-    control: UnixStream,
-}
-impl State {
-    fn fail(&self) {
-        if !self.closing.load(Ordering::Acquire) {
-            self.failed.store(true, Ordering::Release);
-            let _ = self.control.shutdown(Shutdown::Both);
-        }
-    }
-}
 pub struct Client {
     rpc: KernelClient,
-    state: Arc<State>,
+    socket: UnixStream,
+    failed: AtomicBool,
+    closing: AtomicBool,
     features: u32,
-    // Keep the runtime alive until the client channels and their tasks drop.
+    // Concurrent block_on calls are supported by Tokio. One caller owns the
+    // current-thread scheduler/driver; other callers poll their own RPC futures.
+    // Do not serialize whole calls behind a mutex.
     runtime: Runtime,
 }
-pub struct Events {
-    wakeup: UnixStream,
-    receiver: mpsc::Receiver<io::Result<Vec<api::Event>>>,
-    pending: VecDeque<api::Event>,
-    task: JoinHandle<()>,
-}
-impl AsFd for Events {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.wakeup.as_fd()
-    }
-}
-impl Events {
-    pub fn next_event(&mut self) -> io::Result<api::Event> {
-        loop {
-            if let Some(event) = self.pending.pop_front() {
-                return Ok(event);
-            }
-            // Drain readiness even if the queue is empty: a producer may have
-            // written its wakeup after the consumer already took that batch.
-            let mut signal = [0u8; 256];
-            let _ = self.wakeup.read(&mut signal);
-            match self.receiver.try_recv() {
-                Ok(batch) => {
-                    self.pending.extend(batch?);
-                }
-                Err(mpsc::TryRecvError::Empty) => return Err(io::ErrorKind::WouldBlock.into()),
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err(io::ErrorKind::ConnectionAborted.into());
-                }
-            }
-        }
-    }
-}
-impl Drop for Events {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-pub async fn connect(path: &str) -> io::Result<KernelClient> {
-    let socket = tokio::net::UnixStream::connect(path).await?;
-    Ok(KernelClient::new(tarpc::client::Config::default(), transport::framed(socket)).spawn())
-}
-
 impl Client {
-    pub fn connect(config: &Config) -> io::Result<(Arc<Self>, Events)> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("kernel-rpc")
+    pub fn connect(config: &Config) -> io::Result<Arc<Self>> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let socket = UnixStream::connect(&config.path)?;
         socket.set_nonblocking(true)?;
         let control = socket.try_clone()?;
-        let (rpc, watch, features) = runtime.block_on(async {
+        let (rpc, session) = runtime.block_on(async {
             let socket = tokio::net::UnixStream::from_std(socket)?;
             let rpc =
                 KernelClient::new(tarpc::client::Config::default(), transport::framed(socket))
@@ -127,68 +67,16 @@ impl Client {
                 .await
                 .map_err(io::Error::other)?
                 .map_err(io::Error::other)?;
-            let attach = async {
-                let watch = connect(&config.path).await?;
-                watch
-                    .subscribe_events(context::current(), session.token)
-                    .await
-                    .map_err(io::Error::other)?
-                    .map_err(io::Error::other)?;
-                Ok::<_, io::Error>(watch)
-            }
-            .await;
-            match attach {
-                Ok(watch) => Ok((rpc, watch, session.features)),
-                Err(error) => {
-                    let _ = rpc.close_session(context::current()).await;
-                    Err(error)
-                }
-            }
+            Ok::<_, io::Error>((rpc, session))
         })?;
-        let state = Arc::new(State {
+        Ok(Arc::new(Self {
+            rpc,
+            socket: control,
             failed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
-            control,
-        });
-        let (wakeup, mut signal) = UnixStream::pair()?;
-        wakeup.set_nonblocking(true)?;
-        signal.set_nonblocking(true)?;
-        let (sender, receiver) = mpsc::sync_channel(256);
-        let event_state = state.clone();
-        let task = runtime.spawn(async move {
-            loop {
-                // The daemon returns a heartbeat on quiet subscriptions.
-                // A missed deadline fails the connection, without replaying calls.
-                let mut ctx = context::current();
-                ctx.deadline = std::time::Instant::now() + Duration::from_secs(60);
-                let batch = match watch.next_events(ctx).await {
-                    Ok(Ok(batch)) => Ok(batch),
-                    _ => Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
-                };
-                if batch.as_ref().is_ok_and(Vec::is_empty) {
-                    continue;
-                }
-                let failed = batch.is_err();
-                if sender.try_send(batch).is_err() || signal.write_all(&[1]).is_err() || failed {
-                    event_state.fail();
-                    break;
-                }
-            }
-        });
-        Ok((
-            Arc::new(Self {
-                rpc,
-                state,
-                features,
-                runtime,
-            }),
-            Events {
-                wakeup,
-                receiver,
-                pending: VecDeque::new(),
-                task,
-            },
-        ))
+            features: session.features,
+            runtime,
+        }))
     }
     pub fn rpc(&self) -> &KernelClient {
         &self.rpc
@@ -198,12 +86,12 @@ impl Client {
     }
     pub fn request<T>(
         &self,
-        call: impl Future<Output = std::result::Result<api::Result<T>, RpcError>>,
-    ) -> std::result::Result<T, Error> {
-        if self.state.failed.load(Ordering::Acquire) {
+        call: impl Future<Output = Result<api::Result<T>, RpcError>>,
+    ) -> Result<T, Error> {
+        if self.failed.load(Ordering::Acquire) {
             return Err(Error {
                 errno: None,
-                reason: "control connection unavailable",
+                reason: "connection unavailable",
             });
         }
         match self.runtime.block_on(call) {
@@ -217,77 +105,39 @@ impl Client {
                 reason: "remote error",
             }),
             Err(_) => {
-                self.state.failed.store(true, Ordering::Release);
-                let _ = self.state.control.shutdown(Shutdown::Both);
+                self.fail();
                 Err(Error {
                     errno: None,
-                    reason: "control connection lost",
+                    reason: "connection lost",
                 })
             }
         }
     }
-    pub fn event_disconnected(&self) {
-        self.state.fail();
+    /// Drain one event batch. Cancellation stops a pool job during shutdown
+    /// without closing the shared connection or canceling other callers.
+    pub fn next_events(&self, stop: &CancellationToken) -> Result<Option<Vec<api::Event>>, Error> {
+        let result = self.request(async {
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => Ok(Ok(None)),
+                result = self.rpc.next_events(context::current()) => result.map(|batch| batch.map(Some)),
+            }
+        });
+        if result.is_err() {
+            self.fail();
+        }
+        result
     }
-    pub fn close(&self) -> std::result::Result<(), Error> {
-        if self.state.closing.swap(true, Ordering::AcqRel) {
+    fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
+        let _ = self.socket.shutdown(Shutdown::Both);
+    }
+    pub fn close(&self) -> Result<(), Error> {
+        if self.closing.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
         let result = self.request(self.rpc.close_session(context::current()));
-        self.state.failed.store(true, Ordering::Release);
-        let _ = self.state.control.shutdown(Shutdown::Both);
+        self.fail();
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_wakeup_written_after_its_batch_was_consumed_is_drained() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let (wakeup, mut signal) = UnixStream::pair().unwrap();
-        wakeup.set_nonblocking(true).unwrap();
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let mut events = Events {
-            wakeup,
-            receiver,
-            pending: VecDeque::new(),
-            task: runtime.spawn(async {}),
-        };
-        sender
-            .send(Ok(vec![api::Event {
-                kind: api::EventKind::Roam,
-                address_changed: Some(true),
-                expiry: None,
-                acquire: None,
-                mapping: None,
-            }]))
-            .unwrap();
-        events.next_event().unwrap();
-        // Deliberately publish the wakeup after the consumer took the data.
-        signal.write_all(&[1]).unwrap();
-        assert_eq!(
-            events.next_event().unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        let mut descriptors = [rustix::event::PollFd::new(
-            &events,
-            rustix::event::PollFlags::IN,
-        )];
-        assert_eq!(
-            rustix::event::poll(
-                &mut descriptors,
-                Some(&rustix::time::Timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0
-                })
-            )
-            .unwrap(),
-            0
-        );
     }
 }

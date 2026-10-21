@@ -2,7 +2,7 @@
 //! Test-only JSON/stdin adapter for the existing Python kernel scenarios.
 //! It uses tarpc's generated request/response types and the production codec;
 //! JSON is never sent to the daemon.
-use kernel_rust_protocol::{self as api, transport, KernelRequest, KernelResponse};
+use kernel_rust_protocol::{transport, KernelRequest, KernelResponse};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -56,13 +56,21 @@ async fn dispatch(command: Value, connections: &mut HashMap<u64, Connection>) ->
     let id = command["connection"].as_u64().unwrap();
     match command["operation"].as_str().unwrap() {
         "connect" => {
-            let socket = match UnixStream::connect(command["path"].as_str().unwrap()) {
+            let reused = command["reuse"].as_u64().map(|id| &connections[&id]);
+            let socket = match reused.map_or_else(
+                || UnixStream::connect(command["path"].as_str().unwrap()),
+                |connection| connection.socket.try_clone(),
+            ) {
                 Ok(socket) => socket,
                 Err(error) => return json!({"connect_error":error.to_string()}),
             };
             socket.set_nonblocking(true).unwrap();
-            let stream = tokio::net::UnixStream::from_std(socket.try_clone().unwrap()).unwrap();
-            let channel = client::new(client::Config::default(), transport::framed(stream)).spawn();
+            let channel = if let Some(connection) = reused {
+                connection.channel.clone()
+            } else {
+                let stream = tokio::net::UnixStream::from_std(socket.try_clone().unwrap()).unwrap();
+                client::new(client::Config::default(), transport::framed(stream)).spawn()
+            };
             let (sender, receiver) = mpsc::unbounded_channel();
             connections.insert(
                 id,
@@ -94,25 +102,9 @@ async fn dispatch(command: Value, connections: &mut HashMap<u64, Connection>) ->
             let method = command["method"].as_str().unwrap().to_owned();
             let mut parameters = command["parameters"].clone();
             if method == "WatchEvents" {
-                let token: api::SessionToken =
-                    serde_json::from_value(parameters["token"].clone()).unwrap();
                 let channel = connection.channel.clone();
                 let sender = connection.sender.clone();
                 connection.tasks.push(tokio::spawn(async move {
-                    let subscribed = match channel
-                        .call(context::current(), KernelRequest::SubscribeEvents { token })
-                        .await
-                    {
-                        Ok(reply) => response("SubscribeEvents", reply),
-                        Err(_) => {
-                            let _ = sender.send(json!({"eof":true}));
-                            return;
-                        }
-                    };
-                    if subscribed.get("error").is_some() {
-                        let _ = sender.send(subscribed);
-                        return;
-                    }
                     let _ = sender.send(json!({"parameters":{"event":{"kind":"ready"}}}));
                     loop {
                         let mut ctx = context::current();

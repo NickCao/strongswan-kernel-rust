@@ -1,90 +1,101 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! The C watcher boundary; the RPC client and event stream are safe Rust.
-use crate::{ffi, host};
+//! Drain daemon events as a fairly requeued job on charon's existing workers.
+use crate::{ffi, host, log};
 use foreign_types::ForeignType;
 use kernel_rust_protocol::{
     self as api,
-    client::{Client, Events},
+    client::{CancellationToken, Client},
 };
 use std::{
-    io,
-    os::fd::AsRawFd,
     ptr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 struct State {
-    client: Arc<Client>,
-    events: Mutex<Events>,
+    client: Weak<Client>,
+    stop: CancellationToken,
+    active: Mutex<()>,
 }
-pub struct Watcher {
-    _state: Arc<State>,
-    watcher: *mut ffi::watcher_t,
-    fd: i32,
+pub struct EventJob {
+    state: Arc<State>,
 }
-impl Watcher {
+impl EventJob {
     /// # Safety
-    /// The strongSwan library and watcher must outlive this registration.
-    pub unsafe fn register(client: Arc<Client>, events: Events) -> Self {
-        let fd = std::os::fd::AsFd::as_fd(&events).as_raw_fd();
+    /// The host processor/kernel must outlive this registration. Charon cancels
+    /// and destroys queued jobs before unloading plugin libraries.
+    pub unsafe fn register(client: &Arc<Client>) -> Self {
         let state = Arc::new(State {
-            client,
-            events: Mutex::new(events),
+            client: Arc::downgrade(client),
+            stop: CancellationToken::new(),
+            active: Mutex::new(()),
         });
-        let watcher = unsafe { (*ffi::lib).watcher };
-        // SAFETY: Arc keeps the shared callback data stable until remove()
-        // completes; dropping the registration never borrows State exclusively.
+        // SAFETY: the job owns this Arc until its cleanup callback. The handle
+        // retains another Arc to cancel and join active callbacks on drop.
+        let data = Arc::into_raw(state.clone()).cast_mut().cast();
         unsafe {
-            (*watcher).add.unwrap()(
-                watcher,
-                fd,
-                ffi::watcher_event_t_WATCHER_READ,
+            let job = ffi::callback_job_create_with_prio(
                 Some(receive_events),
-                ptr::from_ref(&*state).cast_mut().cast(),
+                data,
+                Some(cleanup),
+                Some(cancel),
+                ffi::job_priority_t_JOB_PRIO_LOW,
             );
+            let processor = (*ffi::lib).processor;
+            (*processor).queue_job.unwrap()(processor, job.cast());
         }
-        Self {
-            _state: state,
-            watcher,
-            fd,
-        }
+        Self { state }
     }
 }
-impl Drop for Watcher {
+impl Drop for EventJob {
     fn drop(&mut self) {
-        // SAFETY: remove waits for all in-flight callbacks before state and its
-        // owned event socket are freed. No exclusive reference to State is made.
-        unsafe {
-            (*self.watcher).remove.unwrap()(self.watcher, self.fd);
-        }
+        self.state.stop.cancel();
+        // Cancellation wakes a pending event RPC. Wait for event dispatch to
+        // finish, but a queued/stopped job need not run to release the client.
+        let _active = self.state.active.lock().unwrap();
     }
 }
-impl State {
-    fn receive(&self) -> bool {
-        let mut events = self.events.lock().unwrap();
-        loop {
-            match events.next_event() {
-                Ok(event) => dispatch(event),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
-                Err(_) => {
-                    self.client.event_disconnected();
-                    return false;
+unsafe extern "C" fn receive_events(data: *mut libc::c_void) -> ffi::job_requeue_t {
+    // SAFETY: callback_job owns an Arc<State> until cleanup(). Its callbacks
+    // borrow it; only cleanup reconstructs and releases that Arc.
+    let state = unsafe { &*data.cast::<State>() };
+    let _active = state.active.lock().unwrap();
+    if !state.stop.is_cancelled() {
+        if let Some(client) = state.client.upgrade() {
+            match client.next_events(&state.stop) {
+                Ok(Some(batch)) => {
+                    for event in batch {
+                        if state.stop.is_cancelled() {
+                            break;
+                        }
+                        dispatch(event);
+                    }
+                    return requeue(ffi::job_requeue_type_t_JOB_REQUEUE_TYPE_FAIR);
                 }
+                Ok(None) => (),
+                Err(error) => log(&format!("receiving events: {error}")),
             }
         }
     }
+    requeue(ffi::job_requeue_type_t_JOB_REQUEUE_TYPE_NONE)
 }
-unsafe extern "C" fn receive_events(
-    data: *mut libc::c_void,
-    _fd: i32,
-    _event: ffi::watcher_event_t,
-) -> bool {
-    // SAFETY: registered data is a State; Watcher::drop waits for this call.
-    unsafe { &*data.cast::<State>() }.receive()
+unsafe extern "C" fn cancel(data: *mut libc::c_void) -> bool {
+    // SAFETY: the processor holds the job alive throughout cancellation.
+    unsafe { &*data.cast::<State>() }.stop.cancel();
+    true // Return normally; never pthread-cancel through Rust stack frames.
+}
+unsafe extern "C" fn cleanup(data: *mut libc::c_void) {
+    // SAFETY: paired with the single Arc::into_raw() in register().
+    drop(unsafe { Arc::from_raw(data.cast::<State>()) });
+}
+fn requeue(kind: ffi::job_requeue_type_t) -> ffi::job_requeue_t {
+    ffi::job_requeue_t {
+        type_: kind,
+        ..Default::default()
+    }
 }
 
 fn dispatch(event: api::Event) {
-    // The watcher runs on charon's workers while the kernel interface is alive.
+    // The job runs on charon's workers while the kernel interface is alive.
     let kernel = unsafe { (*ffi::charon).kernel };
     match event.kind {
         api::EventKind::Expire => {
