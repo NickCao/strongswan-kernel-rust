@@ -299,10 +299,10 @@ supplementary group. Charon
 needs no capabilities when started as its final user, using writable runtime
 and credential directories and UDP ports at least 1024. It binds its own
 sockets and configures UDP_ENCAP/UDP_GRO locally. The daemon installs global
-UDP port bypass policies for IKE. There is **no descriptor passing** and no
-privileged bind operation. Do not configure `socket-default.fwmark`, which
-would require SO_MARK on charon's sockets; ranet's `set_mark_out` applies to
-SAs and is supported by the daemon.
+UDP port bypass policies for IKE. IKE socket descriptors are not passed to the
+daemon, and no privileged bind operation is needed. Do not configure
+`socket-default.fwmark`, which would require SO_MARK on charon's sockets;
+ranet's `set_mark_out` applies to SAs and is supported by the daemon.
 
 Create a dedicated static group and grant the charon service membership:
 
@@ -404,6 +404,27 @@ ignored interfaces only when explicitly requested.
 Subnet nexthop queries for route installation are unsupported.
 Interface/address discovery is cached until a link or address notification
 invalidates it. Interface ownership checks always query the kernel.
+
+## IKE bypass limitation
+
+The plugin receives a borrowed IKE socket descriptor in `bypass_socket()`, but
+uses `getsockname()` to forward only its address family and local UDP port via
+`bypass_port`. The daemon installs global bypass policies matching outgoing
+UDP source ports and incoming UDP destination ports. This corresponds to
+upstream's optional `charon.plugins.kernel-netlink.port_bypass = yes`; upstream
+defaults to policies attached to the actual sockets. See the
+[strongSwan configuration reference](https://docs.strongswan.org/docs/latest/config/strongswanConf.html#_charon_plugins_kernel_netlink).
+
+These port-based exceptions apply to matching traffic regardless of which
+process or socket owns it. Their lifetime follows session/daemon cleanup rather
+than socket closure; a daemon crash can leave them installed until startup
+cleanup. They use `if_id = 0`, so they do not override our tunnel policies,
+which require matching nonzero XFRM interface IDs.
+
+Socket-bound bypasses would require passing the actual IKE socket descriptors
+to the privileged daemon to set `IP_XFRM_POLICY`/`IPV6_XFRM_POLICY` with
+`CAP_NET_ADMIN`. This is not implemented. The notification eventfd passed at
+connection setup does not provide access to the IKE sockets.
 
 ## Safety boundaries
 

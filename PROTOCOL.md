@@ -76,8 +76,14 @@ retaining port bypasses. `close_session` succeeds only with no tunnel
 SAs/policies and then removes bypasses and larval allocations.
 
 `bypass_port` takes an address family (AF_INET/AF_INET6) and a UDP port at least
-1024. Charon binds and enables UDP encapsulation itself; no descriptors are
-passed. Read-only network discovery caches link/address Netlink dumps and
+1024. Charon binds and enables UDP encapsulation itself. The plugin receives
+the IKE socket descriptor but forwards only its family and local port; no IKE
+socket descriptors are passed to the daemon. Bypasses are global port-based
+policies, not socket-bound policies. See the [IKE bypass limitation](README.md#ike-bypass-limitation)
+for their broader scope and cleanup lifetime. The notification eventfd is a
+separate descriptor transfer at connection setup.
+
+Read-only network discovery caches link/address Netlink dumps and
 invalidates them on link/address changes. Source-address and nexthop queries
 use host-only kernel FIB lookups, including policy routing. XFRM links are
 excluded from address/subnet enumeration, address-to-interface queries, and
