@@ -443,6 +443,9 @@ it stops and rearms the watcher. There is no periodic polling, separate event
 connection, wakeup socket or client event queue. The runtime drops when the last
 client reference is released.
 
+See [the event delivery measurements](BENCHMARKS.md) for a comparison with the
+Tokio-worker client and continuous current-thread polling.
+
 The transport also wakes the job when an RPC reads ahead into a following frame,
 or consumes an `EventsReady` notification while another call is active. This
 covers notifications already buffered in userspace, which socket readiness
