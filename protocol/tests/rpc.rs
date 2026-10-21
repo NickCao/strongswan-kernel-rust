@@ -3,6 +3,7 @@ use futures::StreamExt;
 use kernel_rust_protocol::{
     self as api,
     client::{CancellationToken, Client, Config},
+    notification::Notification,
     *,
 };
 use serde_json::{json, Value};
@@ -20,7 +21,7 @@ use tarpc::{context::Context, server::Channel};
 struct State {
     captured: Mutex<Vec<Value>>,
     closes: AtomicUsize,
-    delay_query: AtomicBool,
+    query_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     hold_events: AtomicBool,
     event_calls: AtomicUsize,
     events: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<Event>>>,
@@ -75,8 +76,9 @@ impl Kernel for Fake {
     }
     async fn query_sa(self, _: Context, _id: SaId, cpi: u16) -> api::Result<SaUsage> {
         assert_eq!(cpi, u16::MAX);
-        if self.0.delay_query.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        let barrier = self.0.query_barrier.lock().unwrap().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
         }
         Ok(SaUsage {
             bytes: u64::MAX,
@@ -106,7 +108,7 @@ struct Fixture {
     config: Config,
     state: Arc<State>,
     events: tokio::sync::mpsc::Sender<Vec<Event>>,
-    notifications: tokio::sync::broadcast::Sender<()>,
+    notifications: Arc<Notification>,
     sockets: mpsc::Receiver<UnixStream>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     worker: Option<thread::JoinHandle<()>>,
@@ -118,12 +120,12 @@ impl Fixture {
         let listener = UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (events, receiver) = tokio::sync::mpsc::channel(8);
-        let (notifications, _) = tokio::sync::broadcast::channel(16);
+        let notifications = Arc::new(Notification::new().unwrap());
         let notify = notifications.clone();
         let state = Arc::new(State {
             captured: Mutex::new(Vec::new()),
             closes: AtomicUsize::new(0),
-            delay_query: AtomicBool::new(false),
+            query_barrier: Mutex::new(None),
             hold_events: AtomicBool::new(false),
             event_calls: AtomicUsize::new(0),
             events: tokio::sync::Mutex::new(receiver),
@@ -144,19 +146,14 @@ impl Fixture {
                         _ = &mut shutdown => break,
                         connection = listener.accept() => {
                             let socket = connection.unwrap().0.into_std().unwrap();
+                            notify.send(&socket).unwrap();
                             accepted.send(socket.try_clone().unwrap()).unwrap();
                             let stream = tokio::net::UnixStream::from_std(socket).unwrap();
-                            let notifications = futures::stream::unfold(notify.subscribe(), |mut receiver| async move {
-                                receiver.recv().await.ok().map(|()| ((), receiver))
-                            });
-                            let (transport, driver) = transport::server(stream, notifications);
+                            let transport = transport::framed(stream);
                             let channel = tarpc::server::BaseChannel::with_defaults(transport);
                             let fake = server.clone();
                             tokio::spawn(async move {
-                                tokio::select! {
-                                    _ = driver => (),
-                                    _ = channel.execute(fake.serve()).for_each(|response| async move { tokio::spawn(response); }) => (),
-                                }
+                                channel.execute(fake.serve()).for_each(|response| async move { tokio::spawn(response); }).await;
                             });
                         }
                     }
@@ -303,6 +300,9 @@ fn empty_and_large_batches_share_one_connection_and_disconnect_disables_control(
 #[test]
 fn different_calling_threads_share_the_current_thread_runtime() {
     let fixture = Fixture::new();
+    // A reply requires all eight callers to have an RPC in flight. This
+    // catches accidental serialization without depending on thread timing.
+    *fixture.state.query_barrier.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(8)));
     let client = Client::connect(&fixture.config).unwrap();
     thread::scope(|scope| {
         for _ in 0..8 {
@@ -324,7 +324,7 @@ fn different_calling_threads_share_the_current_thread_runtime() {
     client.close().unwrap();
 }
 #[test]
-fn server_push_wakes_an_idle_client_without_periodic_event_rpcs() {
+fn eventfd_wakes_an_idle_client_without_periodic_event_rpcs() {
     let fixture = Fixture::new();
     let client = Client::connect(&fixture.config).unwrap();
     thread::sleep(Duration::from_millis(50));
@@ -339,11 +339,18 @@ fn server_push_wakes_an_idle_client_without_periodic_event_rpcs() {
             address_changed: Some(true),
         }])
         .unwrap();
-    fixture.notifications.send(()).unwrap();
-    // No runtime is running in the client. Its UDS nevertheless becomes ready
-    // for the host watcher, which can then drive a blocking batch fetch.
+    fixture.notifications.notify().unwrap();
+    // A control RPC must not consume the notification, even if it reads ahead.
+    client
+        .request(
+            client
+                .rpc()
+                .query_sa(api::context::current(), sa_id(), u16::MAX),
+        )
+        .unwrap();
+    // With no client runtime running, only the eventfd becomes readable.
     use rustix::event::{poll, PollFd, PollFlags, Timespec};
-    let mut ready = [PollFd::new(client.socket(), PollFlags::IN)];
+    let mut ready = [PollFd::new(client.notification(), PollFlags::IN)];
     assert_eq!(
         poll(
             &mut ready,
@@ -355,7 +362,12 @@ fn server_push_wakes_an_idle_client_without_periodic_event_rpcs() {
         .unwrap(),
         1
     );
-    assert!(client.events_ready().unwrap());
+    let mut socket_ready = [PollFd::new(client.socket(), PollFlags::IN)];
+    assert_eq!(
+        poll(&mut socket_ready, Some(&Timespec::default())).unwrap(),
+        0
+    );
+    assert!(client.notification().drain().unwrap());
     let batch = client
         .next_events(&CancellationToken::new())
         .unwrap()

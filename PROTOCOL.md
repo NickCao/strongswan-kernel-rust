@@ -2,23 +2,28 @@
 
 [protocol/src/lib.rs](protocol/src/lib.rs) defines the shared Rust types,
 service trait and errors. `#[tarpc::service]` generates the client and dispatch.
-Connections are Unix SOCK_STREAM sockets carrying Bincode-encoded tarpc messages
+Connections use Unix SOCK_STREAM sockets. Before starting tarpc, the daemon
+sends a one-byte zero payload with one nonblocking eventfd through `SCM_RIGHTS`.
+The plugin receives it with `MSG_CMSG_CLOEXEC`, then calls `open_session`.
+Notifications start only after the session opens. Descriptor transfer uses
+rustix's safe ancillary-message APIs and does not touch RPC framing.
+
+RPC traffic uses tarpc's standard Serde transport: Bincode-encoded tarpc messages
 in length-delimited frames, with an 8 MiB frame limit. Install matching plugin
 and daemon builds; this internal binary API does not support mixing versions.
-Client frames contain tarpc's `ClientMessage`. Server frames contain the typed
-`ServerFrame` enum: `Response(tarpc::Response)` or `EventsReady`. The transport
-intercepts notifications before passing replies to tarpc. Empty frames are
-invalid; this protocol does not use socket OOB data or heartbeat frames.
+There is no custom message envelope or notification frame.
 
 The plugin calls `Runtime::block_on()` directly on charon's calling threads,
 using one shared Tokio current-thread runtime and one Unix connection. No plugin
 thread is created. Tokio coordinates concurrent callers and drives its RPC
 dispatch task while a call is active. Charon's existing watcher monitors the
-same socket. Readiness queues a low-priority job and suspends watching until
-that job finishes draining events. The job calls `next_events`, delivers the
-batch after leaving the runtime, and returns `JOB_REQUEUE_FAIR` while batches
-remain. An empty reply stops the job and rearms watching. There is no polling
-timer, additional client event queue or plugin-created thread.
+passed eventfd. Its callback clears the counter with a nonblocking read and
+queues a low-priority job, keeping the watcher registered. The job calls
+`next_events`, delivers the batch after leaving the runtime, and returns
+`JOB_REQUEUE_FAIR` while batches remain or another notification arrived during
+the fetch. An empty reply with no pending wakeup stops the job. There is no
+polling timer or additional client event queue.
+
 Application errors distinguish invalid sessions, an occupied session and kernel
 errors carrying a positive errno. tarpc handles request IDs, deadlines,
 cancellation, framing and transport errors.
@@ -33,25 +38,22 @@ connection is needed. The daemon queue is bounded; overflow invalidates the
 connection instead of silently losing expiry events. The daemon keeps receiving
 hard expiry events after a client disconnects to release expired SA interfaces.
 
-The daemon sends at most one outstanding `EventsReady` notification; fetching a
-batch rearms it. XFRM batches wake immediately. A pending roam wakes at its
-existing 100 ms coalescing deadline, even if an intervening urgent XFRM batch
-has already been delivered. Idle operation sends no periodic empty RPCs.
-
-An RPC can read a subsequent frame into its framing buffer and leave the
-kernel socket unreadable. The client transport also wakes the host when that
-buffer is nonempty after a reply, when it intercepts a notification, or when
-the connection closes. These wakeups are coalesced and retained until a fetch,
-including before the host installs its callback. The event job checks for
-remaining socket/buffer activity to skip readiness consumed by another RPC.
+The daemon writes to the eventfd when a batch becomes available, coalescing
+wakeups until a batch is fetched. XFRM batches wake immediately. A pending roam
+wakes at its existing 100 ms coalescing deadline, even if an intervening urgent
+XFRM batch has already been delivered. Reading RPC replies cannot consume these
+wakeups: the eventfd counter is independent of tarpc's socket and buffers.
+Idle operation sends no periodic RPCs. The eventfd signals event availability
+only; a disconnected daemon is detected by the next RPC call.
 
 Higher-priority eligible jobs take precedence; fair requeue places further
 batch fetches at the tail of their priority queue. Job cancellation wakes an
-in-flight fetch without closing the
-shared connection; unloading stops and joins active event dispatch before
-closing the session. The watcher callback only queues work and unregisters its
-read interest; blocking RPCs run in a job with cooperative cancellation. There
-is no pthread cancellation through Rust RPC frames.
+in-flight fetch without closing the shared connection. Unloading removes the
+watcher and joins active event dispatch before closing the session. The watcher
+callback only performs the nonblocking eventfd read and queues work; blocking
+RPCs run in a job with cooperative cancellation. There is no pthread
+cancellation through Rust RPC frames. Only the notification eventfd is passed;
+RPC data contains no process-local pointers or descriptors.
 
 SA keys and security labels use byte vectors. Algorithm identifiers use
 strongSwan's encryption/integrity identifiers; optional kernel names support

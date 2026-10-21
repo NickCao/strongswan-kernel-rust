@@ -417,8 +417,8 @@ The daemon translates kernel errors to errno replies. Closing a session drops
 its notification routers and wakes the event workers.
 
 tarpc generates typed clients and dispatch from the shared Rust service trait,
-with Bincode over length-delimited Unix socket frames. Server frames wrap replies
-or a typed `EventsReady` notification. Inputs use native integer
+with Bincode over length-delimited Unix socket frames using its standard Serde
+transport. Inputs use native integer
 widths, including full-range `u64` lifetimes and counters, and byte vectors for
 keys and security labels. Endpoints retain IP, port, IPv6 flow information and
 scope ID. SA inputs include mode, selectors, interface restrictions, lifetime
@@ -435,22 +435,23 @@ The plugin shares one Tokio current-thread runtime and one Unix connection.
 StrongSwan's synchronous callbacks call `Runtime::block_on()` on their own
 calling threads. Tokio drives the RPC dispatch task during these calls and
 coordinates concurrent callers without a mutex held over an entire RPC. No
-plugin thread is created. Charon's shared watcher monitors that same socket for
-readability. Its short callback suspends watching and queues a cancellable,
-low-priority processor job. The job calls `NextEvents`, handles its batch after
-returning from the runtime, and fairly requeues while batches remain. Once empty,
-it stops and rearms the watcher. There is no periodic polling, separate event
-connection, wakeup socket or client event queue. The runtime drops when the last
-client reference is released.
+plugin thread is created. Before tarpc starts, the daemon passes one nonblocking
+eventfd over the connection using `SCM_RIGHTS`; the plugin receives it with
+close-on-exec set. Notification delivery starts when `OpenSession` succeeds.
 
-See [the event delivery measurements](BENCHMARKS.md) for a comparison with the
-Tokio-worker client and continuous current-thread polling.
+Charon's shared watcher monitors the eventfd. Its short callback clears the
+counter and queues a cancellable, low-priority processor job. The watcher stays
+registered. The job calls `NextEvents`, handles its batch after returning from
+the runtime, and fairly requeues while batches or racing wakeups remain. Once
+empty, it stops. There is no periodic polling, separate event connection,
+wakeup socket or client event queue. The runtime and eventfd drop when the last
+client reference is released. Reading RPC replies cannot consume eventfd
+wakeups, so no custom transport, notification frames or framing-buffer
+inspection are needed.
 
-The transport also wakes the job when an RPC reads ahead into a following frame,
-or consumes an `EventsReady` notification while another call is active. This
-covers notifications already buffered in userspace, which socket readiness
-alone would miss. A coalesced local flag retains wakeups until the job fetches
-events; it also handles notifications arriving during plugin initialization.
+See [the historical event delivery measurements](BENCHMARKS.md) for the previous
+socket-notification implementation's comparison with the Tokio-worker client
+and continuous current-thread polling.
 
 The plugin still implements strongSwan's C interfaces. Its remaining unsafe
 code borrows C callback arguments, invokes host functions, manages the exported
@@ -463,8 +464,9 @@ The event job uses weak client ownership and cancellation; unloading removes
 the watcher and joins active event dispatch before closing the session. Blocking
 Rust RPCs never run inside the watcher's pthread-cancellable callback. Charon
 destroys queued
-jobs before unloading plugin libraries. No pointers or descriptors cross the RPC
-connection.
+jobs before unloading plugin libraries. The sole descriptor transfer is the
+notification eventfd at connection setup. RPC data contains no process-local
+pointers or descriptors.
 
 ## Session and recovery behavior
 
@@ -472,11 +474,13 @@ The daemon serves one charon session at a time, with control calls and event
 polls on the same Unix connection. `NextEvents` immediately drains one queued
 batch or returns an empty batch. The daemon's bounded event queue retains
 notifications until the next poll; overflow invalidates the session. The
-daemon pushes a coalesced `EventsReady` frame when a batch is available or a
-pending roam reaches its 100 ms coalescing deadline. The next fetch rearms that
-notification. The plugin drains batches at low priority; higher-priority work
+daemon writes to the eventfd when a batch is available or a pending roam
+reaches its 100 ms coalescing deadline. Wakeups are coalesced until a batch
+is fetched. The plugin drains batches at low priority; higher-priority work
 can delay event delivery. Idle operation sends no periodic RPCs or heartbeats.
-A transport failure disables the connection without replaying mutations.
+A transport failure detected by an RPC disables the connection without
+replaying mutations. The eventfd signals event availability only; an idle
+connection does not probe for daemon failure.
 A clean close requires all tunnel SAs/policies removed, cleans larval SPI
 reservations and all remaining global policies, and permits a new session.
 The `FlushSas` RPC clears desired SAs and flushes the whole state table. Flushing

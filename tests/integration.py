@@ -15,8 +15,8 @@ import sys
 import tempfile
 import time
 
-# A test-only Rust process handles typed tarpc calls. All connections opened
-# by one Python client share its helper PID, preserving the peer-binding tests.
+# A test-only Rust process handles typed tarpc calls. Control/event aliases
+# share one channel, socket, and passed notification eventfd.
 import atexit
 
 _bridge = None

@@ -1,5 +1,9 @@
 # Event delivery comparison
 
+These measurements describe the previous `560f002` socket-notification
+implementation. The current implementation uses a passed eventfd and standard
+tarpc framing; it has not been measured in this comparison.
+
 Measured on 2026-10-21 with matching release daemon/plugin pairs and unmodified
 strongSwan 6.1.0 in one NixOS VM: two vCPUs, 768 MiB RAM, Linux 6.18.56 and
 `kvm-clock`. Fifteen alternating trials give five runs per implementation.

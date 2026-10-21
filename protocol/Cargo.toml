@@ -12,10 +12,10 @@ zeroize = "1.8"
 tarpc = { version = "0.38", features = ["serde-transport-bincode", "unix"] }
 tokio = { version = "1", features = ["rt", "net", "sync", "time", "io-util", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-futures = "0.3"
-rustix = { version = "1.1", features = ["event"] }
+rustix = { version = "1.1", features = ["event", "net"] }
 
 [dev-dependencies]
+futures = "0.3"
 serde_json = "1"
 libc = "0.2"
 tempfile = "3"

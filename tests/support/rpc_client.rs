@@ -2,7 +2,7 @@
 //! Test-only JSON/stdin adapter for the existing Python kernel scenarios.
 //! It uses tarpc's generated request/response types and the production codec;
 //! JSON is never sent to the daemon.
-use kernel_rust_protocol::{transport, KernelRequest, KernelResponse};
+use kernel_rust_protocol::{notification::Notification, transport, KernelRequest, KernelResponse};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -17,7 +17,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 type Channel = client::Channel<KernelRequest, KernelResponse>;
 struct Connection {
     channel: Channel,
-    signal: Arc<transport::EventSignal>,
+    notification: Arc<tokio::io::unix::AsyncFd<Notification>>,
     socket: UnixStream,
     sender: mpsc::UnboundedSender<Value>,
     receiver: mpsc::UnboundedReceiver<Value>,
@@ -66,19 +66,26 @@ async fn dispatch(command: Value, connections: &mut HashMap<u64, Connection>) ->
                 Ok(socket) => socket,
                 Err(error) => return json!({"connect_error":error.to_string()}),
             };
-            socket.set_nonblocking(true).unwrap();
-            let (channel, signal) = if let Some(connection) = reused {
-                (connection.channel.clone(), connection.signal.clone())
+            let (channel, notification) = if let Some(connection) = reused {
+                (connection.channel.clone(), connection.notification.clone())
             } else {
+                let notification = match Notification::receive(&socket) {
+                    Ok(notification) => notification,
+                    Err(error) => return json!({"connect_error":error.to_string()}),
+                };
+                socket.set_nonblocking(true).unwrap();
                 let stream = tokio::net::UnixStream::from_std(socket.try_clone().unwrap()).unwrap();
-                let signal = Arc::new(transport::EventSignal::default());
                 (
-                    client::new(
-                        client::Config::default(),
-                        transport::client(stream, signal.clone()),
-                    )
-                    .spawn(),
-                    signal,
+                    client::new(client::Config::default(), transport::framed(stream)).spawn(),
+                    // SAFETY: Notification owns a stable OwnedFd for the whole
+                    // registration and never exposes an operation to replace it.
+                    Arc::new(unsafe {
+                        tokio::io::unix::AsyncFd::register_with_interest(
+                            notification,
+                            tokio::io::Interest::READABLE,
+                        )
+                        .unwrap()
+                    }),
                 )
             };
             let (sender, receiver) = mpsc::unbounded_channel();
@@ -86,7 +93,7 @@ async fn dispatch(command: Value, connections: &mut HashMap<u64, Connection>) ->
                 id,
                 Connection {
                     channel,
-                    signal,
+                    notification,
                     socket,
                     sender,
                     receiver,
@@ -114,17 +121,21 @@ async fn dispatch(command: Value, connections: &mut HashMap<u64, Connection>) ->
             let mut parameters = command["parameters"].clone();
             if method == "WatchEvents" {
                 let channel = connection.channel.clone();
-                let signal = connection.signal.clone();
+                let notification = connection.notification.clone();
                 let sender = connection.sender.clone();
                 connection.tasks.push(tokio::spawn(async move {
                     let _ = sender.send(json!({"parameters":{"event":{"kind":"ready"}}}));
                     let mut first = true;
                     loop {
                         if !first {
-                            signal.notified().await;
+                            let mut ready = notification.readable().await.unwrap();
+                            let drained = notification.get_ref().drain().unwrap();
+                            ready.clear_ready();
+                            if !drained {
+                                continue;
+                            }
                         }
                         first = false;
-                        signal.take();
                         loop {
                             let mut ctx = context::current();
                             ctx.deadline = std::time::Instant::now() + Duration::from_secs(60);

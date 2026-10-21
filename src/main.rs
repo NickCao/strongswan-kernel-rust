@@ -63,6 +63,8 @@ fn interface_name(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 fn connection(socket: UnixStream, server: Arc<Server>) -> io::Result<()> {
+    let notification = charon_kernel_daemon::rpc_api::notification::Notification::new()?;
+    notification.send(&socket)?;
     socket.set_nonblocking(true)?;
     let service = Service::new(server, socket.try_clone()?);
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -70,22 +72,36 @@ fn connection(socket: UnixStream, server: Arc<Server>) -> io::Result<()> {
         .build()?;
     runtime.block_on(async {
         let socket = tokio::net::UnixStream::from_std(socket)?;
-        let notifications = futures::stream::unfold(service.clone(), |service| async move {
-            service.next_notification().await.map(|()| ((), service))
-        });
-        let (transport, driver) =
-            charon_kernel_daemon::rpc_api::transport::server(socket, notifications);
-        tokio::pin!(driver);
+        let notifications = async {
+            while service.next_notification().await.is_some() {
+                notification.notify()?;
+            }
+            Ok::<_, io::Error>(())
+        };
+        tokio::pin!(notifications);
+        let mut notifying = true;
+        let transport = charon_kernel_daemon::rpc_api::transport::framed(socket);
         let channel = tarpc::server::BaseChannel::with_defaults(transport);
         let mut requests = channel.requests();
         let mut tasks = tokio::task::JoinSet::new();
         let result = loop {
             tokio::select! {
-                result = &mut driver => break result,
+                result = &mut notifications, if notifying => {
+                    if let Err(error) = result { break Err(error); }
+                    notifying = false;
+                },
                 request = requests.next() => match request {
                     Some(Ok(request)) => { tasks.spawn(request.execute(service.clone().serve())); }
                     // Do not log decode errors: a failed frame can contain keys.
-                    Some(Err(_)) => break Err(io::ErrorKind::ConnectionAborted.into()),
+                    Some(Err(error)) => {
+                        use tarpc::ChannelError::*;
+                        let kind = match error {
+                            Read(error) | Ready(error) | Write(error) | Flush(error) | Close(error) => error.kind(),
+                        };
+                        break if matches!(kind, io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe) {
+                            Ok(())
+                        } else { Err(kind.into()) };
+                    },
                     None => break Ok(()),
                 },
                 _ = tasks.join_next(), if !tasks.is_empty() => (),

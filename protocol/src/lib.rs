@@ -8,6 +8,7 @@ pub use tarpc::{client::RpcError, context};
 
 pub mod client;
 mod endpoint;
+pub mod notification;
 pub mod transport;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
