@@ -35,6 +35,13 @@ backend also advertises `KERNEL_SA_USE_TIME`: SA queries return the last use
 time converted from the kernel's Unix timestamp to strongSwan's monotonic
 clock. Earlier kernels use strongSwan's policy-query fallback.
 
+The CHILD_SA's `icmp = yes` option enables Linux's reverse-policy lookup for
+forwarding ICMP errors whose source address is outside the negotiated selectors.
+It enables ICMP checking on inbound SAs and sets policy flags as requested by
+strongSwan; reconciliation preserves these settings. Algorithm mappings use
+named strongSwan transform IDs and explicit AEAD tag and standard SHA-2/AES
+MAC lengths. Linux determines which algorithms the running kernel supports.
+
 An interface named `ranet<if_id in eight hex digits>` is created and brought
 up **before its first SA is installed**. Its default MTU is 1400. Every SA
 using that ID shares the interface, including inbound/outbound SAs and old/new

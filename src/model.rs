@@ -97,6 +97,7 @@ pub struct PolicyData {
     pub reqid: u32,
     pub policy_count: u32,
     pub esp: Option<u32>,
+    pub forward_icmp: bool,
 }
 
 #[cfg(test)]

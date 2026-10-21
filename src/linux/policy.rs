@@ -14,6 +14,7 @@ use crate::{
 use ipnet::IpNet;
 use netlink_packet_core::{Nla, Parseable};
 use netlink_packet_xfrm::{self as packet, XfrmAttrs as Attr, XfrmMessage};
+use rustix::net::ipproto;
 use std::io;
 
 fn selector(id: &PolicyKey) -> packet::Selector {
@@ -107,7 +108,16 @@ impl LinuxPolicies {
             selector: selector(&spec.id),
             priority: spec.config.priority,
             direction: spec.id.dir,
-            action: u8::from(spec.config.block),
+            action: if spec.config.block {
+                packet::XFRM_POLICY_BLOCK
+            } else {
+                packet::XFRM_POLICY_ALLOW
+            },
+            flags: if spec.config.forward_icmp {
+                packet::XFRM_POLICY_ICMP
+            } else {
+                0
+            },
             ..Default::default()
         };
         let mut nlas = Vec::new();
@@ -116,13 +126,13 @@ impl LinuxPolicies {
                 id: packet::Id {
                     daddr: packet::Address::from_ip(&template.dst),
                     spi: template.spi,
-                    proto: 50,
+                    proto: ipproto::ESP.as_raw().get() as u8,
                 },
                 saddr: packet::Address::from_ip(&template.src),
                 family: Endpoint::new(template.src, 0).family(),
                 reqid: template.reqid,
                 mode: packet::XFRM_MODE_TUNNEL,
-                share: 0,
+                share: packet::XFRM_SHARE_ANY,
                 optional: 0,
                 aalgos: u32::MAX,
                 ealgos: u32::MAX,
@@ -174,8 +184,8 @@ impl LinuxPolicies {
         policy: &packet::policy::ModifyMessage,
     ) -> Option<PolicyConfig> {
         let block = match policy.user_policy_info.action {
-            0 => false,
-            1 => true,
+            packet::XFRM_POLICY_ALLOW => false,
+            packet::XFRM_POLICY_BLOCK => true,
             _ => return None,
         };
         let templates = policy.nlas.iter().find_map(|attr| match attr {
@@ -195,6 +205,7 @@ impl LinuxPolicies {
         let config = PolicyConfig {
             priority: policy.user_policy_info.priority,
             block,
+            forward_icmp: policy.user_policy_info.flags & packet::XFRM_POLICY_ICMP != 0,
             template,
         };
         let encoded = Self::policy_spec(&PolicySpec {
@@ -362,6 +373,7 @@ mod tests {
             config: PolicyConfig {
                 priority: 100,
                 block: true,
+                forward_icmp: false,
                 template: None,
             },
         };
@@ -471,6 +483,7 @@ mod tests {
             let config = PolicyConfig {
                 priority: 100,
                 block: false,
+                forward_icmp: true,
                 template: Some(PolicyTemplate {
                     src: src.address,
                     dst: dst.address,
@@ -492,9 +505,9 @@ mod tests {
             }));
             native.nlas.reverse();
             assert_eq!(LinuxPolicies::configuration(&id, &native), Some(config));
-            native.user_policy_info.flags = 1;
+            native.user_policy_info.flags |= packet::XFRM_POLICY_LOCALOK;
             assert_eq!(LinuxPolicies::configuration(&id, &native), None);
-            native.user_policy_info.flags = 0;
+            native.user_policy_info.flags &= !packet::XFRM_POLICY_LOCALOK;
             for attr in &mut native.nlas {
                 if let Attr::Template(templates) = attr {
                     templates[0].mode = packet::XFRM_MODE_TRANSPORT;
@@ -524,6 +537,7 @@ mod tests {
                 reqid: 42,
                 policy_count: 1,
                 esp: Some(0x10203),
+                forward_icmp: false,
             };
             let priority = |id: &PolicyId| {
                 let spec = PolicySpec::new(id, &data).unwrap();

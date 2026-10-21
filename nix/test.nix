@@ -40,6 +40,7 @@ let
               local_ts = 0.0.0.0/0, ::/0
               remote_ts = 0.0.0.0/0, ::/0
               mode = tunnel
+              icmp = yes
               esp_proposals = ${proposal}
               tfc_padding = 256
               set_mark_out = 123
@@ -495,6 +496,11 @@ in
                 assert "output-mark 0x7b" in state, state
                 assert "encap type espinudp sport 13000 dport 13000" in state, state
                 assert "tfcpad 256" in state, state
+                state_blocks = re.split(r"(?=^src )", state, flags=re.M)[1:]
+                assert all(("icmp" in block) == ("dir in" in block) for block in state_blocks), state
+                for policy in policy_specs(machine):
+                    if "if_id" in policy:
+                        assert ("flag icmp" in policy) == ("dir out" in policy), policy
                 assert any(int(value) > 0 for value in re.findall(r"(\d+)\(packets\)", state))
 
         with subtest(name + ": policy flush recovers without replacing SAs or interfaces"):

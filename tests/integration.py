@@ -68,21 +68,21 @@ class Rpc:
 def endpoint(address="192.0.2.1", port=13000): return dict(address=address, port=port)
 def sa_id(spi=0x10203, interface=41):
     return dict(src=endpoint(), dst=endpoint("192.0.2.2"), spi=spi, protocol=50, mark=dict(value=0, mask=0), interface_id=interface)
-def sa_config(life=0, inbound=False, update=False):
+def sa_config(life=0, inbound=False, update=False, forward_icmp=False):
     return dict(reqid=42, acquire_sequence=0, encryption=dict(id=20, name="", key=[0]*20),
         integrity=dict(id=1024, name="", key=[]),
         lifetime=dict(time=dict(life=life, rekey=max(0,life-1), jitter=0),
                       bytes=dict(life=0, rekey=0, jitter=0), packets=dict(life=0, rekey=0, jitter=0)),
         mode=2, ipcomp=0, cpi=0, cpu=0xffffffff, hw_offload=0,
-        iptfs_dont_fragment=False, forward_icmp=False, initiator=False,
+        iptfs_dont_fragment=False, forward_icmp=forward_icmp, initiator=False,
         replay_window=128, esn=True, udp_encapsulation=True, output_mark=dict(value=123, mask=0xffffffff),
         tfc=0, copy_df=True, copy_ecn=True, copy_dscp=0, inbound=inbound, update=update)
 def selector(v6=False):
     return dict(**{"from": "::" if v6 else "0.0.0.0", "to": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff" if v6 else "255.255.255.255"}, kind=8 if v6 else 7, dynamic=False, protocol=0, from_port=0, to_port=65535)
 def policy(interface=41, direction=1, v6=False):
     return dict(direction=direction, src=selector(v6), dst=selector(v6), mark=dict(value=0,mask=0), interface_id=interface)
-def policy_config(spi=0x10203):
-    return dict(kind=1, priority=1, manual_priority=0, src=endpoint(), dst=endpoint("192.0.2.2"), hw_offload=0, pcpu_acquires=False, forward_icmp=False,
+def policy_config(spi=0x10203, forward_icmp=False):
+    return dict(kind=1, priority=1, manual_priority=0, src=endpoint(), dst=endpoint("192.0.2.2"), hw_offload=0, pcpu_acquires=False, forward_icmp=forward_icmp,
         sa=dict(mode=2, reqid=42, policy_count=2, esp=dict(used=True, spi=spi),
                 ah=dict(used=False, spi=0), ipcomp=dict(transform=0, cpi=0)))
 
@@ -258,6 +258,17 @@ def run(binary):
                 bad = sa_config(); bad["encryption"]["id"] = 65535
                 failure("InstallSa",errno.EOPNOTSUPP,id=sa_id(interface=90),config=bad)
                 assert [l["ifname"] for l in links()] == ["foreign"]
+                # Modern AEAD and explicit SHA-384 truncation reach the kernel.
+                for enc_id, enc_key, auth_id, auth_key, expected in [
+                    (28, [0] * 36, 1024, [], r"aead rfc7539esp\(chacha20,poly1305\) .* 128"),
+                    (12, [0] * 16, 13, [0] * 48, r"auth-trunc hmac\(sha384\) .* 192"),
+                ]:
+                    config = sa_config()
+                    config["encryption"].update(id=enc_id, key=enc_key)
+                    config["integrity"].update(id=auth_id, key=auth_key)
+                    rpc("InstallSa", id=sa_id(), config=config)
+                    assert re.search(expected, states()), states()
+                    rpc("RemoveSa", id=sa_id())
                 a,b = sa_id(),sa_id(spi=0x10204)
                 rpc("InstallSa",id=a,config=sa_config()); link = next(l for l in links() if l["ifname"] == "ranet00000029")
                 assert link["mtu"] == 1400 and "UP" in link["flags"]
@@ -391,7 +402,13 @@ def run(binary):
                         rpc("RemovePolicy",id=icmp,config=config)
                     assert priorities[1] < priorities[0], priorities
                 for v6 in [False, True]:
-                    for direction in [0,1,2]: rpc("InstallPolicy",id=policy(v6=v6,direction=direction),config=policy_config(spi=b["spi"]))
+                    for direction, name in [(0, "in"), (1, "out"), (2, "fwd")]:
+                        rpc("InstallPolicy",id=policy(v6=v6,direction=direction),
+                            config=policy_config(spi=b["spi"], forward_icmp=True))
+                        subnet = "::/0" if v6 else "0.0.0.0/0"
+                        installed = ip("xfrm", "policy", "get", "src", subnet, "dst", subnet,
+                                       "dir", name, "if_id", "41")
+                        assert ("flag icmp" in installed) == (name != "in"), installed
                 # The entire global policy table is owned. Unsolicited policies
                 # are pruned, including identities outside the supported model.
                 foreign_policy = ["src", "203.0.113.0/24", "dst", "203.0.114.0/24",
@@ -476,7 +493,8 @@ def run(binary):
                 # Inbound larval SPI allocation and conversion to an interface SA.
                 spi = rpc("AllocateSpi",src=endpoint(),dst=endpoint("192.0.2.2"),protocol=50,minimum=0xc0000000,maximum=0xcfffffff)["spi"]
                 inbound = sa_id(spi=spi,interface=43)
-                rpc("InstallSa",id=inbound,config=sa_config(inbound=True,update=True))
+                rpc("InstallSa",id=inbound,config=sa_config(inbound=True,update=True,forward_icmp=True))
+                assert re.search(r"\bflag [^\n]*\bicmp\b", states()), states()
                 rpc("RemoveSa",id=inbound)
                 spi = rpc("AllocateSpi",src=endpoint(),dst=endpoint("192.0.2.2"),protocol=50,minimum=0xc0000000,maximum=0xcfffffff)["spi"]
                 inbound = sa_id(spi=spi,interface=43)

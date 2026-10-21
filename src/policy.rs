@@ -4,6 +4,12 @@ use crate::{error::invalid, model::*};
 use ipnet::IpNet;
 use std::{collections::HashMap, io, net::IpAddr};
 
+// strongSwan ipsec_types.h: API policy directions and kinds.
+const POLICY_IN: u8 = 0;
+const POLICY_OUT: u8 = 1;
+const POLICY_IPSEC: u8 = 1;
+const POLICY_DROP: u8 = 3;
+
 fn missing() -> io::Error {
     io::Error::from_raw_os_error(libc::ENOENT)
 }
@@ -83,12 +89,15 @@ impl PolicyKey {
             id: self.clone(),
             config: PolicyConfig {
                 priority: self.priority(data).0,
-                block: data.kind == 3,
-                template: (data.kind == 1 && data.reqid != 0).then(|| PolicyTemplate {
+                block: data.kind == POLICY_DROP,
+                forward_icmp: data.forward_icmp
+                    && data.kind == POLICY_IPSEC
+                    && self.dir != POLICY_IN,
+                template: (data.kind == POLICY_IPSEC && data.reqid != 0).then(|| PolicyTemplate {
                     src: data.src.address,
                     dst: data.dst.address,
                     reqid: data.reqid,
-                    spi: if self.dir == 1 {
+                    spi: if self.dir == POLICY_OUT {
                         data.esp.unwrap_or(0)
                     } else {
                         0
@@ -112,6 +121,7 @@ pub struct PolicyTemplate {
 pub struct PolicyConfig {
     pub priority: u32,
     pub block: bool,
+    pub forward_icmp: bool,
     pub template: Option<PolicyTemplate>,
 }
 /// Resolved configuration passed to the device backend after selecting the
@@ -327,6 +337,7 @@ impl<K: PolicyKernel> Policies<K> {
                 reqid: 0,
                 policy_count: 1,
                 esp: None,
+                forward_icmp: false,
             };
             self.add_policy(id.clone(), data.clone())?;
             self.bypasses.push((id, data));
@@ -452,6 +463,7 @@ mod tests {
                 reqid: 42,
                 policy_count: 2,
                 esp: Some(0x10203),
+                forward_icmp: false,
             },
         )
     }
@@ -463,6 +475,7 @@ mod tests {
         let old_spec = key.spec(&old);
         let mut new = old.clone();
         new.esp = Some(0x10204);
+        new.forward_icmp = true;
         let new_spec = key.spec(&new);
         let mut foreign = id.clone();
         foreign.if_id = 99;

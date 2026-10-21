@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, net::IpAddr};
 pub use tarpc::{client::RpcError, context};
 
+pub mod algorithms;
 pub mod client;
 mod endpoint;
 pub mod notification;

@@ -6,10 +6,12 @@ use super::{
     netlink::{Message, Netlink, NlFamily, NlmF, Reply},
     policy::LinuxPolicies,
 };
+use crate::rpc_api::algorithms::{encryption as enc, integrity as auth};
 use crate::sa::{is_missing, ObservedSa, SaHandle as _, SaKernel, SaSpec, SaState, SaUsage, Sas};
 use crate::{backend::rpc_selector, error::invalid, model::*, policy::Policies, rpc_api as rpc};
 use netlink_packet_core::{DefaultNla, Emitable, Nla, NlasIterator, Parseable};
 use netlink_packet_xfrm::{self as packet, XfrmAttrs as Attr, XfrmMessage};
+use rustix::net::ipproto;
 use std::io;
 
 // Linux 6.10 added this attribute; use the packet crate's extension mechanism
@@ -96,7 +98,10 @@ pub(super) fn selector_ts(selector: &packet::Selector, source: bool) -> io::Resu
             selector.dport_mask,
         )
     };
-    let (port, mask) = if [1, 58].contains(&selector.proto) {
+    let (port, mask) = if [ipproto::ICMP, ipproto::ICMPV6]
+        .iter()
+        .any(|protocol| protocol.as_raw().get() == u32::from(selector.proto))
+    {
         (
             (selector.sport << 8) | selector.dport,
             if selector.sport_mask | selector.dport_mask != 0 {
@@ -126,38 +131,42 @@ fn algorithm(name: &str) -> io::Result<[u8; packet::XFRM_ALG_NAME_LEN]> {
 }
 fn enc_algorithm(id: u16) -> Option<(&'static str, Option<u32>)> {
     Some(match id {
-        2 => ("des", None),
-        3 => ("des3_ede", None),
-        6 => ("cast5", None),
-        7 => ("blowfish", None),
-        11 => ("cipher_null", None),
-        12 => ("aes", None),
-        13 => ("rfc3686(ctr(aes))", None),
-        14..=16 => ("rfc4309(ccm(aes))", Some(64 + (id as u32 - 14) * 32)),
-        18..=20 => ("rfc4106(gcm(aes))", Some(64 + (id as u32 - 18) * 32)),
-        21 => ("rfc4543(gcm(aes))", Some(128)),
-        23 => ("cbc(camellia)", None),
-        28 => ("rfc7539esp(chacha20,poly1305)", Some(128)),
-        1026 => ("serpent", None),
-        1027 => ("twofish", None),
+        enc::DES => ("des", None),
+        enc::TRIPLE_DES => ("des3_ede", None),
+        enc::CAST => ("cast5", None),
+        enc::BLOWFISH => ("blowfish", None),
+        enc::NULL => ("cipher_null", None),
+        enc::AES_CBC => ("cbc(aes)", None),
+        enc::AES_CTR => ("rfc3686(ctr(aes))", None),
+        enc::AES_CCM_ICV8 => ("rfc4309(ccm(aes))", Some(64)),
+        enc::AES_CCM_ICV12 => ("rfc4309(ccm(aes))", Some(96)),
+        enc::AES_CCM_ICV16 => ("rfc4309(ccm(aes))", Some(128)),
+        enc::AES_GCM_ICV8 => ("rfc4106(gcm(aes))", Some(64)),
+        enc::AES_GCM_ICV12 => ("rfc4106(gcm(aes))", Some(96)),
+        enc::AES_GCM_ICV16 => ("rfc4106(gcm(aes))", Some(128)),
+        enc::NULL_AUTH_AES_GMAC => ("rfc4543(gcm(aes))", Some(128)),
+        enc::CAMELLIA_CBC => ("cbc(camellia)", None),
+        enc::CHACHA20_POLY1305 => ("rfc7539esp(chacha20,poly1305)", Some(128)),
+        enc::SERPENT_CBC => ("serpent", None),
+        enc::TWOFISH_CBC => ("twofish", None),
         _ => return None,
     })
 }
 fn int_algorithm(id: u16) -> Option<(&'static str, Option<u32>)> {
     Some(match id {
-        1 => ("md5", None),
-        2 => ("sha1", None),
-        5 => ("xcbc(aes)", None),
-        6 => ("hmac(md5)", Some(128)),
-        7 => ("hmac(sha1)", Some(160)),
-        8 => ("cmac(aes)", None),
-        12 => ("hmac(sha256)", Some(128)),
-        13 => ("hmac(sha384)", None),
-        14 => ("hmac(sha512)", None),
-        1026 => ("sha256", None),
-        1027 => ("hmac(sha256)", Some(256)),
-        1028 => ("hmac(sha384)", Some(384)),
-        1029 => ("hmac(sha512)", Some(512)),
+        auth::HMAC_MD5_96 => ("md5", None),
+        auth::HMAC_SHA1_96 => ("sha1", None),
+        auth::AES_XCBC_96 => ("xcbc(aes)", Some(96)),
+        auth::HMAC_MD5_128 => ("hmac(md5)", Some(128)),
+        auth::HMAC_SHA1_160 => ("hmac(sha1)", Some(160)),
+        auth::AES_CMAC_96 => ("cmac(aes)", Some(96)),
+        auth::HMAC_SHA2_256_128 => ("hmac(sha256)", Some(128)),
+        auth::HMAC_SHA2_384_192 => ("hmac(sha384)", Some(192)),
+        auth::HMAC_SHA2_512_256 => ("hmac(sha512)", Some(256)),
+        auth::HMAC_SHA2_256_96 => ("sha256", None),
+        auth::HMAC_SHA2_256_256 => ("hmac(sha256)", Some(256)),
+        auth::HMAC_SHA2_384_384 => ("hmac(sha384)", Some(384)),
+        auth::HMAC_SHA2_512_512 => ("hmac(sha512)", Some(512)),
         _ => return None,
     })
 }
@@ -198,7 +207,11 @@ impl LinuxSas {
         min: u32,
         max: u32,
     ) -> io::Result<u32> {
-        if src.family() != dst.family() || proto != 50 || min == 0 || min > max {
+        if src.family() != dst.family()
+            || proto != ipproto::ESP.as_raw().get() as u8
+            || min == 0
+            || min > max
+        {
             return Err(invalid());
         }
         let request = XfrmMessage::AllocSpi(packet::state::AllocSpiMessage {
@@ -243,6 +256,9 @@ impl LinuxSas {
         if !data.copy_ecn {
             flags |= packet::XFRM_STATE_NOECN;
         }
+        if data.inbound && data.forward_icmp {
+            flags |= packet::XFRM_STATE_ICMP;
+        }
         if data.inbound && [1, 2].contains(&data.copy_dscp) {
             flags |= packet::XFRM_STATE_DECAP_DSCP;
         }
@@ -286,7 +302,7 @@ impl LinuxSas {
             ..Default::default()
         };
         let mut nlas = Vec::new();
-        if data.encryption.id != 1024 {
+        if data.encryption.id != enc::UNDEFINED {
             let (name, icv) = enc_algorithm(data.encryption.id)
                 .or_else(|| {
                     (!data.encryption.name.is_empty())
@@ -310,7 +326,7 @@ impl LinuxSas {
                 }),
             });
         }
-        if data.integrity.id != 1024 {
+        if data.integrity.id != auth::UNDEFINED {
             let (name, trunc) = int_algorithm(data.integrity.id)
                 .or_else(|| {
                     (!data.integrity.name.is_empty())
@@ -362,7 +378,7 @@ impl LinuxSas {
             }));
         }
         if !data.inbound && [1, 3].contains(&data.copy_dscp) {
-            nlas.push(Attr::ExtraFlags(1));
+            nlas.push(Attr::ExtraFlags(packet::XFRM_SA_XFLAG_DONT_ENCAP_DSCP));
         }
         nlas.extend(id_attrs(id.mark, id.if_id));
         if self.sa_dir {
@@ -451,8 +467,9 @@ impl LinuxSas {
             last_use: monotonic_use_time(last)?,
         };
         let created_at = info.lifetime_cur.add_time;
-        let supported =
-            state == SaState::Installed && info.mode == packet::XFRM_MODE_TUNNEL && id.proto == 50;
+        let supported = state == SaState::Installed
+            && info.mode == packet::XFRM_MODE_TUNNEL
+            && id.proto == ipproto::ESP.as_raw().get() as u8;
         // Keep static settings only. The kernel's canonical representation
         // resolves algorithm aliases/default ICV lengths at first installation.
         // Subsequent inventories never change that desired snapshot.
@@ -507,7 +524,10 @@ pub struct Configuration(packet::state::ModifyMessage);
 
 fn native_request(id: &SaId) -> packet::state::DelGetMessage {
     let mut nlas = id_attrs(id.mark, 0);
-    if ![50, 51, 108].contains(&id.proto) {
+    if ![ipproto::ESP, ipproto::AH, ipproto::COMP]
+        .iter()
+        .any(|protocol| protocol.as_raw().get() == u32::from(id.proto))
+    {
         nlas.push(Attr::SrcAddr(packet::Address::from_ip(&id.src.address)));
     }
     packet::state::DelGetMessage {
@@ -551,7 +571,7 @@ impl SaKernel for LinuxSas {
         self.observe(sa)
     }
     fn create(&mut self, spec: &SaSpec<'_>) -> io::Result<ObservedSa<SaHandle, Configuration>> {
-        if spec.id.proto != 50 || spec.id.if_id == 0 {
+        if spec.id.proto != ipproto::ESP.as_raw().get() as u8 || spec.id.if_id == 0 {
             return Err(unsupported());
         }
         let mut request = self.sa_message(spec.id, spec.config)?;
@@ -706,10 +726,12 @@ pub fn event(
             let spi = mapping.id.spi;
             let family = mapping.id.family;
             let dst = host(family, mapping.id.daddr, 0)?;
-            if mapping.id.proto != 50
-                || !sas
-                    .ids()
-                    .any(|id| id.dst.address == dst.address && id.spi == spi && id.proto == 50)
+            if mapping.id.proto != ipproto::ESP.as_raw().get() as u8
+                || !sas.ids().any(|id| {
+                    id.dst.address == dst.address
+                        && id.spi == spi
+                        && id.proto == ipproto::ESP.as_raw().get() as u8
+                })
             {
                 return Ok(None);
             }

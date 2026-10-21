@@ -69,7 +69,6 @@ impl Backend {
             || config.security_label.is_some()
             || config.hw_offload != 0
             || config.cpu != u32::MAX
-            || config.forward_icmp
             || restricted_interface(config.interface.as_deref())
         {
             return Err(unsupported());
@@ -78,8 +77,8 @@ impl Backend {
             || config.replay_window > 4096 * 32
             || !(0..=3).contains(&config.copy_dscp)
             || config.reqid == 0
-            || config.encryption.name.len() >= 64
-            || config.integrity.name.len() >= 64
+            || config.encryption.name.len() >= netlink_packet_xfrm::XFRM_ALG_NAME_LEN
+            || config.integrity.name.len() >= netlink_packet_xfrm::XFRM_ALG_AUTH_NAME_LEN
             || config.encryption.key.len() > 8192
             || config.integrity.key.len() > 8192
         {
@@ -210,7 +209,6 @@ pub fn policy_config(p: rpc::PolicyConfig) -> io::Result<PolicyData> {
         || sa.ipcomp.transform != 0
         || p.hw_offload != 0
         || p.pcpu_acquires
-        || p.forward_icmp
     {
         return Err(unsupported());
     }
@@ -224,6 +222,7 @@ pub fn policy_config(p: rpc::PolicyConfig) -> io::Result<PolicyData> {
         reqid: sa.reqid,
         policy_count: sa.policy_count,
         esp: sa.esp.used.then_some(sa.esp.spi),
+        forward_icmp: p.forward_icmp,
     };
     if !(1..=3).contains(&d.kind)
         || d.prio > 3
