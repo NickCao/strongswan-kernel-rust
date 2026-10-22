@@ -443,8 +443,8 @@ The plugin's C ABI adapters are in [plugin/src](plugin/src).
 handoff. Policy, interface and immutable-SA controllers and their kernel traits
 live in [src/policy.rs](src/policy.rs), [src/interfaces.rs](src/interfaces.rs)
 and [src/sa.rs](src/sa.rs). Linux implementations are under
-[src/linux](src/linux); [src/service.rs](src/service.rs) handles sessions,
-event queues and reconciliation scheduling.
+[src/linux](src/linux). [src/service](src/service) separates session lifecycle,
+RPC dispatch, event delivery and reconciliation scheduling into modules.
 
 The daemon and protocol crate forbid unsafe Rust. The plugin's unsafe code
 implements strongSwan's C ABI and calls its host functions. SA keys cross the

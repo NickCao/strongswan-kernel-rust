@@ -27,6 +27,7 @@ type Result<T> = std::result::Result<T, status_t>;
 trait ClientExt {
     fn call<T>(
         &self,
+        operation: &str,
         future: impl std::future::Future<
             Output = std::result::Result<
                 kernel_rust_protocol::Result<T>,
@@ -36,6 +37,7 @@ trait ClientExt {
     ) -> Result<T>;
     fn empty(
         &self,
+        operation: &str,
         future: impl std::future::Future<
             Output = std::result::Result<
                 kernel_rust_protocol::Result<()>,
@@ -43,13 +45,14 @@ trait ClientExt {
             >,
         >,
     ) -> status_t {
-        self.call(future)
+        self.call(operation, future)
             .map_or_else(|status| status, |_| status_t_SUCCESS)
     }
 }
 impl ClientExt for kernel_rust_protocol::client::Client {
     fn call<T>(
         &self,
+        operation: &str,
         future: impl std::future::Future<
             Output = std::result::Result<
                 kernel_rust_protocol::Result<T>,
@@ -58,8 +61,8 @@ impl ClientExt for kernel_rust_protocol::client::Client {
         >,
     ) -> Result<T> {
         self.request(future).map_err(|error| {
-            log(&error.to_string());
-            match error.errno {
+            log_error(operation, &error);
+            match error.errno() {
                 Some(libc::EEXIST) => ffi::status_t_ALREADY_DONE,
                 Some(libc::ENOENT | libc::ESRCH) => ffi::status_t_NOT_FOUND,
                 Some(libc::EOPNOTSUPP) => status_t_NOT_SUPPORTED,
@@ -67,6 +70,17 @@ impl ClientExt for kernel_rust_protocol::client::Client {
             }
         })
     }
+}
+
+fn log_error(operation: &str, error: &dyn std::error::Error) {
+    use std::fmt::Write;
+    let mut message = format!("{operation}: {error}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let _ = write!(message, ": {cause}");
+        source = cause.source();
+    }
+    log(&message);
 }
 
 fn log(message: &str) {

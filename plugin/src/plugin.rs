@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-use crate::{events, ffi, host, ipsec, log, net};
+use crate::{events, ffi, host, ipsec, log_error, net};
 use kernel_rust_protocol::client::Client;
 use std::{
     ptr,
@@ -38,7 +38,7 @@ pub unsafe extern "C" fn kernel_rust_plugin_create() -> *mut ffi::plugin_t {
     let client = match Client::connect(&config) {
         Ok(session) => session,
         Err(error) => {
-            log(&format!("connecting to {} failed: {error}", config.path));
+            log_error(&format!("connecting to {}", config.path), &error);
             return ptr::null_mut();
         }
     };
@@ -113,6 +113,6 @@ unsafe extern "C" fn destroy(this: *mut ffi::plugin_t) {
     // Stop and join event callbacks before closing the shared session.
     drop(plugin.events);
     if let Err(error) = plugin.client.close() {
-        log(&error.to_string());
+        log_error("close_session", &error);
     }
 }

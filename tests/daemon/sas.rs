@@ -327,7 +327,7 @@ fn bulk_flush_reports_each_sa_once(daemon: Fixture, #[case] count: u32) {
     // Cross the periodic audit boundary: retirement must neither replay keys nor notify twice.
     std::thread::sleep(std::time::Duration::from_millis(5200));
     assert!(states().is_empty());
-    assert!(rpc.events().iter().all(|e| e.expiry.is_none()));
+    assert!(!rpc.events().iter().any(|e| matches!(e, Event::Expire(_))));
     rpc.close();
 }
 

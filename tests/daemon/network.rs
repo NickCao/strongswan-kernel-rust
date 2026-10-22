@@ -389,7 +389,14 @@ fn route_events_coalesce_without_losing_address_changes(daemon: Fixture, #[case]
     let mut events = Vec::new();
     eventually(|| {
         events.extend(rpc.events());
-        events.iter().any(|e| e.address_changed == Some(true))
+        events.iter().any(|e| {
+            matches!(
+                e,
+                Event::Roam {
+                    address_changed: true
+                }
+            )
+        })
     });
     assert!(
         events.len() < 50,

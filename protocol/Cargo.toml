@@ -10,6 +10,7 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 num_enum = "0.7.6"
 bitflags = { version = "2", features = ["serde"] }
+thiserror = "2"
 zeroize = "1.8"
 tarpc = { version = "0.38", features = ["serde-transport-bincode", "unix"] }
 tokio = { version = "1", features = ["rt", "net", "sync", "time", "io-util", "macros"] }

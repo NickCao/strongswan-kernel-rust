@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The watcher clears eventfd wakeups; cancellable pool jobs fetch events.
-use crate::{ffi, host, log};
+use crate::{ffi, host, log_error};
 use foreign_types::ForeignType;
 use kernel_rust_protocol::{
     self as api,
@@ -113,7 +113,7 @@ unsafe extern "C" fn notification_ready(
         }
         Ok(false) => (),
         Err(error) => {
-            log(&format!("reading eventfd: {error}"));
+            log_error("reading eventfd", &error);
             state.stop.cancel();
             return false;
         }
@@ -152,7 +152,7 @@ unsafe extern "C" fn receive_events(data: *mut libc::c_void) -> ffi::job_requeue
                 }
                 Ok(None) => state.stop.cancel(),
                 Err(error) => {
-                    log(&format!("receiving events: {error}"));
+                    log_error("next_events", &error);
                     state.stop.cancel();
                 }
             }
@@ -180,68 +180,60 @@ fn requeue(kind: ffi::job_requeue_type_t) -> ffi::job_requeue_t {
 fn dispatch(event: api::Event) {
     // The job runs on charon's workers while the kernel interface is alive.
     let kernel = unsafe { (*ffi::charon).kernel };
-    match event.kind {
-        api::EventKind::Expire => {
-            if let Some(e) = event.expiry {
-                if let Ok(dst) = host::Host::parse(&e.destination) {
-                    // SAFETY: the owned destination stays alive; the host clones
-                    // its borrowed event arguments if it needs to retain them.
-                    unsafe {
-                        (*kernel).expire.unwrap()(
-                            kernel,
-                            e.protocol,
-                            e.spi.to_be(),
-                            dst.as_ptr(),
-                            e.hard,
-                        );
-                    }
-                }
-            }
-        }
-        api::EventKind::Mapping => {
-            if let Some(e) = event.mapping {
-                if let (Ok(dst), Ok(remote)) = (
-                    host::Host::parse(&e.destination),
-                    host::Host::parse(&e.remote),
-                ) {
-                    // SAFETY: both privately owned C objects outlive this call.
-                    unsafe {
-                        (*kernel).mapping.unwrap()(
-                            kernel,
-                            libc::IPPROTO_ESP as u8,
-                            e.spi.to_be(),
-                            dst.as_ptr(),
-                            remote.as_ptr(),
-                        );
-                    }
-                }
-            }
-        }
-        api::EventKind::Acquire => {
-            if let Some(e) = event.acquire {
-                if let (Ok(src), Ok(dst)) =
-                    (host::Selector::parse(&e.src), host::Selector::parse(&e.dst))
-                {
-                    let mut data = ffi::kernel_acquire_data_t {
-                        src: src.as_ptr(),
-                        dst: dst.as_ptr(),
-                        label: ptr::null_mut(),
-                        cpu: ffi::CPU_ID_MAX,
-                        seq: e.sequence,
-                    };
-                    // SAFETY: selectors and the stack record outlive the call.
-                    unsafe {
-                        (*kernel).acquire.unwrap()(kernel, e.reqid, &mut data);
-                    }
-                }
-            }
-        }
-        api::EventKind::Roam => {
-            if let Some(address) = event.address_changed {
-                // SAFETY: the kernel interface remains live for this callback.
+    match event {
+        api::Event::Expire(e) => {
+            if let Ok(dst) = host::Host::parse(&e.destination) {
+                // SAFETY: the owned destination stays alive; the host clones
+                // its borrowed event arguments if it needs to retain them.
                 unsafe {
-                    (*kernel).roam.unwrap()(kernel, address);
+                    (*kernel).expire.unwrap()(
+                        kernel,
+                        e.protocol,
+                        e.spi.to_be(),
+                        dst.as_ptr(),
+                        e.hard,
+                    );
                 }
+            }
+        }
+        api::Event::Mapping(e) => {
+            if let (Ok(dst), Ok(remote)) = (
+                host::Host::parse(&e.destination),
+                host::Host::parse(&e.remote),
+            ) {
+                // SAFETY: both privately owned C objects outlive this call.
+                unsafe {
+                    (*kernel).mapping.unwrap()(
+                        kernel,
+                        libc::IPPROTO_ESP as u8,
+                        e.spi.to_be(),
+                        dst.as_ptr(),
+                        remote.as_ptr(),
+                    );
+                }
+            }
+        }
+        api::Event::Acquire(e) => {
+            if let (Ok(src), Ok(dst)) =
+                (host::Selector::parse(&e.src), host::Selector::parse(&e.dst))
+            {
+                let mut data = ffi::kernel_acquire_data_t {
+                    src: src.as_ptr(),
+                    dst: dst.as_ptr(),
+                    label: ptr::null_mut(),
+                    cpu: ffi::CPU_ID_MAX,
+                    seq: e.sequence,
+                };
+                // SAFETY: selectors and the stack record outlive the call.
+                unsafe {
+                    (*kernel).acquire.unwrap()(kernel, e.reqid, &mut data);
+                }
+            }
+        }
+        api::Event::Roam { address_changed } => {
+            // SAFETY: the kernel interface remains live for this callback.
+            unsafe {
+                (*kernel).roam.unwrap()(kernel, address_changed);
             }
         }
     }

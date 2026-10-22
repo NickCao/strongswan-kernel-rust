@@ -21,24 +21,27 @@ pub use enums::{
 };
 pub use flags::{AddressTypes, KernelFeatures};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum Error {
+    #[error("kernel operation failed: {}", std::io::Error::from_raw_os_error(*.0))]
     Kernel(i32),
+    #[error("access denied")]
     AccessDenied,
+    #[error("kernel session is already open")]
     SessionBusy,
+    #[error("kernel session is not active")]
     InvalidSession,
+    #[error("daemon operation failed: {0}")]
+    Failed(String),
 }
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
-        Self::Kernel(error.raw_os_error().unwrap_or(22))
+        match error.raw_os_error() {
+            Some(errno) => Self::Kernel(errno),
+            None => Self::Failed(error.to_string()),
+        }
     }
 }
-impl fmt::Display for Error {
-    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(out, "{self:?}")
-    }
-}
-impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,19 +282,11 @@ pub struct Mapping {
     pub remote: Endpoint,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EventKind {
-    Expire,
-    Acquire,
-    Mapping,
-    Roam,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Event {
-    pub kind: EventKind,
-    pub expiry: Option<Expiry>,
-    pub acquire: Option<Acquire>,
-    pub mapping: Option<Mapping>,
-    pub address_changed: Option<bool>,
+pub enum Event {
+    Expire(Expiry),
+    Acquire(Acquire),
+    Mapping(Mapping),
+    Roam { address_changed: bool },
 }
 
 #[tarpc::service]

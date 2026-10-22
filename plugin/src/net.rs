@@ -57,11 +57,12 @@ unsafe extern "C" fn get_source_addr(
     let operation = || -> Result<Host> {
         let destination = unsafe { host::endpoint(destination) }?;
         let source = unsafe { host::optional_endpoint(source) }?;
-        let address = this.client.call(this.client.rpc().get_source_address(
-            context::current(),
-            destination,
-            source,
-        ))?;
+        let address = this.client.call(
+            "get_source_address",
+            this.client
+                .rpc()
+                .get_source_address(context::current(), destination, source),
+        )?;
         Host::parse(&address)
     };
     operation().map_or(ptr::null_mut(), Host::into_ptr)
@@ -82,12 +83,12 @@ unsafe extern "C" fn get_nexthop(
     let operation = || -> Result<Host> {
         let destination = unsafe { host::endpoint(destination) }?;
         let source = unsafe { host::optional_endpoint(source) }?;
-        let reply = this.client.call(this.client.rpc().get_next_hop(
-            context::current(),
-            destination,
-            source,
-            Some(prefix),
-        ))?;
+        let reply = this.client.call(
+            "get_next_hop",
+            this.client
+                .rpc()
+                .get_next_hop(context::current(), destination, source, Some(prefix)),
+        )?;
         let host = Host::parse(&reply.gateway)?;
         if let Some(output) = interface {
             *output = host::duplicate(&reply.interface)?;
@@ -109,9 +110,10 @@ unsafe extern "C" fn get_interface(
     }
     let operation = || -> Result<()> {
         let address = unsafe { host::endpoint(address) }?;
-        let interface = this
-            .client
-            .call(this.client.rpc().get_interface(context::current(), address))?;
+        let interface = this.client.call(
+            "get_interface",
+            this.client.rpc().get_interface(context::current(), address),
+        )?;
         if let Some(output) = name {
             *output = host::duplicate(&interface)?;
         }
@@ -203,10 +205,13 @@ unsafe extern "C" fn create_address_enumerator(
 ) -> *mut ffi::enumerator_t {
     let this = unsafe { &*this.cast::<Net>() };
     let operation = || -> Result<Vec<Item>> {
-        let addresses = this.client.call(this.client.rpc().list_addresses(
-            context::current(),
-            api::AddressTypes::from_bits_retain(which),
-        ))?;
+        let addresses = this.client.call(
+            "list_addresses",
+            this.client.rpc().list_addresses(
+                context::current(),
+                api::AddressTypes::from_bits_retain(which),
+            ),
+        )?;
         if addresses.len() > 4096 {
             return Err(status_t_FAILED);
         }
@@ -229,9 +234,10 @@ unsafe extern "C" fn create_local_subnet_enumerator(
 ) -> *mut ffi::enumerator_t {
     let this = unsafe { &*this.cast::<Net>() };
     let operation = || -> Result<Vec<Item>> {
-        let subnets = this
-            .client
-            .call(this.client.rpc().list_subnets(context::current()))?;
+        let subnets = this.client.call(
+            "list_subnets",
+            this.client.rpc().list_subnets(context::current()),
+        )?;
         if subnets.len() > 4096 {
             return Err(status_t_FAILED);
         }

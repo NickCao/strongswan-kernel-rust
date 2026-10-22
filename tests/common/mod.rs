@@ -328,7 +328,10 @@ impl Rpc {
     pub fn expiries(&self, count: usize) -> Vec<Expiry> {
         let mut expiries = Vec::new();
         eventually(|| {
-            expiries.extend(self.events().into_iter().filter_map(|event| event.expiry));
+            expiries.extend(self.events().into_iter().filter_map(|event| match event {
+                Event::Expire(expiry) => Some(expiry),
+                _ => None,
+            }));
             expiries.len() >= count
         });
         assert_eq!(expiries.len(), count);

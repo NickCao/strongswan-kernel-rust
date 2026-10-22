@@ -481,7 +481,10 @@ fn acquire_events_preserve_packet_selectors(
     );
     let mut received = None;
     eventually(|| {
-        received = rpc.events().into_iter().find_map(|e| e.acquire);
+        received = rpc.events().into_iter().find_map(|e| match e {
+            Event::Acquire(acquire) => Some(acquire),
+            _ => None,
+        });
         received.is_some()
     });
     let acquire = received.unwrap();

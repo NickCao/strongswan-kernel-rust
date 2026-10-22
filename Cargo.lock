@@ -582,6 +582,7 @@ dependencies = [
  "serde",
  "tarpc",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-util",
  "zeroize",

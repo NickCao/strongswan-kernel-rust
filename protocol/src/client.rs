@@ -2,7 +2,6 @@
 //! Blocking RPCs driven directly by charon's calling threads.
 use crate::{self as api, notification::Notification, transport, KernelClient};
 use std::{
-    fmt,
     future::Future,
     io,
     net::Shutdown,
@@ -20,17 +19,23 @@ pub struct Config {
     pub path: String,
     pub session: api::SessionConfig,
 }
-#[derive(Debug)]
-pub struct Error {
-    pub errno: Option<i32>,
-    reason: &'static str,
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("kernel RPC connection is unavailable after an earlier failure")]
+    Unavailable,
+    #[error(transparent)]
+    Remote(#[from] api::Error),
+    #[error(transparent)]
+    Transport(#[from] RpcError),
 }
-impl fmt::Display for Error {
-    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(out, "{} ({:?})", self.reason, self.errno)
+impl Error {
+    pub fn errno(&self) -> Option<i32> {
+        match self {
+            Self::Remote(api::Error::Kernel(errno)) => Some(*errno),
+            _ => None,
+        }
     }
 }
-impl std::error::Error for Error {}
 pub struct Client {
     rpc: KernelClient,
     socket: UnixStream,
@@ -91,27 +96,14 @@ impl Client {
         call: impl Future<Output = Result<api::Result<T>, RpcError>>,
     ) -> Result<T, Error> {
         if self.failed.load(Ordering::Acquire) {
-            return Err(Error {
-                errno: None,
-                reason: "connection unavailable",
-            });
+            return Err(Error::Unavailable);
         }
         match self.runtime.block_on(call) {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => Err(Error {
-                errno: if let api::Error::Kernel(errno) = error {
-                    Some(errno)
-                } else {
-                    None
-                },
-                reason: "remote error",
-            }),
-            Err(_) => {
+            Ok(Err(error)) => Err(Error::Remote(error)),
+            Err(error) => {
                 self.fail();
-                Err(Error {
-                    errno: None,
-                    reason: "connection lost",
-                })
+                Err(Error::Transport(error))
             }
         }
     }

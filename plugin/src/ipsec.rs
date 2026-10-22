@@ -72,14 +72,12 @@ unsafe extern "C" fn get_spi(
                 host::setting_int(c"%s.spi_max", 0xcfffffff_u32 as i32) as u32,
             )
         };
-        let value = this.client.call(this.client.rpc().allocate_spi(
-            context::current(),
-            src,
-            dst,
-            protocol,
-            min,
-            max,
-        ))?;
+        let value = this.client.call(
+            "allocate_spi",
+            this.client
+                .rpc()
+                .allocate_spi(context::current(), src, dst, protocol, min, max),
+        )?;
         let spi = unsafe { spi.as_mut() }.ok_or(status_t_FAILED)?;
         if value < 256 {
             return Err(status_t_FAILED);
@@ -100,9 +98,10 @@ unsafe extern "C" fn get_cpi(
     status((|| -> Result<()> {
         let src = unsafe { host::endpoint(src) }?;
         let dst = unsafe { host::endpoint(dst) }?;
-        let value =
-            this.client
-                .call(this.client.rpc().allocate_cpi(context::current(), src, dst))?;
+        let value = this.client.call(
+            "allocate_cpi",
+            this.client.rpc().allocate_cpi(context::current(), src, dst),
+        )?;
         let cpi = unsafe { cpi.as_mut() }.ok_or(status_t_FAILED)?;
         *cpi = value.to_be();
         Ok(())
@@ -177,8 +176,10 @@ unsafe extern "C" fn add_sa(
             inbound: d.inbound,
             update: d.update,
         };
-        this.client
-            .call(this.client.rpc().install_sa(context::current(), id, config))?;
+        this.client.call(
+            "install_sa",
+            this.client.rpc().install_sa(context::current(), id, config),
+        )?;
         Ok(())
     };
     status(operation())
@@ -208,8 +209,10 @@ unsafe extern "C" fn update_sa(
             interface: unsafe { host::optional_string(d.interface) }?,
             inbound: d.inbound,
         };
-        this.client
-            .call(this.client.rpc().update_sa(context::current(), id, config))?;
+        this.client.call(
+            "update_sa",
+            this.client.rpc().update_sa(context::current(), id, config),
+        )?;
         Ok(())
     })())
 }
@@ -226,9 +229,10 @@ unsafe extern "C" fn query_sa(
     let operation = || -> Result<()> {
         let id = unsafe { sa_id(&*id) }?;
         let cpi = u16::from_be(unsafe { (*data).cpi });
-        let reply = this
-            .client
-            .call(this.client.rpc().query_sa(context::current(), id, cpi))?;
+        let reply = this.client.call(
+            "query_sa",
+            this.client.rpc().query_sa(context::current(), id, cpi),
+        )?;
         let last = last_use(reply.last_use)?;
         if let Some(output) = unsafe { bytes.as_mut() } {
             *output = reply.bytes;
@@ -253,8 +257,10 @@ unsafe extern "C" fn del_sa(
     let operation = || -> Result<()> {
         let id = unsafe { sa_id(&*id) }?;
         let cpi = u16::from_be(unsafe { (*data).cpi });
-        this.client
-            .call(this.client.rpc().remove_sa(context::current(), id, cpi))?;
+        this.client.call(
+            "remove_sa",
+            this.client.rpc().remove_sa(context::current(), id, cpi),
+        )?;
         Ok(())
     };
     status(operation())
@@ -263,7 +269,7 @@ unsafe extern "C" fn del_sa(
 unsafe extern "C" fn flush_sas(this: *mut ffi::kernel_ipsec_t) -> status_t {
     let this = unsafe { &*this.cast::<Ipsec>() };
     this.client
-        .empty(this.client.rpc().flush_sas(context::current()))
+        .empty("flush_sas", this.client.rpc().flush_sas(context::current()))
 }
 
 unsafe fn policy_id(id: &ffi::kernel_ipsec_policy_id_t) -> Result<api::PolicyId> {
@@ -325,6 +331,7 @@ unsafe extern "C" fn add_policy(
         let id = unsafe { policy_id(&*id) }?;
         let config = unsafe { policy_config(&*data) }?;
         this.client.call(
+            "install_policy",
             this.client
                 .rpc()
                 .install_policy(context::current(), id, config),
@@ -344,6 +351,7 @@ unsafe extern "C" fn del_policy(
         let id = unsafe { policy_id(&*id) }?;
         let config = unsafe { policy_config(&*data) }?;
         this.client.call(
+            "remove_policy",
             this.client
                 .rpc()
                 .remove_policy(context::current(), id, config),
@@ -362,10 +370,10 @@ unsafe extern "C" fn query_policy(
     let this = unsafe { &*this.cast::<Ipsec>() };
     let operation = || -> Result<()> {
         let id = unsafe { policy_id(&*id) }?;
-        let last = last_use(
-            this.client
-                .call(this.client.rpc().query_policy(context::current(), id))?,
-        )?;
+        let last = last_use(this.client.call(
+            "query_policy",
+            this.client.rpc().query_policy(context::current(), id),
+        )?)?;
         if let Some(output) = unsafe { time.as_mut() } {
             *output = last;
         }
@@ -376,8 +384,10 @@ unsafe extern "C" fn query_policy(
 
 unsafe extern "C" fn flush_policies(this: *mut ffi::kernel_ipsec_t) -> status_t {
     let this = unsafe { &*this.cast::<Ipsec>() };
-    this.client
-        .empty(this.client.rpc().flush_policies(context::current()))
+    this.client.empty(
+        "flush_policies",
+        this.client.rpc().flush_policies(context::current()),
+    )
 }
 
 unsafe extern "C" fn bypass_socket(this: *mut ffi::kernel_ipsec_t, fd: i32, family: i32) -> bool {
@@ -398,6 +408,7 @@ unsafe extern "C" fn bypass_socket(this: *mut ffi::kernel_ipsec_t, fd: i32, fami
     let Ok(port) = port else { return false };
     port >= 1024
         && this.client.empty(
+            "bypass_port",
             this.client
                 .rpc()
                 .bypass_port(context::current(), family as u16, port),

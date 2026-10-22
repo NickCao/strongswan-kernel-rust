@@ -29,11 +29,16 @@ carry the destination and optional source address.
 See [plugin/src/host.rs](plugin/src/host.rs) for the strongSwan setting names.
 
 Calls require an open, connected session on their own connection. A second
-session is rejected as busy. Application failures use `Kernel(errno)`,
-`InvalidSession` or `SessionBusy`; tarpc handles transport errors, request
-IDs, deadlines and cancellation.
+session is rejected as busy. Application failures retain kernel errno values,
+access/session errors or a `Failed(message)` for failures without an OS errno.
+The client preserves application and tarpc transport errors. Plugin logs include
+the operation and error chain; errno values determine strongSwan status codes.
+tarpc handles request IDs, deadlines and cancellation.
 
 ## Event delivery and runtime
+
+`Event` carries its payload in one of four variants: `Expire(Expiry)`,
+`Acquire(Acquire)`, `Mapping(Mapping)` or `Roam { address_changed: bool }`.
 
 The plugin shares one Tokio current-thread runtime. Synchronous C callbacks
 call `Runtime::block_on()` on charon's calling threads. Concurrent callers

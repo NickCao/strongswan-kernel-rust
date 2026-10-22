@@ -2,7 +2,7 @@
 use futures::StreamExt;
 use kernel_rust_protocol::{
     self as api,
-    client::{CancellationToken, Client, Config},
+    client::{CancellationToken, Client, Config, Error as ClientError},
     notification::Notification,
     *,
 };
@@ -20,6 +20,7 @@ use tarpc::{context::Context, server::Channel};
 
 struct State {
     captured: Mutex<Vec<Captured>>,
+    policy_error: Mutex<api::Error>,
     closes: AtomicUsize,
     query_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     hold_events: AtomicBool,
@@ -79,7 +80,7 @@ impl Kernel for Fake {
             .lock()
             .unwrap()
             .push(Captured::Policy(id, config));
-        Err(api::Error::Kernel(libc::EOPNOTSUPP))
+        Err(self.0.policy_error.lock().unwrap().clone())
     }
     async fn query_sa(self, _: Context, _id: SaId, cpi: u16) -> api::Result<SaUsage> {
         assert_eq!(cpi, u16::MAX);
@@ -131,6 +132,7 @@ impl Fixture {
         let notify = notifications.clone();
         let state = Arc::new(State {
             captured: Mutex::new(Vec::new()),
+            policy_error: Mutex::new(api::Error::Kernel(libc::EOPNOTSUPP)),
             closes: AtomicUsize::new(0),
             query_barrier: Mutex::new(None),
             hold_events: AtomicBool::new(false),
@@ -333,7 +335,7 @@ fn complete_native_inputs_and_unsigned_outputs_over_tarpc_uds(
             sa_config(selectors, optional),
         ))
         .unwrap_err();
-    assert_eq!(error.errno, Some(libc::EEXIST));
+    assert_eq!(error.errno(), Some(libc::EEXIST));
     assert_eq!(
         fixture.state.captured.lock().unwrap()[0],
         Captured::Sa(sa_id(), sa_config(selectors, optional))
@@ -365,39 +367,81 @@ fn complete_native_inputs_and_unsigned_outputs_over_tarpc_uds(
     assert_eq!(fixture.state.closes.load(Ordering::Relaxed), 1);
 }
 #[rstest]
-#[case::single_event(1)]
-#[case::large_batch(300)]
+#[case::kernel(api::Error::Kernel(libc::EOPNOTSUPP), Some(libc::EOPNOTSUPP))]
+#[case::access_denied(api::Error::AccessDenied, None)]
+#[case::busy(api::Error::SessionBusy, None)]
+#[case::invalid_session(api::Error::InvalidSession, None)]
+#[case::daemon_failure(api::Error::Failed("invalid Netlink reply".into()), None)]
+fn remote_errors_preserve_the_failure_without_disabling_control(
+    #[case] failure: api::Error,
+    #[case] errno: Option<i32>,
+) {
+    let fixture = Fixture::new();
+    *fixture.state.policy_error.lock().unwrap() = failure.clone();
+    let client = Client::connect(&fixture.config).unwrap();
+    let error = client
+        .request(
+            client
+                .rpc()
+                .install_policy(api::context::current(), policy_id(), policy_config()),
+        )
+        .unwrap_err();
+    assert_eq!(error.errno(), errno);
+    assert!(matches!(error, ClientError::Remote(actual) if actual == failure));
+    assert!(client
+        .request(
+            client
+                .rpc()
+                .query_sa(api::context::current(), sa_id(), u16::MAX)
+        )
+        .is_ok());
+    client.close().unwrap();
+}
+
+#[test]
+fn io_errors_retain_errno_or_the_original_failure_message() {
+    assert_eq!(
+        api::Error::from(std::io::Error::from_raw_os_error(libc::EACCES)),
+        api::Error::Kernel(libc::EACCES)
+    );
+    assert_eq!(
+        api::Error::from(std::io::Error::other("invalid Netlink reply")),
+        api::Error::Failed("invalid Netlink reply".into())
+    );
+}
+
+#[rstest]
+#[case::expiry(Event::Expire(Expiry {
+    protocol: 50,
+    spi: u32::MAX,
+    destination: endpoint(),
+    hard: true,
+}))]
+#[case::acquire(Event::Acquire(Acquire {
+    reqid: u32::MAX,
+    src: selector(),
+    dst: selector(),
+    sequence: u32::MAX,
+}))]
+#[case::mapping(Event::Mapping(Mapping {
+    spi: u32::MAX,
+    destination: endpoint(),
+    remote: Endpoint { port: 13000, ..endpoint() },
+}))]
+#[case::route_change(Event::Roam { address_changed: false })]
+#[case::address_change(Event::Roam { address_changed: true })]
 fn empty_and_large_batches_share_one_connection_and_disconnect_disables_control(
-    #[case] count: usize,
+    #[case] event: Event,
+    #[values(1, 300)] count: usize,
 ) {
     let fixture = Fixture::new();
     let client = Client::connect(&fixture.config).unwrap();
     let stop = CancellationToken::new();
     assert!(client.next_events(&stop).unwrap().unwrap().is_empty());
-    let event = Event {
-        kind: EventKind::Expire,
-        expiry: Some(Expiry {
-            protocol: 50,
-            spi: u32::MAX,
-            destination: endpoint(),
-            hard: true,
-        }),
-        acquire: None,
-        mapping: None,
-        address_changed: None,
-    };
-    fixture
-        .events
-        .blocking_send(vec![event.clone(); count])
-        .unwrap();
+    let expected = vec![event; count];
+    fixture.events.blocking_send(expected.clone()).unwrap();
     let batch = client.next_events(&stop).unwrap().unwrap();
-    assert_eq!(batch.len(), count);
-    for received in batch {
-        assert_eq!(
-            received.expiry.unwrap().destination,
-            event.expiry.as_ref().unwrap().destination
-        );
-    }
+    assert_eq!(batch, expected);
     assert!(client.next_events(&stop).unwrap().unwrap().is_empty());
     let socket = fixture
         .sockets
@@ -408,14 +452,18 @@ fn empty_and_large_batches_share_one_connection_and_disconnect_disables_control(
         "only one UDS connection"
     );
     socket.shutdown(std::net::Shutdown::Both).unwrap();
-    assert!(client.next_events(&stop).is_err());
-    assert!(client
-        .request(
+    assert!(matches!(
+        client.next_events(&stop),
+        Err(ClientError::Transport(_))
+    ));
+    assert!(matches!(
+        client.request(
             client
                 .rpc()
                 .query_sa(api::context::current(), sa_id(), u16::MAX)
-        )
-        .is_err());
+        ),
+        Err(ClientError::Unavailable)
+    ));
 }
 #[test]
 fn different_calling_threads_share_the_current_thread_runtime() {
@@ -451,12 +499,8 @@ fn eventfd_wakes_an_idle_client_without_periodic_event_rpcs() {
     assert_eq!(fixture.state.event_calls.load(Ordering::Relaxed), 0);
     fixture
         .events
-        .blocking_send(vec![Event {
-            kind: EventKind::Roam,
-            expiry: None,
-            acquire: None,
-            mapping: None,
-            address_changed: Some(true),
+        .blocking_send(vec![Event::Roam {
+            address_changed: true,
         }])
         .unwrap();
     fixture.notifications.notify().unwrap();
@@ -492,8 +536,12 @@ fn eventfd_wakes_an_idle_client_without_periodic_event_rpcs() {
         .next_events(&CancellationToken::new())
         .unwrap()
         .unwrap();
-    assert_eq!(batch.len(), 1);
-    assert_eq!(batch[0].address_changed, Some(true));
+    assert_eq!(
+        batch,
+        [Event::Roam {
+            address_changed: true
+        }]
+    );
     thread::sleep(Duration::from_millis(50));
     assert_eq!(fixture.state.event_calls.load(Ordering::Relaxed), 1);
     client.close().unwrap();
