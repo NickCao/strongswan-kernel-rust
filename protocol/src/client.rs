@@ -36,7 +36,7 @@ pub struct Client {
     socket: UnixStream,
     failed: AtomicBool,
     closing: AtomicBool,
-    features: u32,
+    features: api::KernelFeatures,
     notification: Notification,
     // Concurrent block_on calls are supported by Tokio. One caller owns the
     // current-thread scheduler/driver; other callers poll their own RPC futures.
@@ -77,7 +77,7 @@ impl Client {
     pub fn rpc(&self) -> &KernelClient {
         &self.rpc
     }
-    pub fn features(&self) -> u32 {
+    pub fn features(&self) -> api::KernelFeatures {
         self.features
     }
     pub fn notification(&self) -> &Notification {

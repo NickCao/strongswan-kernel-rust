@@ -1,25 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 use crate::error::invalid;
-pub use crate::rpc_api::{Endpoint, Mark, SaConfig, SessionConfig};
+pub use crate::rpc_api::{
+    DscpCopy, Endpoint, HwOffload, IpcompTransform, IpsecMode, Mark, PolicyDirection, PolicyKind,
+    PolicyPriority, SaConfig, SelectorKind, SessionConfig,
+};
 use ipnet::IpNet;
 use std::io;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TunnelMode {
-    Tunnel,
-    Iptfs,
-}
-impl TryFrom<u32> for TunnelMode {
-    type Error = io::Error;
-
-    fn try_from(mode: u32) -> io::Result<Self> {
-        match mode {
-            crate::rpc_api::mode::TUNNEL => Ok(Self::Tunnel),
-            crate::rpc_api::mode::IPTFS => Ok(Self::Iptfs),
-            _ => Err(crate::error::unsupported()),
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Ts {
@@ -96,7 +82,7 @@ impl SaId {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PolicyId {
-    pub dir: u8,
+    pub dir: PolicyDirection,
     pub src: Ts,
     pub dst: Ts,
     pub mark: Mark,
@@ -106,9 +92,9 @@ pub struct PolicyId {
 /// removal. Multiple references may share one installed policy during rekeying.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyData {
-    pub mode: TunnelMode,
-    pub kind: u8,
-    pub prio: u8,
+    pub mode: IpsecMode,
+    pub kind: PolicyKind,
+    pub prio: PolicyPriority,
     pub manual_prio: u32,
     pub src: Endpoint,
     pub dst: Endpoint,

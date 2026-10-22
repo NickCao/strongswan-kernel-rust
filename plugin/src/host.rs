@@ -307,7 +307,7 @@ impl SelectorRef {
             return Err(status_t_FAILED);
         }
         Ok(api::Selector {
-            kind: unsafe { (*ts).get_type.unwrap()(ts) },
+            kind: unsafe { (*ts).get_type.unwrap()(ts) }.into(),
             dynamic: unsafe { (*ts).is_dynamic.unwrap()(ts) },
             from,
             to,
@@ -336,11 +336,11 @@ pub fn duplicate(value: &str) -> Result<*mut libc::c_char> {
     }
 }
 
-pub unsafe fn algorithm(
+pub unsafe fn algorithm<Id: From<u16>>(
     id: u16,
     key: ffi::chunk_t,
     kind: ffi::transform_type_t,
-) -> Result<api::Algorithm> {
+) -> Result<api::Algorithm<Id>> {
     let mut name = ptr::null_mut();
     // SAFETY: the C callback keeps the host kernel interface alive.
     unsafe {
@@ -354,7 +354,7 @@ pub unsafe fn algorithm(
     };
     let bytes = unsafe { chunk_bytes(key) }?;
     Ok(api::Algorithm {
-        id,
+        id: id.into(),
         name,
         key: bytes.to_vec(),
     })

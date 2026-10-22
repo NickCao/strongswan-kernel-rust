@@ -50,7 +50,11 @@ fn install_policy_set(rpc: &Rpc, outer: Family) {
         );
         rpc.call(rpc.kernel.bypass_port(ctx(), inner.af(), 13000))
             .unwrap();
-        for direction in 0..3 {
+        for direction in [
+            PolicyDirection::Inbound,
+            PolicyDirection::Outbound,
+            PolicyDirection::Forward,
+        ] {
             rpc.call(rpc.kernel.install_policy(
                 ctx(),
                 inner.policy(direction),
@@ -63,6 +67,27 @@ fn install_policy_set(rpc: &Rpc, outer: Family) {
 }
 
 #[rstest]
+#[ignore = "requires root and iproute2; creates a network namespace"]
+fn rejects_unsupported_modes(
+    daemon: Fixture,
+    #[values(IpsecMode::Transport, IpsecMode::Other(u32::MAX))] mode: IpsecMode,
+) {
+    let rpc = daemon.session();
+    let mut config = policy_config(Family::V4, 0x10001);
+    config.sa.as_mut().unwrap().mode = mode;
+    assert_eq!(
+        rpc.call(rpc.kernel.install_policy(
+            ctx(),
+            Family::V4.policy(PolicyDirection::Outbound),
+            config
+        )),
+        Err(Error::Kernel(libc::EOPNOTSUPP))
+    );
+    assert!(inventory().is_empty() && owned_links().is_empty());
+    rpc.close();
+}
+
+#[rstest]
 #[case::wildcard(0, 0, (0, u16::MAX))]
 #[case::tcp_host_port(32, libc::IPPROTO_TCP as u8, (443, 443))]
 #[case::udp_port_range(24, libc::IPPROTO_UDP as u8, (1024, 2047))]
@@ -71,7 +96,12 @@ fn policy_selectors_and_flags(
     daemon: Fixture,
     #[values(Family::V4, Family::V6)] inner: Family,
     #[values(Family::V4, Family::V6)] outer: Family,
-    #[values(0, 1, 2)] direction: u32,
+    #[values(
+        PolicyDirection::Inbound,
+        PolicyDirection::Outbound,
+        PolicyDirection::Forward
+    )]
+    direction: PolicyDirection,
     #[case] prefix: u8,
     #[case] protocol: u8,
     #[case] ports: (u16, u16),
@@ -99,17 +129,27 @@ fn policy_selectors_and_flags(
     let (key, config_native) = native.iter().next().unwrap();
     assert_eq!(
         (key.src.prefix_len(), key.protocol, key.dir),
-        (prefix, protocol, direction as u8)
+        (prefix, protocol, direction)
     );
     assert_eq!(key.src_port, ports.0);
     assert_eq!(key.src_port | !key.src_port_mask, ports.1);
-    assert_eq!(config_native.forward_icmp, direction != 0);
+    assert_eq!(
+        config_native.forward_icmp,
+        direction != PolicyDirection::Inbound
+    );
     let template = config_native.template.as_ref().unwrap();
     assert_eq!(
         (template.src, template.dst),
         (outer.local().address, outer.peer().address)
     );
-    assert_eq!(template.spi, if direction == 1 { 0x10001 } else { 0 });
+    assert_eq!(
+        template.spi,
+        if direction == PolicyDirection::Outbound {
+            0x10001
+        } else {
+            0
+        }
+    );
     assert_eq!(rpc.call(rpc.kernel.query_policy(ctx(), id())).unwrap(), 0);
     assert!(
         owned_links().is_empty(),
@@ -135,7 +175,7 @@ fn icmp_code_specificity_controls_priority(
     let mut priorities = Vec::new();
     for code in [0, 1] {
         let id = || {
-            let mut id = family.policy(1);
+            let mut id = family.policy(PolicyDirection::Outbound);
             id.src.protocol = protocol as u8;
             id.src.from_port = icmp_type << 8 | code;
             id.src.to_port = id.src.from_port;
@@ -202,7 +242,7 @@ fn policy_repair_preserves_sas_and_bypasses(
         .iter()
         .find(|(key, _)| {
             key.if_id == 41
-                && key.dir == 1
+                && key.dir == PolicyDirection::Outbound
                 && key.src.addr().is_ipv4() == matches!(family, Family::V4)
         })
         .unwrap()
@@ -353,16 +393,17 @@ fn periodic_policy_audits_do_not_rewrite_or_resurrect_objects(
 fn repair_uses_surviving_rekey_reference(daemon: Fixture, #[case] count: u32) {
     let rpc = daemon.session();
     let family = Family::V4;
-    rpc.call(
-        rpc.kernel
-            .install_policy(ctx(), family.policy(1), policy_config(family, 0x10001)),
-    )
+    rpc.call(rpc.kernel.install_policy(
+        ctx(),
+        family.policy(PolicyDirection::Outbound),
+        policy_config(family, 0x10001),
+    ))
     .unwrap();
     let expected = inventory();
     for n in 0..count {
         rpc.call(rpc.kernel.install_policy(
             ctx(),
-            family.policy(1),
+            family.policy(PolicyDirection::Outbound),
             policy_config(family, 0x20000 + n),
         ))
         .unwrap();
@@ -381,7 +422,7 @@ fn repair_uses_surviving_rekey_reference(daemon: Fixture, #[case] count: u32) {
         ]);
         rpc.call(rpc.kernel.remove_policy(
             ctx(),
-            family.policy(1),
+            family.policy(PolicyDirection::Outbound),
             policy_config(family, 0x20000 + n),
         ))
         .unwrap();
@@ -412,8 +453,11 @@ fn acquire_events_preserve_packet_selectors(
     // A different reqid ensures traffic triggers acquisition instead of using the installed SA.
     let mut config = policy_config(family, 0);
     config.sa.as_mut().unwrap().reqid = 43;
-    rpc.call(rpc.kernel.install_policy(ctx(), family.policy(1), config))
-        .unwrap();
+    rpc.call(
+        rpc.kernel
+            .install_policy(ctx(), family.policy(PolicyDirection::Outbound), config),
+    )
+    .unwrap();
     let dst = family.destination();
     ip(&[
         "route",

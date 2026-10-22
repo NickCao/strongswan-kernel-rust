@@ -4,12 +4,6 @@ use crate::{error::invalid, model::*};
 use ipnet::IpNet;
 use std::{collections::HashMap, io, net::IpAddr};
 
-// strongSwan ipsec_types.h: API policy directions and kinds.
-const POLICY_IN: u8 = 0;
-const POLICY_OUT: u8 = 1;
-const POLICY_IPSEC: u8 = 1;
-const POLICY_DROP: u8 = 3;
-
 fn missing() -> io::Error {
     io::Error::from_raw_os_error(libc::ENOENT)
 }
@@ -25,7 +19,7 @@ pub struct PolicyKey {
     pub dst_port: u16,
     pub dst_port_mask: u16,
     pub protocol: u8,
-    pub dir: u8,
+    pub dir: PolicyDirection,
     pub mark: Mark,
     pub if_id: u32,
 }
@@ -65,15 +59,15 @@ impl PolicyKey {
 
     fn priority(&self, data: &PolicyData) -> (u32, u32) {
         let base = match data.prio {
-            0 => 200000,
-            3 => 600000,
+            PolicyPriority::Pass => 200000,
+            PolicyPriority::Fallback => 600000,
             _ => 400000,
         };
         let auto = base
             - (self.src.prefix_len() as u32 + self.dst.prefix_len() as u32) * 512
             - if self.protocol != 0 { 256 } else { 0 }
             - (self.src_port_mask.count_ones() + self.dst_port_mask.count_ones()) * 4
-            - u32::from(data.prio != 2);
+            - u32::from(data.prio != PolicyPriority::Routed);
         (
             if data.manual_prio == 0 {
                 auto
@@ -89,20 +83,22 @@ impl PolicyKey {
             id: self.clone(),
             config: PolicyConfig {
                 priority: self.priority(data).0,
-                block: data.kind == POLICY_DROP,
+                block: data.kind == PolicyKind::Drop,
                 forward_icmp: data.forward_icmp
-                    && data.kind == POLICY_IPSEC
-                    && self.dir != POLICY_IN,
-                template: (data.kind == POLICY_IPSEC && data.reqid != 0).then(|| PolicyTemplate {
-                    mode: data.mode,
-                    src: data.src.address,
-                    dst: data.dst.address,
-                    reqid: data.reqid,
-                    spi: if self.dir == POLICY_OUT {
-                        data.esp.unwrap_or(0)
-                    } else {
-                        0
-                    },
+                    && data.kind == PolicyKind::Ipsec
+                    && self.dir != PolicyDirection::Inbound,
+                template: (data.kind == PolicyKind::Ipsec && data.reqid != 0).then(|| {
+                    PolicyTemplate {
+                        mode: data.mode,
+                        src: data.src.address,
+                        dst: data.dst.address,
+                        reqid: data.reqid,
+                        spi: if self.dir == PolicyDirection::Outbound {
+                            data.esp.unwrap_or(0)
+                        } else {
+                            0
+                        },
+                    }
                 }),
             },
         }
@@ -113,7 +109,7 @@ impl PolicyKey {
 /// any matching SA (including overlapping inbound SAs during rekey).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyTemplate {
-    pub mode: TunnelMode,
+    pub mode: IpsecMode,
     pub src: IpAddr,
     pub dst: IpAddr,
     pub reqid: u32,
@@ -312,10 +308,10 @@ impl<K: PolicyKernel> Policies<K> {
             return Err(invalid());
         }
         let any = Endpoint::any(family)?;
-        for dir in [1, 0] {
+        for dir in [PolicyDirection::Outbound, PolicyDirection::Inbound] {
             let wildcard = Ts::from_subnet(any, 0, 17, 0, 65535)?;
             let specific = Ts::from_subnet(any, 0, 17, port, port)?;
-            let (src, dst) = if dir == 1 {
+            let (src, dst) = if dir == PolicyDirection::Outbound {
                 (specific, wildcard)
             } else {
                 (wildcard, specific)
@@ -331,9 +327,9 @@ impl<K: PolicyKernel> Policies<K> {
                 continue;
             }
             let data = PolicyData {
-                mode: TunnelMode::Tunnel,
-                kind: 2,
-                prio: 0,
+                mode: IpsecMode::Tunnel,
+                kind: PolicyKind::Pass,
+                prio: PolicyPriority::Pass,
                 manual_prio: 32,
                 src: any,
                 dst: any,
@@ -453,16 +449,16 @@ mod tests {
             PolicyId {
                 src: Ts::from_subnet(src, 0, 0, 0, u16::MAX).unwrap(),
                 dst: Ts::from_subnet(dst, 0, 0, 0, u16::MAX).unwrap(),
-                dir: 1,
+                dir: PolicyDirection::Outbound,
                 mark: Mark::default(),
                 if_id: 41,
             },
             PolicyData {
-                mode: TunnelMode::Tunnel,
+                mode: IpsecMode::Tunnel,
                 src,
                 dst,
-                kind: 1,
-                prio: 1,
+                kind: PolicyKind::Ipsec,
+                prio: PolicyPriority::Default,
                 manual_prio: 100,
                 reqid: 42,
                 policy_count: 2,
@@ -479,7 +475,7 @@ mod tests {
         let old_spec = key.spec(&old);
         let mut new = old.clone();
         new.esp = Some(0x10204);
-        new.mode = TunnelMode::Iptfs;
+        new.mode = IpsecMode::Iptfs;
         new.forward_icmp = true;
         let new_spec = key.spec(&new);
         let mut foreign = id.clone();

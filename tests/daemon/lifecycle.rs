@@ -41,7 +41,11 @@ fn populate(rpc: &Rpc) {
     for family in [Family::V4, Family::V6] {
         rpc.call(rpc.kernel.bypass_port(ctx(), family.af(), 13000))
             .unwrap();
-        for direction in 0..3 {
+        for direction in [
+            PolicyDirection::Inbound,
+            PolicyDirection::Outbound,
+            PolicyDirection::Forward,
+        ] {
             rpc.call(rpc.kernel.install_policy(
                 ctx(),
                 family.policy(direction),
@@ -141,7 +145,7 @@ fn session_is_connection_bound_and_clean_close_releases_it(
         active
             .call(active.kernel.install_policy(
                 ctx(),
-                Family::V4.policy(1),
+                Family::V4.policy(PolicyDirection::Outbound),
                 policy_config(Family::V4, 0x10001),
             ))
             .unwrap();
@@ -187,7 +191,7 @@ fn active_shutdown_cleans_the_namespace(
                 tarpc::Response<KernelResponse>,
                 tarpc::ClientMessage<KernelRequest>,
             > = transport::framed(socket);
-            let mut id = Family::V6.policy(1);
+            let mut id = Family::V6.policy(PolicyDirection::Outbound);
             id.interface_id = 99;
             outgoing
                 .send(tarpc::ClientMessage::Request(tarpc::Request {
@@ -468,8 +472,11 @@ fn unprivileged_socket_probe() {
             SaUsage::default()
         );
         assert_eq!(
-            rpc.call(rpc.kernel.query_policy(ctx(), Family::V4.policy(1)))
-                .unwrap(),
+            rpc.call(
+                rpc.kernel
+                    .query_policy(ctx(), Family::V4.policy(PolicyDirection::Outbound))
+            )
+            .unwrap(),
             0
         );
         for family in [Family::V4, Family::V6] {
@@ -488,7 +495,7 @@ fn unprivileged_socket_probe() {
             );
         }
         assert!(!rpc
-            .call(rpc.kernel.list_addresses(ctx(), 1))
+            .call(rpc.kernel.list_addresses(ctx(), AddressTypes::REGULAR))
             .unwrap()
             .is_empty());
         assert!(!rpc.call(rpc.kernel.list_subnets(ctx())).unwrap().is_empty());

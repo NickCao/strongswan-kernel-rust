@@ -64,10 +64,10 @@ impl Backend {
         let id = sa_id(id)?;
         // These checks used to run in the plugin. All options now arrive at
         // this boundary, even when the current backend does not support them.
-        if config.ipcomp != 0
+        if config.ipcomp != IpcompTransform::None
             || config.cpi != 0
             || config.security_label.is_some()
-            || config.hw_offload != 0
+            || config.hw_offload != HwOffload::No
             || config.cpu != u32::MAX
             || restricted_interface(config.interface.as_deref())
         {
@@ -75,7 +75,7 @@ impl Backend {
         }
         if config.lifetime.is_none()
             || config.replay_window > 4096 * 32
-            || !(0..=3).contains(&config.copy_dscp)
+            || matches!(config.copy_dscp, DscpCopy::Other(_))
             || config.reqid == 0
             || config.encryption.name.len() >= netlink_packet_xfrm::XFRM_ALG_NAME_LEN
             || config.integrity.name.len() >= netlink_packet_xfrm::XFRM_ALG_AUTH_NAME_LEN
@@ -119,9 +119,6 @@ impl Backend {
         self.policies.reconcile()
     }
 }
-fn number<T: TryFrom<u32>>(n: u32) -> io::Result<T> {
-    T::try_from(n).map_err(|_| invalid())
-}
 pub fn validate_endpoint(endpoint: Endpoint) -> io::Result<Endpoint> {
     std::net::SocketAddr::try_from(&endpoint).map_err(|_| invalid())?;
     Ok(endpoint)
@@ -146,7 +143,14 @@ pub fn sa_id(id: rpc::SaId) -> io::Result<SaId> {
 pub fn selector(s: rpc::Selector) -> io::Result<Ts> {
     let from = Endpoint::new(s.from, 0);
     let to = Endpoint::new(s.to, 0);
-    if s.dynamic || s.kind != if s.from.is_ipv4() { 7 } else { 8 } {
+    if s.dynamic
+        || s.kind
+            != if s.from.is_ipv4() {
+                SelectorKind::Ipv4Range
+            } else {
+                SelectorKind::Ipv6Range
+            }
+    {
         return Err(unsupported());
     }
     let ts = Ts {
@@ -177,7 +181,11 @@ pub fn selector(s: rpc::Selector) -> io::Result<Ts> {
 }
 pub fn rpc_selector(s: Ts) -> rpc::Selector {
     rpc::Selector {
-        kind: if s.from.address.is_ipv4() { 7 } else { 8 },
+        kind: if s.from.address.is_ipv4() {
+            SelectorKind::Ipv4Range
+        } else {
+            SelectorKind::Ipv6Range
+        },
         dynamic: false,
         from: s.from.address,
         to: s.to.address,
@@ -191,26 +199,34 @@ pub fn policy_id(p: rpc::PolicyId) -> io::Result<PolicyId> {
         return Err(unsupported());
     }
     let id = PolicyId {
-        dir: number(p.direction)?,
+        dir: p.direction,
         src: selector(p.src)?,
         dst: selector(p.dst)?,
         mark: p.mark,
         if_id: p.interface_id,
     };
-    if id.dir > 2 || id.if_id == 0 || id.src.from.family() != id.dst.from.family() {
+    if matches!(id.dir, PolicyDirection::Other(_))
+        || id.if_id == 0
+        || id.src.from.family() != id.dst.from.family()
+    {
         return Err(invalid());
     }
     Ok(id)
 }
 pub fn policy_config(p: rpc::PolicyConfig) -> io::Result<PolicyData> {
     let sa = p.sa.ok_or_else(unsupported)?;
-    if sa.ah.used || sa.ipcomp.transform != 0 || p.hw_offload != 0 || p.pcpu_acquires {
+    if !matches!(sa.mode, IpsecMode::Tunnel | IpsecMode::Iptfs)
+        || sa.ah.used
+        || sa.ipcomp.transform != IpcompTransform::None
+        || p.hw_offload != HwOffload::No
+        || p.pcpu_acquires
+    {
         return Err(unsupported());
     }
     let d = PolicyData {
-        mode: TunnelMode::try_from(sa.mode)?,
-        kind: number(p.kind)?,
-        prio: number(p.priority)?,
+        mode: sa.mode,
+        kind: p.kind,
+        prio: p.priority,
         manual_prio: p.manual_priority,
         // Policy references use addresses and ports, not IPv6 sockaddr metadata.
         src: policy_endpoint(p.src.ok_or_else(invalid)?)?,
@@ -220,10 +236,10 @@ pub fn policy_config(p: rpc::PolicyConfig) -> io::Result<PolicyData> {
         esp: sa.esp.used.then_some(sa.esp.spi),
         forward_icmp: p.forward_icmp,
     };
-    if !(1..=3).contains(&d.kind)
-        || d.prio > 3
+    if matches!(d.kind, PolicyKind::Other(_))
+        || matches!(d.prio, PolicyPriority::Other(_))
         || d.src.family() != d.dst.family()
-        || (d.kind == 1 && (d.reqid == 0 || d.esp.is_none()))
+        || (d.kind == PolicyKind::Ipsec && (d.reqid == 0 || d.esp.is_none()))
     {
         return Err(invalid());
     }
@@ -255,7 +271,11 @@ mod tests {
         #[case] valid: bool,
     ) {
         let input = rpc::Selector {
-            kind: if cidr.addr().is_ipv4() { 7 } else { 8 },
+            kind: if cidr.addr().is_ipv4() {
+                SelectorKind::Ipv4Range
+            } else {
+                SelectorKind::Ipv6Range
+            },
             dynamic: false,
             from: cidr.network(),
             to: cidr.broadcast(),
@@ -284,7 +304,11 @@ mod tests {
         #[case] valid: bool,
     ) {
         let input = rpc::Selector {
-            kind: if from.is_ipv4() { 7 } else { 8 },
+            kind: if from.is_ipv4() {
+                SelectorKind::Ipv4Range
+            } else {
+                SelectorKind::Ipv6Range
+            },
             dynamic: false,
             from,
             to,

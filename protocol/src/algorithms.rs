@@ -1,43 +1,79 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! strongSwan encryption/integrity IDs (crypter.h and signer.h). The standard
-//! values are IKE transform IDs; values >= 1024 are strongSwan private IDs.
-//! Netlink and rustix expose kernel constants, not these IKE identifiers.
+//! strongSwan encryption/integrity IDs (crypter.h and signer.h).
+use num_enum::{FromPrimitive, IntoPrimitive};
+use serde::{Deserialize, Serialize};
 
-pub mod encryption {
-    pub const DES: u16 = 2;
-    pub const TRIPLE_DES: u16 = 3;
-    pub const CAST: u16 = 6;
-    pub const BLOWFISH: u16 = 7;
-    pub const NULL: u16 = 11;
-    pub const AES_CBC: u16 = 12;
-    pub const AES_CTR: u16 = 13;
-    pub const AES_CCM_ICV8: u16 = 14;
-    pub const AES_CCM_ICV12: u16 = 15;
-    pub const AES_CCM_ICV16: u16 = 16;
-    pub const AES_GCM_ICV8: u16 = 18;
-    pub const AES_GCM_ICV12: u16 = 19;
-    pub const AES_GCM_ICV16: u16 = 20;
-    pub const NULL_AUTH_AES_GMAC: u16 = 21;
-    pub const CAMELLIA_CBC: u16 = 23;
-    pub const CHACHA20_POLY1305: u16 = 28;
-    pub const UNDEFINED: u16 = 1024;
-    pub const SERPENT_CBC: u16 = 1026;
-    pub const TWOFISH_CBC: u16 = 1027;
+/// Encryption transform IDs, including strongSwan private values.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, FromPrimitive, IntoPrimitive, Serialize, Deserialize,
+)]
+#[repr(u16)]
+#[serde(from = "u16", into = "u16")]
+pub enum EncryptionAlgorithm {
+    DesIv64 = 1,
+    Des = 2,
+    TripleDes = 3,
+    Rc5 = 4,
+    Idea = 5,
+    Cast = 6,
+    Blowfish = 7,
+    TripleIdea = 8,
+    DesIv32 = 9,
+    Null = 11,
+    AesCbc = 12,
+    AesCtr = 13,
+    AesCcmIcv8 = 14,
+    AesCcmIcv12 = 15,
+    AesCcmIcv16 = 16,
+    AesGcmIcv8 = 18,
+    AesGcmIcv12 = 19,
+    AesGcmIcv16 = 20,
+    NullAuthAesGmac = 21,
+    CamelliaCbc = 23,
+    CamelliaCtr = 24,
+    CamelliaCcmIcv8 = 25,
+    CamelliaCcmIcv12 = 26,
+    CamelliaCcmIcv16 = 27,
+    ChaCha20Poly1305 = 28,
+    Undefined = 1024,
+    DesEcb = 1025,
+    SerpentCbc = 1026,
+    TwofishCbc = 1027,
+    Rc2Cbc = 1028,
+    AesEcb = 1029,
+    AesCfb = 1030,
+    #[num_enum(catch_all)]
+    Other(u16),
 }
 
-pub mod integrity {
-    pub const HMAC_MD5_96: u16 = 1;
-    pub const HMAC_SHA1_96: u16 = 2;
-    pub const AES_XCBC_96: u16 = 5;
-    pub const HMAC_MD5_128: u16 = 6;
-    pub const HMAC_SHA1_160: u16 = 7;
-    pub const AES_CMAC_96: u16 = 8;
-    pub const HMAC_SHA2_256_128: u16 = 12;
-    pub const HMAC_SHA2_384_192: u16 = 13;
-    pub const HMAC_SHA2_512_256: u16 = 14;
-    pub const UNDEFINED: u16 = 1024;
-    pub const HMAC_SHA2_256_96: u16 = 1026;
-    pub const HMAC_SHA2_256_256: u16 = 1027;
-    pub const HMAC_SHA2_384_384: u16 = 1028;
-    pub const HMAC_SHA2_512_512: u16 = 1029;
+/// Integrity transform IDs, including strongSwan private values.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, FromPrimitive, IntoPrimitive, Serialize, Deserialize,
+)]
+#[repr(u16)]
+#[serde(from = "u16", into = "u16")]
+pub enum IntegrityAlgorithm {
+    HmacMd5Icv96 = 1,
+    HmacSha1Icv96 = 2,
+    DesMac = 3,
+    KpdkMd5 = 4,
+    AesXcbcIcv96 = 5,
+    HmacMd5Icv128 = 6,
+    HmacSha1Icv160 = 7,
+    AesCmacIcv96 = 8,
+    Aes128Gmac = 9,
+    Aes192Gmac = 10,
+    Aes256Gmac = 11,
+    HmacSha256Icv128 = 12,
+    HmacSha384Icv192 = 13,
+    HmacSha512Icv256 = 14,
+    Undefined = 1024,
+    HmacSha1Icv128 = 1025,
+    HmacSha256Icv96 = 1026,
+    HmacSha256Icv256 = 1027,
+    HmacSha384Icv384 = 1028,
+    HmacSha512Icv512 = 1029,
+    CamelliaXcbcIcv96 = 1030,
+    #[num_enum(catch_all)]
+    Other(u16),
 }

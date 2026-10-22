@@ -7,7 +7,7 @@ use super::{
     netlink::{Message, Netlink, NlFamily, NlmF, Reply},
     policy::LinuxPolicies,
 };
-use crate::rpc_api::algorithms::{encryption as enc, integrity as auth};
+use crate::rpc_api::{DscpCopy, EncryptionAlgorithm, IntegrityAlgorithm, KernelFeatures};
 use crate::sa::{is_missing, ObservedSa, SaHandle as _, SaKernel, SaSpec, SaState, SaUsage, Sas};
 use crate::{backend::rpc_selector, error::invalid, model::*, policy::Policies, rpc_api as rpc};
 use netlink_packet_core::{DefaultNla, Emitable, Nla, NlasIterator, Parseable};
@@ -19,13 +19,6 @@ use std::io;
 // until it has a dedicated variant. Values are XFRM_SA_DIR_IN/OUT.
 const SA_DIR: u16 = 33;
 pub const NEWSA: u16 = packet::XFRM_MSG_NEWSA;
-
-// kernel_feature_t from strongSwan's kernel_interface.h.
-const KERNEL_ESP_V3_TFC: u32 = 1 << 0;
-const KERNEL_REQUIRE_UDP_ENCAPSULATION: u32 = 1 << 2;
-const KERNEL_POLICY_SPI: u32 = 1 << 4;
-const KERNEL_SA_USE_TIME: u32 = 1 << 5;
-const KERNEL_ACQUIRE_SEQ: u32 = 1 << 6;
 
 pub(super) fn missing() -> io::Error {
     io::Error::from_raw_os_error(libc::ENOENT)
@@ -130,44 +123,44 @@ fn algorithm(name: &str) -> io::Result<[u8; packet::XFRM_ALG_NAME_LEN]> {
     bytes[..name.len()].copy_from_slice(name.as_bytes());
     Ok(bytes)
 }
-fn enc_algorithm(id: u16) -> Option<(&'static str, Option<u32>)> {
+fn enc_algorithm(id: EncryptionAlgorithm) -> Option<(&'static str, Option<u32>)> {
     Some(match id {
-        enc::DES => ("des", None),
-        enc::TRIPLE_DES => ("des3_ede", None),
-        enc::CAST => ("cast5", None),
-        enc::BLOWFISH => ("blowfish", None),
-        enc::NULL => ("cipher_null", None),
-        enc::AES_CBC => ("cbc(aes)", None),
-        enc::AES_CTR => ("rfc3686(ctr(aes))", None),
-        enc::AES_CCM_ICV8 => ("rfc4309(ccm(aes))", Some(64)),
-        enc::AES_CCM_ICV12 => ("rfc4309(ccm(aes))", Some(96)),
-        enc::AES_CCM_ICV16 => ("rfc4309(ccm(aes))", Some(128)),
-        enc::AES_GCM_ICV8 => ("rfc4106(gcm(aes))", Some(64)),
-        enc::AES_GCM_ICV12 => ("rfc4106(gcm(aes))", Some(96)),
-        enc::AES_GCM_ICV16 => ("rfc4106(gcm(aes))", Some(128)),
-        enc::NULL_AUTH_AES_GMAC => ("rfc4543(gcm(aes))", Some(128)),
-        enc::CAMELLIA_CBC => ("cbc(camellia)", None),
-        enc::CHACHA20_POLY1305 => ("rfc7539esp(chacha20,poly1305)", Some(128)),
-        enc::SERPENT_CBC => ("serpent", None),
-        enc::TWOFISH_CBC => ("twofish", None),
+        EncryptionAlgorithm::Des => ("des", None),
+        EncryptionAlgorithm::TripleDes => ("des3_ede", None),
+        EncryptionAlgorithm::Cast => ("cast5", None),
+        EncryptionAlgorithm::Blowfish => ("blowfish", None),
+        EncryptionAlgorithm::Null => ("cipher_null", None),
+        EncryptionAlgorithm::AesCbc => ("cbc(aes)", None),
+        EncryptionAlgorithm::AesCtr => ("rfc3686(ctr(aes))", None),
+        EncryptionAlgorithm::AesCcmIcv8 => ("rfc4309(ccm(aes))", Some(64)),
+        EncryptionAlgorithm::AesCcmIcv12 => ("rfc4309(ccm(aes))", Some(96)),
+        EncryptionAlgorithm::AesCcmIcv16 => ("rfc4309(ccm(aes))", Some(128)),
+        EncryptionAlgorithm::AesGcmIcv8 => ("rfc4106(gcm(aes))", Some(64)),
+        EncryptionAlgorithm::AesGcmIcv12 => ("rfc4106(gcm(aes))", Some(96)),
+        EncryptionAlgorithm::AesGcmIcv16 => ("rfc4106(gcm(aes))", Some(128)),
+        EncryptionAlgorithm::NullAuthAesGmac => ("rfc4543(gcm(aes))", Some(128)),
+        EncryptionAlgorithm::CamelliaCbc => ("cbc(camellia)", None),
+        EncryptionAlgorithm::ChaCha20Poly1305 => ("rfc7539esp(chacha20,poly1305)", Some(128)),
+        EncryptionAlgorithm::SerpentCbc => ("serpent", None),
+        EncryptionAlgorithm::TwofishCbc => ("twofish", None),
         _ => return None,
     })
 }
-fn int_algorithm(id: u16) -> Option<(&'static str, Option<u32>)> {
+fn int_algorithm(id: IntegrityAlgorithm) -> Option<(&'static str, Option<u32>)> {
     Some(match id {
-        auth::HMAC_MD5_96 => ("md5", None),
-        auth::HMAC_SHA1_96 => ("sha1", None),
-        auth::AES_XCBC_96 => ("xcbc(aes)", Some(96)),
-        auth::HMAC_MD5_128 => ("hmac(md5)", Some(128)),
-        auth::HMAC_SHA1_160 => ("hmac(sha1)", Some(160)),
-        auth::AES_CMAC_96 => ("cmac(aes)", Some(96)),
-        auth::HMAC_SHA2_256_128 => ("hmac(sha256)", Some(128)),
-        auth::HMAC_SHA2_384_192 => ("hmac(sha384)", Some(192)),
-        auth::HMAC_SHA2_512_256 => ("hmac(sha512)", Some(256)),
-        auth::HMAC_SHA2_256_96 => ("sha256", None),
-        auth::HMAC_SHA2_256_256 => ("hmac(sha256)", Some(256)),
-        auth::HMAC_SHA2_384_384 => ("hmac(sha384)", Some(384)),
-        auth::HMAC_SHA2_512_512 => ("hmac(sha512)", Some(512)),
+        IntegrityAlgorithm::HmacMd5Icv96 => ("md5", None),
+        IntegrityAlgorithm::HmacSha1Icv96 => ("sha1", None),
+        IntegrityAlgorithm::AesXcbcIcv96 => ("xcbc(aes)", Some(96)),
+        IntegrityAlgorithm::HmacMd5Icv128 => ("hmac(md5)", Some(128)),
+        IntegrityAlgorithm::HmacSha1Icv160 => ("hmac(sha1)", Some(160)),
+        IntegrityAlgorithm::AesCmacIcv96 => ("cmac(aes)", Some(96)),
+        IntegrityAlgorithm::HmacSha256Icv128 => ("hmac(sha256)", Some(128)),
+        IntegrityAlgorithm::HmacSha384Icv192 => ("hmac(sha384)", Some(192)),
+        IntegrityAlgorithm::HmacSha512Icv256 => ("hmac(sha512)", Some(256)),
+        IntegrityAlgorithm::HmacSha256Icv96 => ("sha256", None),
+        IntegrityAlgorithm::HmacSha256Icv256 => ("hmac(sha256)", Some(256)),
+        IntegrityAlgorithm::HmacSha384Icv384 => ("hmac(sha384)", Some(384)),
+        IntegrityAlgorithm::HmacSha512Icv512 => ("hmac(sha512)", Some(512)),
         _ => return None,
     })
 }
@@ -195,12 +188,16 @@ impl LinuxSas {
             iptfs,
         })
     }
-    fn feature_flags(&self) -> u32 {
-        KERNEL_ESP_V3_TFC
-            | KERNEL_REQUIRE_UDP_ENCAPSULATION
-            | KERNEL_POLICY_SPI
-            | KERNEL_ACQUIRE_SEQ
-            | if self.lastused { KERNEL_SA_USE_TIME } else { 0 }
+    fn feature_flags(&self) -> KernelFeatures {
+        KernelFeatures::ESP_V3_TFC
+            | KernelFeatures::REQUIRE_UDP_ENCAPSULATION
+            | KernelFeatures::POLICY_SPI
+            | KernelFeatures::ACQUIRE_SEQ
+            | if self.lastused {
+                KernelFeatures::SA_USE_TIME
+            } else {
+                KernelFeatures::empty()
+            }
     }
     fn allocate_spi(
         &mut self,
@@ -252,8 +249,8 @@ impl LinuxSas {
         Err(invalid())
     }
     fn sa_message(&self, id: &SaId, data: &SaConfig) -> io::Result<XfrmMessage> {
-        let mode = TunnelMode::try_from(data.mode)?;
-        if mode == TunnelMode::Iptfs && data.tfc != 0 {
+        let mode = iptfs::mode(data.mode)?;
+        if data.mode == IpsecMode::Iptfs && data.tfc != 0 {
             return Err(unsupported());
         }
         // strongSwan has already jittered the rekey limits. Tunnel selectors
@@ -266,7 +263,7 @@ impl LinuxSas {
         if data.inbound && data.forward_icmp {
             flags |= packet::XFRM_STATE_ICMP;
         }
-        if data.inbound && [1, 2].contains(&data.copy_dscp) {
+        if data.inbound && matches!(data.copy_dscp, DscpCopy::InOnly | DscpCopy::Yes) {
             flags |= packet::XFRM_STATE_DECAP_DSCP;
         }
         if !data.inbound && !data.copy_df {
@@ -288,7 +285,7 @@ impl LinuxSas {
                 proto: id.proto,
             },
             family: id.src.family(),
-            mode: iptfs::mode(mode),
+            mode,
             reqid: data.reqid,
             seq: data.acquire_sequence,
             flags,
@@ -309,7 +306,7 @@ impl LinuxSas {
             ..Default::default()
         };
         let mut nlas = Vec::new();
-        if data.encryption.id != enc::UNDEFINED {
+        if data.encryption.id != EncryptionAlgorithm::Undefined {
             let (name, icv) = enc_algorithm(data.encryption.id)
                 .or_else(|| {
                     (!data.encryption.name.is_empty())
@@ -333,7 +330,7 @@ impl LinuxSas {
                 }),
             });
         }
-        if data.integrity.id != auth::UNDEFINED {
+        if data.integrity.id != IntegrityAlgorithm::Undefined {
             let (name, trunc) = int_algorithm(data.integrity.id)
                 .or_else(|| {
                     (!data.integrity.name.is_empty())
@@ -384,14 +381,14 @@ impl LinuxSas {
                 bmp,
             }));
         }
-        if !data.inbound && [1, 3].contains(&data.copy_dscp) {
+        if !data.inbound && matches!(data.copy_dscp, DscpCopy::InOnly | DscpCopy::No) {
             nlas.push(Attr::ExtraFlags(packet::XFRM_SA_XFLAG_DONT_ENCAP_DSCP));
         }
         nlas.extend(id_attrs(id.mark, id.if_id));
         if self.sa_dir {
             nlas.push(direction(data.inbound));
         }
-        if mode == TunnelMode::Iptfs {
+        if data.mode == IpsecMode::Iptfs {
             nlas.extend(iptfs::attributes(
                 &self.iptfs,
                 data.inbound,
@@ -553,7 +550,7 @@ fn native_request(id: &SaId) -> packet::state::DelGetMessage {
 impl SaKernel for LinuxSas {
     type Handle = SaHandle;
     type Config = Configuration;
-    fn features(&self) -> u32 {
+    fn features(&self) -> KernelFeatures {
         self.feature_flags()
     }
     fn allocate(

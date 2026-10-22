@@ -9,14 +9,17 @@ pub use tarpc::{client::RpcError, context};
 pub mod algorithms;
 pub mod client;
 mod endpoint;
+mod enums;
+mod flags;
 pub mod notification;
 pub mod transport;
 
-/// strongSwan ipsec_types.h values, distinct from Linux XFRM mode numbers.
-pub mod mode {
-    pub const TUNNEL: u32 = 2;
-    pub const IPTFS: u32 = 6;
-}
+pub use algorithms::{EncryptionAlgorithm, IntegrityAlgorithm};
+pub use enums::{
+    DscpCopy, HwOffload, IpcompTransform, IpsecMode, PolicyDirection, PolicyKind, PolicyPriority,
+    SelectorKind,
+};
+pub use flags::{AddressTypes, KernelFeatures};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Error {
@@ -81,7 +84,7 @@ impl SessionConfig {
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
-    pub features: u32,
+    pub features: KernelFeatures,
 }
 
 // SocketAddr's Serde representation drops IPv6 sockaddr metadata. Preserve
@@ -102,7 +105,7 @@ pub struct Mark {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selector {
-    pub kind: u32,
+    pub kind: SelectorKind,
     pub dynamic: bool,
     pub from: IpAddr,
     pub to: IpAddr,
@@ -120,12 +123,12 @@ pub struct SaId {
     pub interface_id: u32,
 }
 #[derive(PartialEq, Eq, Serialize, Deserialize)]
-pub struct Algorithm {
-    pub id: u16,
+pub struct Algorithm<Id> {
+    pub id: Id,
     pub name: String,
     pub key: Vec<u8>,
 }
-impl fmt::Debug for Algorithm {
+impl<Id: fmt::Debug> fmt::Debug for Algorithm<Id> {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         out.debug_struct("Algorithm")
             .field("id", &self.id)
@@ -133,7 +136,7 @@ impl fmt::Debug for Algorithm {
             .finish_non_exhaustive()
     }
 }
-impl Drop for Algorithm {
+impl<Id> Drop for Algorithm<Id> {
     fn drop(&mut self) {
         zeroize::Zeroize::zeroize(&mut self.key);
     }
@@ -154,18 +157,18 @@ pub struct Lifetime {
 pub struct SaConfig {
     pub reqid: u32,
     pub acquire_sequence: u32,
-    pub mode: u32,
+    pub mode: IpsecMode,
     pub src_selectors: Option<Vec<Selector>>,
     pub dst_selectors: Option<Vec<Selector>>,
     pub interface: Option<String>,
-    pub encryption: Algorithm,
-    pub integrity: Algorithm,
+    pub encryption: Algorithm<EncryptionAlgorithm>,
+    pub integrity: Algorithm<IntegrityAlgorithm>,
     pub lifetime: Option<Lifetime>,
     pub replay_window: u32,
-    pub ipcomp: u16,
+    pub ipcomp: IpcompTransform,
     pub cpi: u16,
     pub cpu: u32,
-    pub hw_offload: u32,
+    pub hw_offload: HwOffload,
     pub security_label: Option<Vec<u8>>,
     pub esn: bool,
     pub udp_encapsulation: bool,
@@ -173,7 +176,7 @@ pub struct SaConfig {
     pub tfc: u32,
     pub copy_df: bool,
     pub copy_ecn: bool,
-    pub copy_dscp: u32,
+    pub copy_dscp: DscpCopy,
     pub iptfs_dont_fragment: bool,
     pub forward_icmp: bool,
     pub initiator: bool,
@@ -182,7 +185,7 @@ pub struct SaConfig {
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SaUpdate {
-    pub mode: u32,
+    pub mode: IpsecMode,
     pub cpi: u16,
     pub src: Endpoint,
     pub dst: Endpoint,
@@ -190,7 +193,7 @@ pub struct SaUpdate {
     pub new_udp_encapsulation: bool,
     pub old_reqid: u32,
     pub new_reqid: u32,
-    pub hw_offload: u32,
+    pub hw_offload: HwOffload,
     pub src_selectors: Option<Vec<Selector>>,
     pub dst_selectors: Option<Vec<Selector>>,
     pub interface: Option<String>,
@@ -205,7 +208,7 @@ pub struct SaUsage {
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyId {
-    pub direction: u32,
+    pub direction: PolicyDirection,
     pub src: Selector,
     pub dst: Selector,
     pub mark: Mark,
@@ -220,12 +223,12 @@ pub struct ProtocolSa {
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompressionSa {
-    pub transform: u16,
+    pub transform: IpcompTransform,
     pub cpi: u16,
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicySa {
-    pub mode: u32,
+    pub mode: IpsecMode,
     pub reqid: u32,
     pub policy_count: u32,
     pub esp: ProtocolSa,
@@ -234,10 +237,10 @@ pub struct PolicySa {
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyConfig {
-    pub kind: u32,
-    pub priority: u32,
+    pub kind: PolicyKind,
+    pub priority: PolicyPriority,
     pub manual_priority: u32,
-    pub hw_offload: u32,
+    pub hw_offload: HwOffload,
     pub pcpu_acquires: bool,
     pub forward_icmp: bool,
     pub src: Option<Endpoint>,
@@ -325,6 +328,6 @@ pub trait Kernel {
         prefix: Option<i32>,
     ) -> Result<NextHop>;
     async fn get_interface(address: Endpoint) -> Result<String>;
-    async fn list_addresses(which: u32) -> Result<Vec<Endpoint>>;
+    async fn list_addresses(which: AddressTypes) -> Result<Vec<Endpoint>>;
     async fn list_subnets() -> Result<Vec<Subnet>>;
 }

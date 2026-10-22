@@ -2,7 +2,7 @@
 // Network semantics ported from kernel_netlink_net.c, Copyright secunet
 // Security Networks AG, Martin Willi, Tobias Brunner and contributors.
 use super::netlink::{Message, Netlink, NlFamily, NlmF};
-use crate::{error::invalid, model::*};
+use crate::{error::invalid, model::*, rpc_api::AddressTypes};
 use netlink_packet_core::ParseableParametrized;
 use netlink_packet_route::{
     address::{AddressAttribute, AddressFlags, AddressMessage, AddressScope},
@@ -11,12 +11,6 @@ use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
 };
 use std::{io, sync::Arc};
-
-// kernel_address_type_t: DOWN and IGNORED permit additional interfaces;
-// REGULAR still selects their non-virtual addresses.
-const ADDR_TYPE_REGULAR: u32 = 1 << 0;
-const ADDR_TYPE_DOWN: u32 = 1 << 1;
-const ADDR_TYPE_IGNORED: u32 = 1 << 2;
 
 #[derive(Clone, Debug)]
 pub struct Link {
@@ -209,8 +203,8 @@ impl Network {
         }
         Ok(out)
     }
-    pub fn enumerate(&mut self, which: u32) -> io::Result<Vec<Endpoint>> {
-        if which & ADDR_TYPE_REGULAR == 0 {
+    pub fn enumerate(&mut self, which: AddressTypes) -> io::Result<Vec<Endpoint>> {
+        if !which.contains(AddressTypes::REGULAR) {
             return Ok(Vec::new());
         }
         let snapshot = self.snapshot()?;
@@ -233,8 +227,8 @@ impl Network {
                 {
                     return false;
                 }
-                (self.config.usable(&link.name) || which & ADDR_TYPE_IGNORED != 0)
-                    && (link.flags.contains(LinkFlags::Up) || which & ADDR_TYPE_DOWN != 0)
+                (self.config.usable(&link.name) || which.contains(AddressTypes::IGNORED))
+                    && (link.flags.contains(LinkFlags::Up) || which.contains(AddressTypes::DOWN))
             })
             .map(|a| a.host)
             .collect())

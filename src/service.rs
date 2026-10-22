@@ -605,7 +605,11 @@ impl Kernel for Service {
     async fn get_interface(self, _: tarpc::context::Context, address: Endpoint) -> Result<String> {
         self.request(|backend| backend.net.interface(&backend::validate_endpoint(address)?))
     }
-    async fn list_addresses(self, _: tarpc::context::Context, which: u32) -> Result<Vec<Endpoint>> {
+    async fn list_addresses(
+        self,
+        _: tarpc::context::Context,
+        which: AddressTypes,
+    ) -> Result<Vec<Endpoint>> {
         self.request(|backend| backend.net.enumerate(which))
     }
     async fn list_subnets(self, _: tarpc::context::Context) -> Result<Vec<Subnet>> {

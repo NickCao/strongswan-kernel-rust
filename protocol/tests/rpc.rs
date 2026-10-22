@@ -43,7 +43,9 @@ macro_rules! unsupported {
 impl Kernel for Fake {
     async fn open_session(self, _: Context, config: SessionConfig) -> api::Result<SessionInfo> {
         assert_eq!(config.interfaces_use, "eth0");
-        Ok(SessionInfo { features: 4 })
+        Ok(SessionInfo {
+            features: KernelFeatures::REQUIRE_UDP_ENCAPSULATION,
+        })
     }
     async fn close_session(self, _: Context) -> api::Result<()> {
         self.0.closes.fetch_add(1, Ordering::Relaxed);
@@ -104,7 +106,7 @@ impl Kernel for Fake {
         get_source_address(_destination: Endpoint, _source: Option<Endpoint>) -> Endpoint;
         get_next_hop(_destination: Endpoint, _source: Option<Endpoint>, _prefix: Option<i32>) -> NextHop;
         get_interface(_address: Endpoint) -> String;
-        list_addresses(_which: u32) -> Vec<Endpoint>;
+        list_addresses(_which: AddressTypes) -> Vec<Endpoint>;
         list_subnets() -> Vec<Subnet>;
     }
 }
@@ -213,7 +215,7 @@ fn sa_id() -> SaId {
 }
 fn selector() -> Selector {
     Selector {
-        kind: u32::MAX,
+        kind: SelectorKind::Other(u32::MAX),
         dynamic: true,
         from: "::".parse().unwrap(),
         to: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
@@ -231,17 +233,17 @@ fn sa_config(selectors: bool, optional: bool) -> SaConfig {
     SaConfig {
         reqid: u32::MAX,
         acquire_sequence: u32::MAX,
-        mode: u32::MAX,
+        mode: IpsecMode::Other(u32::MAX),
         src_selectors: selectors.then(|| vec![selector()]),
         dst_selectors: selectors.then(Vec::new),
         interface: optional.then(String::new),
         encryption: Algorithm {
-            id: u16::MAX,
+            id: EncryptionAlgorithm::Other(u16::MAX),
             name: "future-cipher".into(),
             key: vec![0, 128, 255],
         },
         integrity: Algorithm {
-            id: u16::MAX - 1,
+            id: IntegrityAlgorithm::Other(u16::MAX - 1),
             name: "future-auth".into(),
             key: vec![255, 0, 254],
         },
@@ -251,10 +253,10 @@ fn sa_config(selectors: bool, optional: bool) -> SaConfig {
             packets: limit(),
         }),
         replay_window: u32::MAX,
-        ipcomp: u16::MAX,
+        ipcomp: IpcompTransform::Other(u16::MAX),
         cpi: u16::MAX,
         cpu: u32::MAX - 1,
-        hw_offload: u32::MAX,
+        hw_offload: HwOffload::Other(u32::MAX),
         security_label: optional.then(|| vec![0, 255, 128]),
         esn: true,
         udp_encapsulation: true,
@@ -265,7 +267,7 @@ fn sa_config(selectors: bool, optional: bool) -> SaConfig {
         tfc: u32::MAX,
         copy_df: false,
         copy_ecn: true,
-        copy_dscp: u32::MAX,
+        copy_dscp: DscpCopy::Other(u32::MAX),
         iptfs_dont_fragment: true,
         forward_icmp: true,
         initiator: true,
@@ -275,7 +277,7 @@ fn sa_config(selectors: bool, optional: bool) -> SaConfig {
 }
 fn policy_id() -> PolicyId {
     PolicyId {
-        direction: u32::MAX,
+        direction: PolicyDirection::Other(u32::MAX),
         src: selector(),
         dst: selector(),
         mark: Mark {
@@ -289,16 +291,16 @@ fn policy_id() -> PolicyId {
 }
 fn policy_config() -> PolicyConfig {
     PolicyConfig {
-        kind: u32::MAX,
-        priority: u32::MAX,
+        kind: PolicyKind::Other(u32::MAX),
+        priority: PolicyPriority::Other(u32::MAX),
         manual_priority: u32::MAX,
-        hw_offload: u32::MAX,
+        hw_offload: HwOffload::Other(u32::MAX),
         pcpu_acquires: true,
         forward_icmp: true,
         src: Some(endpoint()),
         dst: Some(endpoint()),
         sa: Some(PolicySa {
-            mode: u32::MAX,
+            mode: IpsecMode::Other(u32::MAX),
             reqid: u32::MAX,
             policy_count: u32::MAX,
             esp: ProtocolSa {
@@ -310,7 +312,7 @@ fn policy_config() -> PolicyConfig {
                 spi: u32::MAX - 1,
             },
             ipcomp: CompressionSa {
-                transform: u16::MAX,
+                transform: IpcompTransform::Other(u16::MAX),
                 cpi: u16::MAX,
             },
         }),
@@ -323,7 +325,7 @@ fn complete_native_inputs_and_unsigned_outputs_over_tarpc_uds(
 ) {
     let fixture = Fixture::new();
     let client = Client::connect(&fixture.config).unwrap();
-    assert_eq!(client.features(), 4);
+    assert_eq!(client.features(), KernelFeatures::REQUIRE_UDP_ENCAPSULATION);
     let error = client
         .request(client.rpc().install_sa(
             api::context::current(),

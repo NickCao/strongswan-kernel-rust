@@ -52,7 +52,7 @@ unsafe fn sa_id(id: &ffi::kernel_ipsec_sa_id_t) -> Result<api::SaId> {
 
 unsafe extern "C" fn get_features(this: *mut ffi::kernel_ipsec_t) -> ffi::kernel_feature_t {
     let this = unsafe { &*this.cast::<Ipsec>() };
-    this.client.features() as _
+    this.client.features().bits()
 }
 
 unsafe extern "C" fn get_spi(
@@ -135,14 +135,14 @@ unsafe extern "C" fn add_sa(
         let config = api::SaConfig {
             reqid: d.reqid,
             acquire_sequence: d.seq,
-            mode: d.mode,
+            mode: d.mode.into(),
             src_selectors: unsafe { host::selectors(d.src_ts) }?,
             dst_selectors: unsafe { host::selectors(d.dst_ts) }?,
             interface: unsafe { host::optional_string(d.interface) }?,
-            ipcomp: d.ipcomp,
+            ipcomp: d.ipcomp.into(),
             cpi: u16::from_be(d.cpi),
             cpu: d.cpu,
-            hw_offload: d.hw_offload,
+            hw_offload: d.hw_offload.into(),
             security_label: unsafe { host::label(d.label) }?,
             encryption,
             integrity,
@@ -170,7 +170,7 @@ unsafe extern "C" fn add_sa(
             tfc: d.tfc,
             copy_df: d.copy_df,
             copy_ecn: d.copy_ecn,
-            copy_dscp: d.copy_dscp,
+            copy_dscp: d.copy_dscp.into(),
             iptfs_dont_fragment: d.iptfs_dont_frag,
             forward_icmp: d.forward_icmp,
             initiator: d.initiator,
@@ -194,7 +194,7 @@ unsafe extern "C" fn update_sa(
         let d = unsafe { &*data };
         let id = unsafe { sa_id(&*id) }?;
         let config = api::SaUpdate {
-            mode: d.mode,
+            mode: d.mode.into(),
             cpi: u16::from_be(d.cpi),
             src: unsafe { host::endpoint(d.new_src) }?,
             dst: unsafe { host::endpoint(d.new_dst) }?,
@@ -202,7 +202,7 @@ unsafe extern "C" fn update_sa(
             new_udp_encapsulation: d.new_encap,
             old_reqid: d.old_reqid,
             new_reqid: d.new_reqid,
-            hw_offload: d.hw_offload,
+            hw_offload: d.hw_offload.into(),
             src_selectors: unsafe { host::selectors(d.src_ts) }?,
             dst_selectors: unsafe { host::selectors(d.dst_ts) }?,
             interface: unsafe { host::optional_string(d.interface) }?,
@@ -269,7 +269,7 @@ unsafe extern "C" fn flush_sas(this: *mut ffi::kernel_ipsec_t) -> status_t {
 unsafe fn policy_id(id: &ffi::kernel_ipsec_policy_id_t) -> Result<api::PolicyId> {
     let (src, dst) = unsafe { (host::selector(id.src_ts)?, host::selector(id.dst_ts)?) };
     Ok(api::PolicyId {
-        direction: id.dir,
+        direction: id.dir.into(),
         src,
         dst,
         mark: host::mark(id.mark),
@@ -287,16 +287,16 @@ unsafe fn policy_config(d: &ffi::kernel_ipsec_manage_policy_t) -> Result<api::Po
         )
     };
     Ok(api::PolicyConfig {
-        kind: d.type_,
-        priority: d.prio,
+        kind: d.type_.into(),
+        priority: d.prio.into(),
         manual_priority: d.manual_prio,
-        hw_offload: d.hw_offload,
+        hw_offload: d.hw_offload.into(),
         pcpu_acquires: d.pcpu_acquires,
         forward_icmp: d.forward_icmp,
         src,
         dst,
         sa: unsafe { d.sa.as_ref() }.map(|sa| api::PolicySa {
-            mode: sa.mode,
+            mode: sa.mode.into(),
             reqid: sa.reqid,
             policy_count: sa.policy_count,
             esp: api::ProtocolSa {
@@ -308,7 +308,7 @@ unsafe fn policy_config(d: &ffi::kernel_ipsec_manage_policy_t) -> Result<api::Po
                 spi: u32::from_be(sa.ah.spi),
             },
             ipcomp: api::CompressionSa {
-                transform: sa.ipcomp.transform,
+                transform: sa.ipcomp.transform.into(),
                 cpi: u16::from_be(sa.ipcomp.cpi),
             },
         }),

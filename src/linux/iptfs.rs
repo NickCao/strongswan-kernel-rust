@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Linux 6.14 IP-TFS UAPI additions missing in netlink-packet-xfrm 0.5.
 //! Keep the extension in the packet crate's generic NLA representation.
-use crate::{model::TunnelMode, rpc_api::IptfsConfig};
+use crate::rpc_api::{IpsecMode, IptfsConfig};
 use netlink_packet_core::DefaultNla;
 use netlink_packet_xfrm::{self as packet, XfrmAttrs};
 
@@ -14,17 +14,18 @@ const XFRMA_IPTFS_INIT_DELAY: u16 = 39;
 const XFRMA_IPTFS_MAX_QSIZE: u16 = 40;
 const XFRMA_IPTFS_PKT_SIZE: u16 = 41;
 
-pub(super) fn mode(mode: TunnelMode) -> u8 {
+pub(super) fn mode(mode: IpsecMode) -> std::io::Result<u8> {
     match mode {
-        TunnelMode::Tunnel => packet::XFRM_MODE_TUNNEL,
-        TunnelMode::Iptfs => XFRM_MODE_IPTFS,
+        IpsecMode::Tunnel => Ok(packet::XFRM_MODE_TUNNEL),
+        IpsecMode::Iptfs => Ok(XFRM_MODE_IPTFS),
+        _ => Err(crate::error::unsupported()),
     }
 }
 
-pub(super) fn observed_mode(mode: u8) -> Option<TunnelMode> {
+pub(super) fn observed_mode(mode: u8) -> Option<IpsecMode> {
     match mode {
-        packet::XFRM_MODE_TUNNEL => Some(TunnelMode::Tunnel),
-        XFRM_MODE_IPTFS => Some(TunnelMode::Iptfs),
+        packet::XFRM_MODE_TUNNEL => Some(IpsecMode::Tunnel),
+        XFRM_MODE_IPTFS => Some(IpsecMode::Iptfs),
         _ => None,
     }
 }

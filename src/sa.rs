@@ -2,6 +2,7 @@
 //! Immutable SA lifecycle. Established SAs are never repaired or recreated:
 //! loss or configuration drift retires them and asks the IKE owner to recover.
 use crate::model::{Endpoint, SaConfig, SaId};
+use crate::rpc_api::KernelFeatures;
 pub use crate::rpc_api::SaUsage;
 use std::{
     collections::{HashMap, HashSet},
@@ -57,7 +58,7 @@ pub trait SaKernel: Send {
     type Handle: SaHandle;
     type Config: PartialEq;
 
-    fn features(&self) -> u32;
+    fn features(&self) -> KernelFeatures;
     fn allocate(
         &mut self,
         src: &Endpoint,
@@ -121,7 +122,7 @@ impl<K: SaKernel> Sas<K> {
             reservations: HashSet::new(),
         }
     }
-    pub fn features(&self) -> u32 {
+    pub fn features(&self) -> KernelFeatures {
         self.kernel.features()
     }
     pub fn ids(&self) -> impl Iterator<Item = &SaId> {
@@ -250,7 +251,8 @@ impl<K: SaKernel> Sas<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Mark;
+    use crate::model::{DscpCopy, HwOffload, IpcompTransform, IpsecMode, Mark};
+    use crate::rpc_api::{EncryptionAlgorithm, IntegrityAlgorithm};
 
     #[derive(Clone)]
     struct Handle(SaId);
@@ -269,8 +271,8 @@ mod tests {
     impl SaKernel for MemoryKernel {
         type Handle = Handle;
         type Config = u32;
-        fn features(&self) -> u32 {
-            0
+        fn features(&self) -> KernelFeatures {
+            KernelFeatures::empty()
         }
         fn allocate(
             &mut self,
@@ -356,17 +358,17 @@ mod tests {
             SaConfig {
                 reqid: 42,
                 acquire_sequence: 0,
-                mode: 2,
+                mode: IpsecMode::Tunnel,
                 src_selectors: None,
                 dst_selectors: None,
                 interface: None,
                 encryption: crate::rpc_api::Algorithm {
-                    id: 20,
+                    id: EncryptionAlgorithm::AesGcmIcv16,
                     name: String::new(),
                     key: vec![0; 20],
                 },
                 integrity: crate::rpc_api::Algorithm {
-                    id: 1024,
+                    id: IntegrityAlgorithm::Undefined,
                     name: String::new(),
                     key: Vec::new(),
                 },
@@ -388,10 +390,10 @@ mod tests {
                     },
                 }),
                 replay_window: 128,
-                ipcomp: 0,
+                ipcomp: IpcompTransform::None,
                 cpi: 0,
                 cpu: u32::MAX,
-                hw_offload: 0,
+                hw_offload: HwOffload::No,
                 security_label: None,
                 tfc: 0,
                 udp_encapsulation: true,
@@ -399,7 +401,7 @@ mod tests {
                 esn: true,
                 copy_df: true,
                 copy_ecn: true,
-                copy_dscp: 0,
+                copy_dscp: DscpCopy::OutOnly,
                 iptfs_dont_fragment: false,
                 forward_icmp: false,
                 initiator: true,

@@ -5,7 +5,7 @@ use crate::{
     status_t, status_t_FAILED, status_t_NOT_SUPPORTED, ClientExt, Result,
 };
 use foreign_types::ForeignType;
-use kernel_rust_protocol::{client::Client, context};
+use kernel_rust_protocol::{self as api, client::Client, context};
 use std::{
     ffi::{CString, VaList},
     mem::ManuallyDrop,
@@ -43,7 +43,7 @@ pub extern "C" fn create() -> *mut ffi::kernel_net_t {
 }
 
 extern "C" fn get_features(_this: *mut ffi::kernel_net_t) -> ffi::kernel_feature_t {
-    0
+    api::KernelFeatures::empty().bits()
 }
 
 // These callbacks borrow their C arguments once at entry. RPC, response
@@ -203,9 +203,10 @@ unsafe extern "C" fn create_address_enumerator(
 ) -> *mut ffi::enumerator_t {
     let this = unsafe { &*this.cast::<Net>() };
     let operation = || -> Result<Vec<Item>> {
-        let addresses = this
-            .client
-            .call(this.client.rpc().list_addresses(context::current(), which))?;
+        let addresses = this.client.call(this.client.rpc().list_addresses(
+            context::current(),
+            api::AddressTypes::from_bits_retain(which),
+        ))?;
         if addresses.len() > 4096 {
             return Err(status_t_FAILED);
         }

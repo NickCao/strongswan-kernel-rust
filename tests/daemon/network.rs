@@ -179,15 +179,16 @@ fn xfrm_egress_and_policy_rules_are_honored(
 }
 
 #[rstest]
-#[case::regular(1, false, false)]
-#[case::include_down(3, true, false)]
-#[case::include_ignored(5, false, true)]
-#[case::include_both(7, true, true)]
-#[case::modifier_only(4, false, false)]
+#[case::regular(AddressTypes::REGULAR, false, false)]
+#[case::include_down(AddressTypes::REGULAR | AddressTypes::DOWN, true, false)]
+#[case::include_ignored(AddressTypes::REGULAR | AddressTypes::IGNORED, false, true)]
+#[case::include_both(AddressTypes::REGULAR | AddressTypes::IGNORED | AddressTypes::DOWN, true, true)]
+#[case::modifier_only(AddressTypes::IGNORED, false, false)]
+#[case::all(AddressTypes::all(), true, true)]
 #[ignore = "requires root and iproute2; creates a network namespace"]
 fn address_enumeration_flags(
     daemon: Fixture,
-    #[case] which: u32,
+    #[case] which: AddressTypes,
     #[case] down: bool,
     #[case] ignored: bool,
 ) {
@@ -232,8 +233,11 @@ fn address_enumeration_flags(
     let contains = |s: &str| addresses.iter().any(|e| e.address.to_string() == s);
     assert_eq!(contains("198.18.1.1"), down);
     assert_eq!(contains("198.18.2.1"), ignored);
-    assert_eq!(contains("192.0.2.1"), which & 1 != 0);
-    assert_eq!(contains("2001:db8:1::1"), which & 1 != 0);
+    assert_eq!(contains("192.0.2.1"), which.contains(AddressTypes::REGULAR));
+    assert_eq!(
+        contains("2001:db8:1::1"),
+        which.contains(AddressTypes::REGULAR)
+    );
     assert!(!addresses
         .iter()
         .any(|e| e.is_link_local() || e.address.is_loopback()));
@@ -310,7 +314,7 @@ fn multihomed_sources_are_independent_of_egress_filters(
         "underlay"
     );
     assert!(!rpc
-        .call(rpc.kernel.list_addresses(ctx(), 1))
+        .call(rpc.kernel.list_addresses(ctx(), AddressTypes::REGULAR))
         .unwrap()
         .iter()
         .any(|e| e.address == source.address));
@@ -346,14 +350,18 @@ fn discovery_cache_tracks_link_state_changes(
             .iter()
             .any(|e| e.address == source.address)
     };
-    assert!(!listed(5)); // REGULAR | IGNORED still excludes down interfaces.
-    assert!(listed(7)); // REGULAR | IGNORED | DOWN includes this address.
+    assert!(!listed(AddressTypes::REGULAR | AddressTypes::IGNORED));
+    assert!(listed(
+        AddressTypes::REGULAR | AddressTypes::IGNORED | AddressTypes::DOWN
+    ));
     ip(&["link", "set", "spare", "up"]);
-    eventually(|| listed(5));
-    assert!(!listed(1));
+    eventually(|| listed(AddressTypes::REGULAR | AddressTypes::IGNORED));
+    assert!(!listed(AddressTypes::REGULAR));
     ip(&["link", "set", "spare", "down"]);
-    eventually(|| !listed(5));
-    assert!(listed(7));
+    eventually(|| !listed(AddressTypes::REGULAR | AddressTypes::IGNORED));
+    assert!(listed(
+        AddressTypes::REGULAR | AddressTypes::IGNORED | AddressTypes::DOWN
+    ));
     rpc.close();
 }
 
@@ -364,7 +372,8 @@ fn discovery_cache_tracks_link_state_changes(
 fn route_events_coalesce_without_losing_address_changes(daemon: Fixture, #[case] routes: u32) {
     let rpc = daemon.session();
     // Populate discovery's cache, then mutate after subscribing.
-    rpc.call(rpc.kernel.list_addresses(ctx(), 1)).unwrap();
+    rpc.call(rpc.kernel.list_addresses(ctx(), AddressTypes::REGULAR))
+        .unwrap();
     ip(&["addr", "add", "192.0.2.3/24", "dev", "underlay"]);
     for n in 0..routes {
         ip(&[

@@ -134,7 +134,7 @@ impl Family {
             interface_id: 41,
         }
     }
-    pub fn policy(self, direction: u32) -> PolicyId {
+    pub fn policy(self, direction: PolicyDirection) -> PolicyId {
         PolicyId {
             direction,
             src: self.selector(0, (0, u16::MAX), 0),
@@ -155,13 +155,37 @@ pub enum Cipher {
     ChaCha,
 }
 impl Cipher {
-    pub fn algorithms(self) -> (Algorithm, Algorithm) {
-        use algorithms::{encryption as enc, integrity as auth};
+    pub fn algorithms(
+        self,
+    ) -> (
+        Algorithm<EncryptionAlgorithm>,
+        Algorithm<IntegrityAlgorithm>,
+    ) {
         let (enc_id, enc_len, auth_id, auth_len) = match self {
-            Self::Gcm => (enc::AES_GCM_ICV16, 20, auth::UNDEFINED, 0),
-            Self::CbcSha256 => (enc::AES_CBC, 16, auth::HMAC_SHA2_256_128, 32),
-            Self::CbcSha384 => (enc::AES_CBC, 16, auth::HMAC_SHA2_384_192, 48),
-            Self::ChaCha => (enc::CHACHA20_POLY1305, 36, auth::UNDEFINED, 0),
+            Self::Gcm => (
+                EncryptionAlgorithm::AesGcmIcv16,
+                20,
+                IntegrityAlgorithm::Undefined,
+                0,
+            ),
+            Self::CbcSha256 => (
+                EncryptionAlgorithm::AesCbc,
+                16,
+                IntegrityAlgorithm::HmacSha256Icv128,
+                32,
+            ),
+            Self::CbcSha384 => (
+                EncryptionAlgorithm::AesCbc,
+                16,
+                IntegrityAlgorithm::HmacSha384Icv192,
+                48,
+            ),
+            Self::ChaCha => (
+                EncryptionAlgorithm::ChaCha20Poly1305,
+                36,
+                IntegrityAlgorithm::Undefined,
+                0,
+            ),
         };
         (
             Algorithm {
@@ -187,7 +211,7 @@ pub fn sa_config(cipher: Cipher, inbound: bool, esn: bool) -> SaConfig {
     SaConfig {
         reqid: 42,
         acquire_sequence: 0,
-        mode: mode::TUNNEL,
+        mode: IpsecMode::Tunnel,
         src_selectors: None,
         dst_selectors: None,
         interface: None,
@@ -199,10 +223,10 @@ pub fn sa_config(cipher: Cipher, inbound: bool, esn: bool) -> SaConfig {
             packets: limit(),
         }),
         replay_window: 128,
-        ipcomp: 0,
+        ipcomp: IpcompTransform::None,
         cpi: 0,
         cpu: u32::MAX,
-        hw_offload: 0,
+        hw_offload: HwOffload::No,
         security_label: None,
         esn,
         udp_encapsulation: true,
@@ -213,7 +237,7 @@ pub fn sa_config(cipher: Cipher, inbound: bool, esn: bool) -> SaConfig {
         tfc: 0,
         copy_df: true,
         copy_ecn: true,
-        copy_dscp: 0,
+        copy_dscp: DscpCopy::OutOnly,
         iptfs_dont_fragment: false,
         forward_icmp: false,
         initiator: false,
@@ -223,16 +247,16 @@ pub fn sa_config(cipher: Cipher, inbound: bool, esn: bool) -> SaConfig {
 }
 pub fn policy_config(family: Family, spi: u32) -> PolicyConfig {
     PolicyConfig {
-        kind: 1,
-        priority: 1,
+        kind: PolicyKind::Ipsec,
+        priority: PolicyPriority::Default,
         manual_priority: 0,
-        hw_offload: 0,
+        hw_offload: HwOffload::No,
         pcpu_acquires: false,
         forward_icmp: false,
         src: Some(family.local()),
         dst: Some(family.peer()),
         sa: Some(PolicySa {
-            mode: mode::TUNNEL,
+            mode: IpsecMode::Tunnel,
             reqid: 42,
             policy_count: 2,
             esp: ProtocolSa { used: true, spi },
@@ -241,7 +265,7 @@ pub fn policy_config(family: Family, spi: u32) -> PolicyConfig {
                 spi: 0,
             },
             ipcomp: CompressionSa {
-                transform: 0,
+                transform: IpcompTransform::None,
                 cpi: 0,
             },
         }),

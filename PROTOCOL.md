@@ -100,6 +100,10 @@ Shared types retain:
 - SA modes, selectors, flags, direction, compression, offload, CPU, interface
   and security-label inputs; policy ESP/AH/IPComp configuration.
 
+strongSwan enum fields use shared Rust enums with numeric Serde encoding;
+unknown values retain their original numbers. Address and feature bitmasks
+use `bitflags` and retain unknown bits across RPC.
+
 Query last-use values are monotonic seconds, or zero when unused/unavailable.
 The Linux adapter converts native timestamps. strongSwan already applies
 lifetime jitter. Its tunnel traffic selectors become policies rather than

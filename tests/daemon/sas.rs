@@ -16,7 +16,7 @@ fn installs_sa_options(
     config.forward_icmp = true;
     config.copy_df = false;
     config.copy_ecn = false;
-    config.copy_dscp = 3;
+    config.copy_dscp = DscpCopy::No;
     rpc.call(rpc.kernel.install_sa(ctx(), family.sa(0x10001), config))
         .unwrap();
     let native = states().pop().unwrap();
@@ -91,17 +91,18 @@ fn installs_sa_options(
 #[case::missing_lifetime(|_: &mut SaId, c: &mut SaConfig| c.lifetime = None, libc::EINVAL)]
 #[case::zero_reqid(|_: &mut SaId, c: &mut SaConfig| c.reqid = 0, libc::EINVAL)]
 #[case::replay_window(|_: &mut SaId, c: &mut SaConfig| c.replay_window = 131073, libc::EINVAL)]
-#[case::copy_dscp(|_: &mut SaId, c: &mut SaConfig| c.copy_dscp = 4, libc::EINVAL)]
-#[case::unknown_cipher(|_: &mut SaId, c: &mut SaConfig| c.encryption.id = u16::MAX, libc::EOPNOTSUPP)]
+#[case::copy_dscp(|_: &mut SaId, c: &mut SaConfig| c.copy_dscp = DscpCopy::Other(4), libc::EINVAL)]
+#[case::unknown_cipher(|_: &mut SaId, c: &mut SaConfig| c.encryption.id = EncryptionAlgorithm::Other(u16::MAX), libc::EOPNOTSUPP)]
 #[case::key_length(|_: &mut SaId, c: &mut SaConfig| c.encryption.key = vec![0; 8193], libc::EINVAL)]
-#[case::transport_mode(|_: &mut SaId, c: &mut SaConfig| c.mode = 1, libc::EOPNOTSUPP)]
-#[case::compression(|_: &mut SaId, c: &mut SaConfig| c.ipcomp = 1, libc::EOPNOTSUPP)]
+#[case::transport_mode(|_: &mut SaId, c: &mut SaConfig| c.mode = IpsecMode::Transport, libc::EOPNOTSUPP)]
+#[case::unknown_mode(|_: &mut SaId, c: &mut SaConfig| c.mode = IpsecMode::Other(u32::MAX), libc::EOPNOTSUPP)]
+#[case::compression(|_: &mut SaId, c: &mut SaConfig| c.ipcomp = IpcompTransform::Oui, libc::EOPNOTSUPP)]
 #[case::cpi(|_: &mut SaId, c: &mut SaConfig| c.cpi = 1, libc::EOPNOTSUPP)]
 #[case::label(|_: &mut SaId, c: &mut SaConfig| c.security_label = Some(vec![]), libc::EOPNOTSUPP)]
-#[case::offload(|_: &mut SaId, c: &mut SaConfig| c.hw_offload = 1, libc::EOPNOTSUPP)]
+#[case::offload(|_: &mut SaId, c: &mut SaConfig| c.hw_offload = HwOffload::Crypto, libc::EOPNOTSUPP)]
 #[case::cpu(|_: &mut SaId, c: &mut SaConfig| c.cpu = 0, libc::EOPNOTSUPP)]
 #[case::bound_interface(|_: &mut SaId, c: &mut SaConfig| c.interface = Some("underlay".into()), libc::EOPNOTSUPP)]
-#[case::iptfs_tfc(|_: &mut SaId, c: &mut SaConfig| { c.mode = mode::IPTFS; c.tfc = 1; }, libc::EOPNOTSUPP)]
+#[case::iptfs_tfc(|_: &mut SaId, c: &mut SaConfig| { c.mode = IpsecMode::Iptfs; c.tfc = 1; }, libc::EOPNOTSUPP)]
 #[ignore = "requires root and iproute2; creates a network namespace"]
 fn rejected_install_rolls_back(
     daemon: Fixture,
