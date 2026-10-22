@@ -49,7 +49,20 @@ pub fn ip(args: &[&str]) -> String {
 }
 
 pub fn links() -> Vec<Link> {
-    Network::new().unwrap().links().unwrap()
+    let mut network = Network::new().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match network.links() {
+            // The daemon may change links during a dump. Discard the partial
+            // inventory and observe again, as a later reconciliation would.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            result => return result.unwrap(),
+        }
+    }
 }
 pub fn owned_links() -> Vec<Link> {
     links().into_iter().filter(|l| l.group == 17227).collect()
@@ -121,7 +134,7 @@ impl Family {
             interface_id: 41,
         }
     }
-    pub fn policy(self, direction: i32) -> PolicyId {
+    pub fn policy(self, direction: u32) -> PolicyId {
         PolicyId {
             direction,
             src: self.selector(0, (0, u16::MAX), 0),

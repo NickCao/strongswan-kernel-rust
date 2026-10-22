@@ -104,7 +104,7 @@ impl Kernel for Fake {
         get_source_address(_destination: Endpoint, _source: Option<Endpoint>) -> Endpoint;
         get_next_hop(_destination: Endpoint, _source: Option<Endpoint>, _prefix: Option<i32>) -> NextHop;
         get_interface(_address: Endpoint) -> String;
-        list_addresses(_which: i32) -> Vec<Endpoint>;
+        list_addresses(_which: u32) -> Vec<Endpoint>;
         list_subnets() -> Vec<Subnet>;
     }
 }
@@ -213,7 +213,7 @@ fn sa_id() -> SaId {
 }
 fn selector() -> Selector {
     Selector {
-        kind: 8,
+        kind: u32::MAX,
         dynamic: true,
         from: "::".parse().unwrap(),
         to: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
@@ -231,7 +231,7 @@ fn sa_config(selectors: bool, optional: bool) -> SaConfig {
     SaConfig {
         reqid: u32::MAX,
         acquire_sequence: u32::MAX,
-        mode: 6,
+        mode: u32::MAX,
         src_selectors: selectors.then(|| vec![selector()]),
         dst_selectors: selectors.then(Vec::new),
         interface: optional.then(String::new),
@@ -254,7 +254,7 @@ fn sa_config(selectors: bool, optional: bool) -> SaConfig {
         ipcomp: u16::MAX,
         cpi: u16::MAX,
         cpu: u32::MAX - 1,
-        hw_offload: 3,
+        hw_offload: u32::MAX,
         security_label: optional.then(|| vec![0, 255, 128]),
         esn: true,
         udp_encapsulation: true,
@@ -265,7 +265,7 @@ fn sa_config(selectors: bool, optional: bool) -> SaConfig {
         tfc: u32::MAX,
         copy_df: false,
         copy_ecn: true,
-        copy_dscp: 3,
+        copy_dscp: u32::MAX,
         iptfs_dont_fragment: true,
         forward_icmp: true,
         initiator: true,
@@ -275,7 +275,7 @@ fn sa_config(selectors: bool, optional: bool) -> SaConfig {
 }
 fn policy_id() -> PolicyId {
     PolicyId {
-        direction: 2,
+        direction: u32::MAX,
         src: selector(),
         dst: selector(),
         mark: Mark {
@@ -289,16 +289,16 @@ fn policy_id() -> PolicyId {
 }
 fn policy_config() -> PolicyConfig {
     PolicyConfig {
-        kind: 3,
-        priority: 3,
+        kind: u32::MAX,
+        priority: u32::MAX,
         manual_priority: u32::MAX,
-        hw_offload: 3,
+        hw_offload: u32::MAX,
         pcpu_acquires: true,
         forward_icmp: true,
         src: Some(endpoint()),
         dst: Some(endpoint()),
         sa: Some(PolicySa {
-            mode: 6,
+            mode: u32::MAX,
             reqid: u32::MAX,
             policy_count: u32::MAX,
             esp: ProtocolSa {

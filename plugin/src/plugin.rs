@@ -76,7 +76,8 @@ fn callback(f: ffi::plugin_feature_callback_t, data: *mut libc::c_void) -> ffi::
         type_: ffi::plugin_feature_t_FEATURE_NONE,
         ..Default::default()
     };
-    feature.arg.cb = ffi::plugin_feature_t__bindgen_ty_3__bindgen_ty_4 { f, data };
+    feature.arg.cb.f = f;
+    feature.arg.cb.data = data;
     feature
 }
 

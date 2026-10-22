@@ -18,7 +18,8 @@ libc = "0.2"
 kernel-rust-protocol = { path = "protocol" }
 rustix = { version = "1.1", features = ["net", "process", "fs", "time", "system", "event"] }
 nix = { version = "0.31", features = ["user", "signal"] }
-neli = "0.7.4"
+# 0.7.5's EINTR handler reads the event buffer instead of retrying; see README.
+neli = "=0.7.4"
 ipnet = "2.12.2"
 netlink-packet-xfrm = "0.5.0"
 netlink-packet-core = "0.9.0"

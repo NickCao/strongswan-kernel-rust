@@ -71,7 +71,7 @@ fn policy_selectors_and_flags(
     daemon: Fixture,
     #[values(Family::V4, Family::V6)] inner: Family,
     #[values(Family::V4, Family::V6)] outer: Family,
-    #[values(0, 1, 2)] direction: i32,
+    #[values(0, 1, 2)] direction: u32,
     #[case] prefix: u8,
     #[case] protocol: u8,
     #[case] ports: (u16, u16),

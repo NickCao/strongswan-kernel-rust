@@ -14,8 +14,8 @@ pub mod transport;
 
 /// strongSwan ipsec_types.h values, distinct from Linux XFRM mode numbers.
 pub mod mode {
-    pub const TUNNEL: i32 = 2;
-    pub const IPTFS: i32 = 6;
+    pub const TUNNEL: u32 = 2;
+    pub const IPTFS: u32 = 6;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,7 +102,7 @@ pub struct Mark {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selector {
-    pub kind: i32,
+    pub kind: u32,
     pub dynamic: bool,
     pub from: IpAddr,
     pub to: IpAddr,
@@ -154,7 +154,7 @@ pub struct Lifetime {
 pub struct SaConfig {
     pub reqid: u32,
     pub acquire_sequence: u32,
-    pub mode: i32,
+    pub mode: u32,
     pub src_selectors: Option<Vec<Selector>>,
     pub dst_selectors: Option<Vec<Selector>>,
     pub interface: Option<String>,
@@ -165,7 +165,7 @@ pub struct SaConfig {
     pub ipcomp: u16,
     pub cpi: u16,
     pub cpu: u32,
-    pub hw_offload: i32,
+    pub hw_offload: u32,
     pub security_label: Option<Vec<u8>>,
     pub esn: bool,
     pub udp_encapsulation: bool,
@@ -173,7 +173,7 @@ pub struct SaConfig {
     pub tfc: u32,
     pub copy_df: bool,
     pub copy_ecn: bool,
-    pub copy_dscp: i32,
+    pub copy_dscp: u32,
     pub iptfs_dont_fragment: bool,
     pub forward_icmp: bool,
     pub initiator: bool,
@@ -182,7 +182,7 @@ pub struct SaConfig {
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SaUpdate {
-    pub mode: i32,
+    pub mode: u32,
     pub cpi: u16,
     pub src: Endpoint,
     pub dst: Endpoint,
@@ -190,7 +190,7 @@ pub struct SaUpdate {
     pub new_udp_encapsulation: bool,
     pub old_reqid: u32,
     pub new_reqid: u32,
-    pub hw_offload: i32,
+    pub hw_offload: u32,
     pub src_selectors: Option<Vec<Selector>>,
     pub dst_selectors: Option<Vec<Selector>>,
     pub interface: Option<String>,
@@ -205,7 +205,7 @@ pub struct SaUsage {
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyId {
-    pub direction: i32,
+    pub direction: u32,
     pub src: Selector,
     pub dst: Selector,
     pub mark: Mark,
@@ -225,7 +225,7 @@ pub struct CompressionSa {
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicySa {
-    pub mode: i32,
+    pub mode: u32,
     pub reqid: u32,
     pub policy_count: u32,
     pub esp: ProtocolSa,
@@ -234,10 +234,10 @@ pub struct PolicySa {
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyConfig {
-    pub kind: i32,
-    pub priority: i32,
+    pub kind: u32,
+    pub priority: u32,
     pub manual_priority: u32,
-    pub hw_offload: i32,
+    pub hw_offload: u32,
     pub pcpu_acquires: bool,
     pub forward_icmp: bool,
     pub src: Option<Endpoint>,
@@ -325,6 +325,6 @@ pub trait Kernel {
         prefix: Option<i32>,
     ) -> Result<NextHop>;
     async fn get_interface(address: Endpoint) -> Result<String>;
-    async fn list_addresses(which: i32) -> Result<Vec<Endpoint>>;
+    async fn list_addresses(which: u32) -> Result<Vec<Endpoint>>;
     async fn list_subnets() -> Result<Vec<Subnet>>;
 }

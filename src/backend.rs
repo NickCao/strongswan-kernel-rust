@@ -119,7 +119,7 @@ impl Backend {
         self.policies.reconcile()
     }
 }
-fn number<T: TryFrom<i32>>(n: i32) -> io::Result<T> {
+fn number<T: TryFrom<u32>>(n: u32) -> io::Result<T> {
     T::try_from(n).map_err(|_| invalid())
 }
 pub fn validate_endpoint(endpoint: Endpoint) -> io::Result<Endpoint> {

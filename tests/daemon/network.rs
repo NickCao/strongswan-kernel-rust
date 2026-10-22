@@ -187,7 +187,7 @@ fn xfrm_egress_and_policy_rules_are_honored(
 #[ignore = "requires root and iproute2; creates a network namespace"]
 fn address_enumeration_flags(
     daemon: Fixture,
-    #[case] which: i32,
+    #[case] which: u32,
     #[case] down: bool,
     #[case] ignored: bool,
 ) {

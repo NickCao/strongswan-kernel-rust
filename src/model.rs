@@ -9,10 +9,10 @@ pub enum TunnelMode {
     Tunnel,
     Iptfs,
 }
-impl TryFrom<i32> for TunnelMode {
+impl TryFrom<u32> for TunnelMode {
     type Error = io::Error;
 
-    fn try_from(mode: i32) -> io::Result<Self> {
+    fn try_from(mode: u32) -> io::Result<Self> {
         match mode {
             crate::rpc_api::mode::TUNNEL => Ok(Self::Tunnel),
             crate::rpc_api::mode::IPTFS => Ok(Self::Iptfs),
