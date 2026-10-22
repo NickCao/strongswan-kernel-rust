@@ -226,21 +226,21 @@ impl<K: PolicyKernel> Policies<K> {
     }
     pub fn delete_policy(&mut self, id: &PolicyId, data: &PolicyData) -> io::Result<()> {
         let key = PolicyKey::new(id)?;
-        let mut uses = self.policies.get(&key).ok_or_else(missing)?.clone();
+        let uses = self.policies.get_mut(&key).ok_or_else(missing)?;
         let pos = uses.iter().position(|p| p == data).ok_or_else(missing)?;
+        // Release the reference before kernel I/O so reconciliation cannot
+        // restore it if deletion or updating the remaining policy fails.
         uses.remove(pos);
         if uses.is_empty() {
+            self.policies.remove(&key);
             match self.kernel.get(&key) {
                 Ok(current) => self.kernel.delete(&current.handle)?,
                 Err(error) if is_missing(&error) => (),
                 Err(error) => return Err(error),
             }
-            self.policies.remove(&key);
-        } else {
-            if pos == 0 {
-                self.ensure(&key.spec(&uses[0]))?;
-            }
-            self.policies.insert(key, uses);
+        } else if pos == 0 {
+            let spec = key.spec(&uses[0]);
+            self.ensure(&spec)?;
         }
         Ok(())
     }
@@ -355,6 +355,7 @@ fn is_missing(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[derive(Clone)]
     struct MemoryHandle {
@@ -373,6 +374,7 @@ mod tests {
         writes: usize,
         lists: usize,
         reject_write: bool,
+        reject_get: bool,
         reject_delete: std::collections::HashSet<u64>,
     }
     impl MemoryKernel {
@@ -399,6 +401,9 @@ mod tests {
             Ok(self.installed.values().cloned().collect())
         }
         fn get(&mut self, id: &PolicyKey) -> io::Result<ObservedPolicy<MemoryHandle>> {
+            if self.reject_get {
+                return Err(io::Error::from_raw_os_error(libc::EINTR));
+            }
             self.installed
                 .values()
                 .find(|entry| entry.handle.id() == Some(id))
@@ -546,6 +551,82 @@ mod tests {
             policies.kernel.installed[&key].config.as_ref(),
             Some(&key.spec(&data).config)
         );
+    }
+
+    #[rstest]
+    #[case::lookup(true, libc::EINTR)]
+    #[case::delete(false, libc::EIO)]
+    fn failed_final_reference_deletion_is_retried_without_restoring_the_policy(
+        #[case] fail_lookup: bool,
+        #[case] errno: i32,
+    ) {
+        let (id, data) = fixture();
+        let key = PolicyKey::new(&id).unwrap();
+        let mut policies = Policies::new(MemoryKernel::default());
+        policies.add_policy(id.clone(), data.clone()).unwrap();
+        let index = policies.kernel.installed[&key].handle.index;
+        policies.kernel.reject_delete.insert(index);
+        policies.kernel.reject_get = fail_lookup;
+        assert_eq!(
+            policies
+                .delete_policy(&id, &data)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(errno)
+        );
+        assert!(!policies.has_tunnel_policies());
+        assert_eq!(
+            policies.query_policy(&id).unwrap_err().raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(
+            policies.reconcile().unwrap_err().raw_os_error(),
+            Some(libc::EIO)
+        );
+        policies.kernel.reject_delete.clear();
+        policies.kernel.reject_get = false;
+        policies.reconcile().unwrap();
+        assert!(policies.kernel.installed.is_empty());
+    }
+
+    #[rstest]
+    #[case::lookup(true, false)]
+    #[case::update(false, false)]
+    #[case::create(false, true)]
+    fn failed_reference_replacement_repairs_only_the_remaining_reference(
+        #[case] fail_lookup: bool,
+        #[case] native_missing: bool,
+    ) {
+        let (id, old) = fixture();
+        let key = PolicyKey::new(&id).unwrap();
+        let mut policies = Policies::new(MemoryKernel::default());
+        policies.add_policy(id.clone(), old.clone()).unwrap();
+        let mut new = old.clone();
+        new.esp = Some(0x10204);
+        policies.add_policy(id.clone(), new.clone()).unwrap();
+        if native_missing {
+            policies.kernel.installed.remove(&key);
+        }
+        policies.kernel.reject_write = true;
+        policies.kernel.reject_get = fail_lookup;
+        assert_eq!(
+            policies
+                .delete_policy(&id, &new)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(if fail_lookup { libc::EINTR } else { libc::EIO })
+        );
+        policies.kernel.reject_write = false;
+        policies.kernel.reject_get = false;
+        policies.reconcile().unwrap();
+        assert_eq!(
+            policies.kernel.installed[&key].config.as_ref(),
+            Some(&key.spec(&old).config)
+        );
+        policies.delete_policy(&id, &old).unwrap();
+        policies.reconcile().unwrap();
+        assert!(!policies.has_tunnel_policies());
+        assert!(policies.kernel.installed.is_empty());
     }
 
     #[test]

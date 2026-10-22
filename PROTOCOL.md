@@ -153,6 +153,36 @@ This operation cannot update an established SA.
 Acquisition placeholders remain subject to their normal kernel timeout;
 startup, flush and shutdown clear them too.
 
+### Open issue: stale SA deletion after SPI reuse
+
+The daemon's logical SA identity includes the source address and XFRM interface
+ID. For ESP, Linux GETSA/DELSA look up the destination, SPI, protocol, address
+family and mark within a network namespace. `Sas::remove()` deletes the returned
+native handle without checking that its observed logical identity matches the
+request, even when the requested SA is no longer tracked.
+
+A stale removal could therefore delete a replacement in this sequence:
+
+1. SA A expires or otherwise disappears before its pending teardown runs.
+2. SA B reuses A's native lookup key with a different source address or interface
+   ID.
+3. `remove_sa(A)` looks up B and deletes it.
+
+An installed A normally prevents B from sharing that native lookup key, so
+ordinary rekey overlap alone does not establish this sequence. It can be
+constructed through direct RPC operations; reachability through normal
+strongSwan teardown has not been demonstrated. The client does not replay
+requests. This remains an open defensive issue.
+
+Reconciliation retires the missing B and reports hard expiry; it never
+reinstalls old keys or sequence state. Recovery requires fresh negotiation and
+may interrupt traffic.
+
+A follow-up should check the observed logical identity before deleting an
+established SA, with separate handling for larval reservations that lack the
+eventual interface binding. Identity comparison cannot distinguish replacements
+that reuse the entire logical identity.
+
 ## Close, failure and shutdown
 
 `close_session` requires no remaining desired tunnel SAs or policies.

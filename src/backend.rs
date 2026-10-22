@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 use crate::{
     error::{invalid, unsupported},
-    interfaces::Interfaces,
+    interfaces::{InterfaceKernel, Interfaces},
     linux::{interfaces::LinuxInterfaces, network::Network, policy::LinuxPolicies, xfrm::LinuxSas},
     model::*,
     policy::Policies,
@@ -10,11 +10,11 @@ use crate::{
 };
 use std::{collections::HashSet, io};
 
-pub struct Backend {
+pub struct Backend<I: InterfaceKernel = LinuxInterfaces> {
     pub sas: Sas<LinuxSas>,
     pub net: Network,
     pub policies: Policies<LinuxPolicies>,
-    interfaces: Interfaces<LinuxInterfaces>,
+    interfaces: Interfaces<I>,
 }
 impl Backend {
     pub fn new(
@@ -42,6 +42,8 @@ impl Backend {
             ),
         })
     }
+}
+impl<I: InterfaceKernel> Backend<I> {
     fn desired_interfaces(&self) -> HashSet<u32> {
         self.sas.ids().map(|sa| sa.if_id).collect()
     }
@@ -89,8 +91,12 @@ impl Backend {
         }
         self.interfaces.ensure(id.if_id)?;
         let result = self.sas.install(&id, &config);
-        let cleanup = self.cleanup_interfaces();
-        result.and(cleanup)
+        // Charon must record successful installation even if interface cleanup
+        // fails. Reconciliation retries cleanup independently.
+        if let Err(error) = self.cleanup_interfaces() {
+            eprintln!("kernel-daemon: interface cleanup after SA installation: {error}");
+        }
+        result
     }
     pub fn remove_sa(&mut self, id: rpc::SaId) -> io::Result<()> {
         let result = self.sas.remove(&sa_id(id)?);
@@ -256,7 +262,142 @@ fn policy_endpoint(endpoint: Endpoint) -> io::Result<Endpoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        interfaces::{InterfaceSpec, ObservedInterface},
+        rpc_api::{Algorithm, EncryptionAlgorithm, IntegrityAlgorithm, Lifetime, LifetimeLimit},
+        sa::SaKernel,
+    };
     use rstest::rstest;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct InterruptedCleanup {
+        kernel: LinuxInterfaces,
+        dumps: Arc<AtomicUsize>,
+    }
+    impl InterfaceKernel for InterruptedCleanup {
+        type Handle = <LinuxInterfaces as InterfaceKernel>::Handle;
+
+        fn list(&mut self) -> io::Result<Vec<ObservedInterface<Self::Handle>>> {
+            // The first inventory prepares the interface. Interrupt the next
+            // dump, which cleans up interfaces after the SA install attempt.
+            if self.dumps.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Err(io::Error::from_raw_os_error(libc::EINTR));
+            }
+            self.kernel.list()
+        }
+        fn create(&mut self, spec: &InterfaceSpec) -> io::Result<Self::Handle> {
+            self.kernel.create(spec)
+        }
+        fn update(&mut self, handle: &Self::Handle, spec: &InterfaceSpec) -> io::Result<()> {
+            self.kernel.update(handle, spec)
+        }
+        fn delete(&mut self, handle: &Self::Handle) -> io::Result<()> {
+            self.kernel.delete(handle)
+        }
+    }
+
+    #[rstest]
+    #[case::installed(true)]
+    #[case::rejected(false)]
+    #[ignore = "requires root; creates a network namespace"]
+    fn sa_installation_result_survives_cleanup_failure(#[case] successful: bool) {
+        let _namespace = crate::test_netns::Netns::new();
+        let dumps = Arc::new(AtomicUsize::new(0));
+        let kernel = || LinuxInterfaces::new("tst".into(), 17227).unwrap();
+        let mut backend = Backend {
+            sas: Sas::new(LinuxSas::new(Default::default()).unwrap()),
+            net: Network::new().unwrap(),
+            policies: Policies::new(LinuxPolicies::new().unwrap()),
+            interfaces: Interfaces::new(
+                InterruptedCleanup {
+                    kernel: kernel(),
+                    dumps: dumps.clone(),
+                },
+                None,
+                1400,
+            ),
+        };
+        let id = || rpc::SaId {
+            src: Endpoint::new("192.0.2.1".parse().unwrap(), 13000),
+            dst: Endpoint::new("192.0.2.2".parse().unwrap(), 13000),
+            spi: 0x10203,
+            protocol: 50,
+            mark: Mark::default(),
+            interface_id: 41,
+        };
+        let limit = || LifetimeLimit {
+            life: 0,
+            rekey: 0,
+            jitter: 0,
+        };
+        let config = SaConfig {
+            reqid: 42,
+            acquire_sequence: 0,
+            mode: IpsecMode::Tunnel,
+            src_selectors: None,
+            dst_selectors: None,
+            interface: None,
+            encryption: Algorithm {
+                id: if successful {
+                    EncryptionAlgorithm::AesGcmIcv16
+                } else {
+                    EncryptionAlgorithm::Other(u16::MAX)
+                },
+                name: String::new(),
+                key: vec![0; 20],
+            },
+            integrity: Algorithm {
+                id: IntegrityAlgorithm::Undefined,
+                name: String::new(),
+                key: Vec::new(),
+            },
+            lifetime: Some(Lifetime {
+                time: limit(),
+                bytes: limit(),
+                packets: limit(),
+            }),
+            replay_window: 32,
+            ipcomp: IpcompTransform::None,
+            cpi: 0,
+            cpu: u32::MAX,
+            hw_offload: HwOffload::No,
+            security_label: None,
+            esn: false,
+            udp_encapsulation: true,
+            output_mark: Mark::default(),
+            tfc: 0,
+            copy_df: true,
+            copy_ecn: true,
+            copy_dscp: DscpCopy::OutOnly,
+            iptfs_dont_fragment: false,
+            forward_icmp: false,
+            initiator: false,
+            inbound: false,
+            update: false,
+        };
+        let result = backend.install_sa(id(), config);
+        assert_eq!(dumps.load(Ordering::SeqCst), 2, "cleanup was interrupted");
+        if successful {
+            result.unwrap();
+            backend.sas.query(&sa_id(id()).unwrap()).unwrap();
+        } else {
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
+        }
+        let mut native = LinuxSas::new(Default::default()).unwrap();
+        assert_eq!(native.list().unwrap().len(), usize::from(successful));
+        // A later cleanup retries the interrupted dump. It retains an
+        // installed SA's interface and removes a rejected install's interface.
+        backend.cleanup_interfaces().unwrap();
+        assert_eq!(kernel().list().unwrap().len(), usize::from(successful));
+        if successful {
+            backend.remove_sa(id()).unwrap();
+        }
+        assert!(native.list().unwrap().is_empty());
+        assert!(kernel().list().unwrap().is_empty());
+    }
 
     #[rstest]
     #[case::any_port(0, u16::MAX, true)]
