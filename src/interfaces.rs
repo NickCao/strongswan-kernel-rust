@@ -60,19 +60,31 @@ pub trait InterfaceHandle {
 /// leftovers discovered after restart. Backends own naming and ownership rules
 /// and define the native key used to target mutations.
 pub trait InterfaceKernel: Send {
-    type Handle: InterfaceHandle;
+    type Handle: InterfaceHandle + Send + Sync;
 
-    fn list(&mut self) -> io::Result<Vec<ObservedInterface<Self::Handle>>>;
+    fn list(
+        &mut self,
+    ) -> impl std::future::Future<Output = io::Result<Vec<ObservedInterface<Self::Handle>>>> + Send;
     /// Create only: an existing object must not be replaced. Existing owned
     /// interfaces are discovered via list() and updated by the controller.
-    fn create(&mut self, spec: &InterfaceSpec) -> io::Result<Self::Handle>;
+    fn create(
+        &mut self,
+        spec: &InterfaceSpec,
+    ) -> impl std::future::Future<Output = io::Result<Self::Handle>> + Send;
     /// Achieve this configuration for the object identified by the handle.
     /// The backend chooses in-place repair or replacement. Callers must list
     /// again before reusing a handle after a potentially replacing update.
-    fn update(&mut self, handle: &Self::Handle, spec: &InterfaceSpec) -> io::Result<()>;
+    fn update(
+        &mut self,
+        handle: &Self::Handle,
+        spec: &InterfaceSpec,
+    ) -> impl std::future::Future<Output = io::Result<()>> + Send;
     /// An already absent object counts as successfully deleted. The handle's
     /// native key determines the object targeted by this operation.
-    fn delete(&mut self, handle: &Self::Handle) -> io::Result<()>;
+    fn delete(
+        &mut self,
+        handle: &Self::Handle,
+    ) -> impl std::future::Future<Output = io::Result<()>> + Send;
 }
 
 pub struct Interfaces<K: InterfaceKernel> {
@@ -105,22 +117,26 @@ impl<K: InterfaceKernel> Interfaces<K> {
         }
     }
 
-    fn repair(&mut self, if_id: u32, observed: &[ObservedInterface<K::Handle>]) -> io::Result<()> {
+    async fn repair(
+        &mut self,
+        if_id: u32,
+        observed: &[ObservedInterface<K::Handle>],
+    ) -> io::Result<()> {
         let spec = self.spec(if_id);
         if let Some(current) = observed
             .iter()
             .find(|entry| entry.handle.id() == Some(spec.id))
         {
             if current.config.as_ref() != Some(&spec.config) {
-                self.kernel.update(&current.handle, &spec)?;
+                self.kernel.update(&current.handle, &spec).await?;
             }
             return Ok(());
         }
-        self.kernel.create(&spec)?;
+        self.kernel.create(&spec).await?;
         Ok(())
     }
 
-    fn prune(
+    async fn prune(
         &mut self,
         observed: &[ObservedInterface<K::Handle>],
         keep: impl Fn(InterfaceId) -> bool,
@@ -133,7 +149,7 @@ impl<K: InterfaceKernel> Interfaces<K> {
                 .id()
                 .is_none_or(|id| !keep(id) || !retained.insert(id))
             {
-                if let Err(error) = self.kernel.delete(&entry.handle) {
+                if let Err(error) = self.kernel.delete(&entry.handle).await {
                     first_error.get_or_insert(error);
                 }
             }
@@ -141,8 +157,8 @@ impl<K: InterfaceKernel> Interfaces<K> {
         first_error.map_or(Ok(()), Err)
     }
 
-    fn inventory(&mut self) -> io::Result<Vec<ObservedInterface<K::Handle>>> {
-        let mut observed = self.kernel.list()?;
+    async fn inventory(&mut self) -> io::Result<Vec<ObservedInterface<K::Handle>>> {
+        let mut observed = self.kernel.list().await?;
         // If multiple owned objects claim an ID, retain a representable one
         // before attempting a backend repair of an unrepresentable duplicate.
         observed.sort_by_key(|entry| entry.config.is_none());
@@ -151,29 +167,29 @@ impl<K: InterfaceKernel> Interfaces<K> {
 
     /// Prepare an interface before installing an SA. If installation fails,
     /// remove_unused() rolls this temporary ownership back.
-    pub fn ensure(&mut self, id: u32) -> io::Result<()> {
-        let observed = self.inventory()?;
-        let cleanup = self.prune(&observed, |_| true);
-        let repair = self.repair(id, &observed);
+    pub async fn ensure(&mut self, id: u32) -> io::Result<()> {
+        let observed = self.inventory().await?;
+        let cleanup = self.prune(&observed, |_| true).await;
+        let repair = self.repair(id, &observed).await;
         cleanup.and(repair)
     }
 
     /// Immediate cleanup after SA deletion, hard expiry or failed installation.
     /// This also runs after session loss, without repairing retained interfaces.
-    pub fn remove_unused(&mut self, desired: &HashSet<u32>) -> io::Result<()> {
-        let observed = self.inventory()?;
+    pub async fn remove_unused(&mut self, desired: &HashSet<u32>) -> io::Result<()> {
+        let observed = self.inventory().await?;
         let desired: HashSet<_> = desired.iter().map(|id| InterfaceId(*id)).collect();
-        self.prune(&observed, |id| desired.contains(&id))
+        self.prune(&observed, |id| desired.contains(&id)).await
     }
 
     /// Desired IDs come from the current SA ownership set, not from observed
     /// kernel SAs or policy references. One listing serves the entire pass.
-    pub fn reconcile(&mut self, desired: &HashSet<u32>) -> io::Result<()> {
-        let observed = self.inventory()?;
+    pub async fn reconcile(&mut self, desired: &HashSet<u32>) -> io::Result<()> {
+        let observed = self.inventory().await?;
         let ids: HashSet<_> = desired.iter().map(|id| InterfaceId(*id)).collect();
-        let mut first_error = self.prune(&observed, |id| ids.contains(&id)).err();
+        let mut first_error = self.prune(&observed, |id| ids.contains(&id)).await.err();
         for id in desired {
-            if let Err(error) = self.repair(*id, &observed) {
+            if let Err(error) = self.repair(*id, &observed).await {
                 first_error.get_or_insert(error);
             }
         }
@@ -214,7 +230,7 @@ mod tests {
     }
     impl InterfaceKernel for MemoryKernel {
         type Handle = MemoryHandle;
-        fn list(&mut self) -> io::Result<Vec<ObservedInterface<MemoryHandle>>> {
+        async fn list(&mut self) -> io::Result<Vec<ObservedInterface<MemoryHandle>>> {
             Ok(self
                 .objects
                 .iter()
@@ -222,7 +238,7 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        fn create(&mut self, spec: &InterfaceSpec) -> io::Result<MemoryHandle> {
+        async fn create(&mut self, spec: &InterfaceSpec) -> io::Result<MemoryHandle> {
             if self.reject.contains(&spec.config.if_id) {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
@@ -248,7 +264,7 @@ mod tests {
             });
             Ok(handle)
         }
-        fn update(&mut self, handle: &MemoryHandle, spec: &InterfaceSpec) -> io::Result<()> {
+        async fn update(&mut self, handle: &MemoryHandle, spec: &InterfaceSpec) -> io::Result<()> {
             self.updates += 1;
             if self.reject.contains(&spec.config.if_id) || self.unowned.contains(&handle.identity) {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
@@ -264,7 +280,7 @@ mod tests {
             self.writes += 1;
             Ok(())
         }
-        fn delete(&mut self, handle: &MemoryHandle) -> io::Result<()> {
+        async fn delete(&mut self, handle: &MemoryHandle) -> io::Result<()> {
             if self.unowned.contains(&handle.identity) {
                 return Ok(());
             }
@@ -280,26 +296,26 @@ mod tests {
         Interfaces::new(MemoryKernel::default(), Some("gravity".into()), 1400)
     }
 
-    #[test]
-    fn logical_identity_is_independent_of_native_configuration() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn logical_identity_is_independent_of_native_configuration() {
         let mut kernel = MemoryKernel::default();
         let mut spec = controller().spec(41);
         spec.id = InterfaceId(7);
-        let handle = kernel.create(&spec).unwrap();
+        let handle = kernel.create(&spec).await.unwrap();
         assert_eq!(handle.id(), Some(InterfaceId(7)));
         assert_eq!(kernel.objects[0].config.as_ref().unwrap().if_id, 41);
         spec.config.if_id = 42;
-        kernel.update(&handle, &spec).unwrap();
+        kernel.update(&handle, &spec).await.unwrap();
         assert_eq!(kernel.objects[0].handle.id(), Some(InterfaceId(7)));
         assert_eq!(kernel.objects[0].config.as_ref().unwrap().if_id, 42);
         assert_eq!(kernel.objects[0].handle.name, "memory-00000007");
     }
 
-    #[test]
-    fn repairs_configuration_without_updating_unchanged_interfaces() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn repairs_configuration_without_updating_unchanged_interfaces() {
         let mut interfaces = controller();
         let desired = HashSet::from([41]);
-        interfaces.ensure(41).unwrap();
+        interfaces.ensure(41).await.unwrap();
         let original = interfaces.kernel.objects[0].handle.identity;
         let spec = interfaces.spec(41);
         let config = interfaces.kernel.objects[0].config.as_mut().unwrap();
@@ -307,68 +323,76 @@ mod tests {
         config.master = None;
         config.up = false;
         config.multicast = false;
-        interfaces.reconcile(&desired).unwrap();
+        interfaces.reconcile(&desired).await.unwrap();
         assert_eq!(
             interfaces.kernel.objects[0].config.as_ref(),
             Some(&spec.config)
         );
         assert_eq!(interfaces.kernel.objects[0].handle.identity, original);
         let updates = interfaces.kernel.updates;
-        interfaces.reconcile(&desired).unwrap();
+        interfaces.reconcile(&desired).await.unwrap();
         assert_eq!(
             interfaces.kernel.updates, updates,
             "unchanged interfaces must not call update"
         );
         interfaces.kernel.objects.clear();
-        interfaces.reconcile(&desired).unwrap();
+        interfaces.reconcile(&desired).await.unwrap();
         assert_ne!(interfaces.kernel.objects[0].handle.identity, original);
         // The backend releases ownership; a conflicting unowned object stays.
         interfaces.kernel.objects[0].handle.identity = 999;
         interfaces.kernel.unowned.insert(999);
         assert_eq!(
-            interfaces.reconcile(&desired).unwrap_err().raw_os_error(),
+            interfaces
+                .reconcile(&desired)
+                .await
+                .unwrap_err()
+                .raw_os_error(),
             Some(libc::EEXIST)
         );
-        interfaces.reconcile(&HashSet::new()).unwrap();
+        interfaces.reconcile(&HashSet::new()).await.unwrap();
         assert_eq!(interfaces.kernel.objects.len(), 1);
         assert_eq!(interfaces.kernel.objects[0].handle.identity, 999);
     }
 
-    #[test]
-    fn sharing_rollback_and_teardown_follow_current_sa_ownership() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharing_rollback_and_teardown_follow_current_sa_ownership() {
         let mut interfaces = controller();
-        interfaces.ensure(41).unwrap();
+        interfaces.ensure(41).await.unwrap();
         let handle = interfaces.kernel.objects[0].handle.identity;
-        interfaces.ensure(41).unwrap();
+        interfaces.ensure(41).await.unwrap();
         assert_eq!(interfaces.kernel.objects[0].handle.identity, handle);
         assert_eq!(interfaces.kernel.writes, 1);
         interfaces.kernel.reject.insert(42);
-        assert!(interfaces.ensure(42).is_err());
+        assert!(interfaces.ensure(42).await.is_err());
         assert_eq!(interfaces.kernel.objects.len(), 1);
-        interfaces.ensure(43).unwrap();
-        interfaces.remove_unused(&HashSet::from([41])).unwrap();
+        interfaces.ensure(43).await.unwrap();
+        interfaces
+            .remove_unused(&HashSet::from([41]))
+            .await
+            .unwrap();
         assert_eq!(
             interfaces.kernel.objects.len(),
             1,
             "failed SA installation must release its interface"
         );
         interfaces.kernel.objects.clear();
-        interfaces.reconcile(&HashSet::new()).unwrap();
-        interfaces.reconcile(&HashSet::new()).unwrap();
+        interfaces.reconcile(&HashSet::new()).await.unwrap();
+        interfaces.reconcile(&HashSet::new()).await.unwrap();
         assert!(interfaces.kernel.objects.is_empty());
     }
 
-    #[test]
-    fn one_failed_repair_does_not_block_other_interfaces() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_failed_repair_does_not_block_other_interfaces() {
         let mut interfaces = controller();
-        interfaces.ensure(41).unwrap();
-        interfaces.ensure(42).unwrap();
+        interfaces.ensure(41).await.unwrap();
+        interfaces.ensure(42).await.unwrap();
         interfaces.kernel.objects[0].config.as_mut().unwrap().mtu = 1280;
         interfaces.kernel.objects.pop();
         interfaces.kernel.reject.insert(41);
         assert_eq!(
             interfaces
                 .reconcile(&HashSet::from([41, 42]))
+                .await
                 .unwrap_err()
                 .raw_os_error(),
             Some(libc::EIO)
@@ -379,7 +403,10 @@ mod tests {
             .iter()
             .any(|entry| entry.config.as_ref() == Some(&interfaces.spec(42).config)));
         interfaces.kernel.reject.clear();
-        interfaces.reconcile(&HashSet::from([41, 42])).unwrap();
+        interfaces
+            .reconcile(&HashSet::from([41, 42]))
+            .await
+            .unwrap();
         assert!(interfaces
             .kernel
             .objects
@@ -387,11 +414,11 @@ mod tests {
             .any(|entry| entry.config.as_ref() == Some(&interfaces.spec(41).config)));
     }
 
-    #[test]
-    fn empty_desired_set_retries_deletions_and_preserves_foreign_interfaces() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_desired_set_retries_deletions_and_preserves_foreign_interfaces() {
         let mut interfaces = controller();
-        interfaces.ensure(41).unwrap();
-        interfaces.ensure(42).unwrap();
+        interfaces.ensure(41).await.unwrap();
+        interfaces.ensure(42).await.unwrap();
         interfaces.kernel.objects.push(ObservedInterface {
             handle: MemoryHandle {
                 identity: 999,
@@ -403,19 +430,19 @@ mod tests {
         interfaces.kernel.unowned.insert(999);
         let failed = interfaces.kernel.objects[0].handle.identity;
         interfaces.kernel.reject_delete.insert(failed);
-        assert!(interfaces.reconcile(&HashSet::new()).is_err());
+        assert!(interfaces.reconcile(&HashSet::new()).await.is_err());
         assert_eq!(interfaces.kernel.objects.len(), 2);
         let writes = interfaces.kernel.writes;
         interfaces.kernel.reject_delete.clear();
-        interfaces.reconcile(&HashSet::new()).unwrap();
-        interfaces.reconcile(&HashSet::new()).unwrap();
+        interfaces.reconcile(&HashSet::new()).await.unwrap();
+        interfaces.reconcile(&HashSet::new()).await.unwrap();
         assert_eq!(interfaces.kernel.objects.len(), 1);
         assert_eq!(interfaces.kernel.objects[0].handle.identity, 999);
         assert_eq!(interfaces.kernel.writes, writes);
     }
 
-    #[test]
-    fn known_ids_with_unrepresentable_config_are_updated_and_survive_controller_restart() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn known_ids_with_unrepresentable_config_are_updated_and_survive_controller_restart() {
         let mut interfaces = controller();
         interfaces.kernel.objects.push(ObservedInterface {
             handle: MemoryHandle {
@@ -426,7 +453,7 @@ mod tests {
             config: None,
         });
         interfaces.kernel.next = 1;
-        interfaces.ensure(41).unwrap();
+        interfaces.ensure(41).await.unwrap();
         assert_eq!(interfaces.kernel.objects.len(), 1);
         assert_eq!(interfaces.kernel.objects[0].handle.identity, 1);
         assert_eq!(interfaces.kernel.updates, 1);
@@ -440,19 +467,20 @@ mod tests {
             mtu,
         } = interfaces;
         let mut restarted = Interfaces::new(kernel, master, mtu);
-        restarted.reconcile(&HashSet::from([41])).unwrap();
+        restarted.reconcile(&HashSet::from([41])).await.unwrap();
         assert_eq!(
             restarted.kernel.writes, 1,
             "owned inventory must be reused after restart"
         );
-        restarted.reconcile(&HashSet::new()).unwrap();
+        restarted.reconcile(&HashSet::new()).await.unwrap();
         assert!(restarted.kernel.objects.is_empty());
     }
 
-    #[test]
-    fn unidentified_objects_and_duplicate_ids_are_deleted_without_replacing_the_retained_object() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn unidentified_objects_and_duplicate_ids_are_deleted_without_replacing_the_retained_object(
+    ) {
         let mut interfaces = controller();
-        interfaces.ensure(41).unwrap();
+        interfaces.ensure(41).await.unwrap();
         let original = interfaces.kernel.objects[0].clone();
         let mut duplicate = original.clone();
         duplicate.handle.identity = 98;
@@ -466,7 +494,7 @@ mod tests {
             },
             config: None,
         });
-        interfaces.reconcile(&HashSet::from([41])).unwrap();
+        interfaces.reconcile(&HashSet::from([41])).await.unwrap();
         assert_eq!(interfaces.kernel.objects.len(), 1);
         assert_eq!(
             interfaces.kernel.objects[0].handle.identity,

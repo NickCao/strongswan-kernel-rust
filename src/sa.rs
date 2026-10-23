@@ -55,8 +55,8 @@ pub struct ObservedSa<H, C> {
 /// representation belongs to the backend; the controller only compares them.
 /// There is deliberately no operation to update an established SA.
 pub trait SaKernel: Send {
-    type Handle: SaHandle;
-    type Config: PartialEq;
+    type Handle: SaHandle + Send + Sync;
+    type Config: PartialEq + Send + Sync;
 
     fn features(&self) -> KernelFeatures;
     fn allocate(
@@ -66,17 +66,28 @@ pub trait SaKernel: Send {
         proto: u8,
         min: u32,
         max: u32,
-    ) -> io::Result<u32>;
-    fn list(&mut self) -> io::Result<Vec<ObservedSa<Self::Handle, Self::Config>>>;
-    fn get(&mut self, id: &SaId) -> io::Result<ObservedSa<Self::Handle, Self::Config>>;
+    ) -> impl std::future::Future<Output = io::Result<u32>> + Send;
+    fn list(
+        &mut self,
+    ) -> impl std::future::Future<Output = io::Result<Vec<ObservedSa<Self::Handle, Self::Config>>>> + Send;
+    fn get(
+        &mut self,
+        id: &SaId,
+    ) -> impl std::future::Future<Output = io::Result<ObservedSa<Self::Handle, Self::Config>>> + Send;
     /// First installation only. config.update may complete a known larval
     /// reservation or create it if the reservation expired. An existing
     /// established SA must never be modified, even for a repeated request.
     /// Return the canonical installed configuration after resolving defaults.
-    fn create(&mut self, spec: &SaSpec<'_>) -> io::Result<ObservedSa<Self::Handle, Self::Config>>;
-    fn delete(&mut self, handle: &Self::Handle) -> io::Result<()>;
+    fn create(
+        &mut self,
+        spec: &SaSpec<'_>,
+    ) -> impl std::future::Future<Output = io::Result<ObservedSa<Self::Handle, Self::Config>>> + Send;
+    fn delete(
+        &mut self,
+        handle: &Self::Handle,
+    ) -> impl std::future::Future<Output = io::Result<()>> + Send;
     /// Bulk deletion also covers acquisitions without an addressable SPI.
-    fn flush(&mut self) -> io::Result<()>;
+    fn flush(&mut self) -> impl std::future::Future<Output = io::Result<()>> + Send;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -134,7 +145,7 @@ impl<K: SaKernel> Sas<K> {
     pub fn contains(&self, id: &SaId) -> bool {
         self.installed.contains_key(&id.key())
     }
-    pub fn allocate(
+    pub async fn allocate(
         &mut self,
         src: Endpoint,
         dst: Endpoint,
@@ -142,7 +153,7 @@ impl<K: SaKernel> Sas<K> {
         min: u32,
         max: u32,
     ) -> io::Result<u32> {
-        let spi = self.kernel.allocate(&src, &dst, proto, min, max)?;
+        let spi = self.kernel.allocate(&src, &dst, proto, min, max).await?;
         self.reservations.insert(Reservation {
             src: src.address,
             dst: dst.address,
@@ -151,7 +162,7 @@ impl<K: SaKernel> Sas<K> {
         });
         Ok(spi)
     }
-    pub fn install(&mut self, id: &SaId, data: &SaConfig) -> io::Result<()> {
+    pub async fn install(&mut self, id: &SaId, data: &SaConfig) -> io::Result<()> {
         let key = id.key();
         if self.installed.contains_key(&key) {
             return Err(io::Error::from_raw_os_error(libc::EEXIST));
@@ -160,7 +171,7 @@ impl<K: SaKernel> Sas<K> {
         if data.update && !self.reservations.contains(&reservation) {
             return Err(missing());
         }
-        let current = self.kernel.create(&SaSpec { id, config: data })?;
+        let current = self.kernel.create(&SaSpec { id, config: data }).await?;
         let config = current
             .config
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EOPNOTSUPP))?;
@@ -174,19 +185,19 @@ impl<K: SaKernel> Sas<K> {
         self.reservations.remove(&reservation);
         Ok(())
     }
-    pub fn query(&mut self, id: &SaId) -> io::Result<SaUsage> {
+    pub async fn query(&mut self, id: &SaId) -> io::Result<SaUsage> {
         if !self.contains(id) {
             return Err(missing());
         }
-        Ok(self.kernel.get(id)?.usage)
+        Ok(self.kernel.get(id).await?.usage)
     }
-    pub fn remove(&mut self, id: &SaId) -> io::Result<()> {
+    pub async fn remove(&mut self, id: &SaId) -> io::Result<()> {
         // Desired state is removed even if native deletion fails. Future
         // inventories retry deletion; neither the SA nor its interface revives.
         self.installed.remove(&id.key());
         self.reservations.remove(&Reservation::from(id));
-        match self.kernel.get(id) {
-            Ok(current) => self.kernel.delete(&current.handle),
+        match self.kernel.get(id).await {
+            Ok(current) => self.kernel.delete(&current.handle).await,
             Err(error) if is_missing(&error) => Ok(()),
             Err(error) => Err(error),
         }
@@ -201,10 +212,10 @@ impl<K: SaKernel> Sas<K> {
             self.installed.contains_key(&key)
         }
     }
-    pub fn reconcile(&mut self) -> io::Result<SaChanges> {
+    pub async fn reconcile(&mut self) -> io::Result<SaChanges> {
         // Never interpret a failed, partial or undecodable inventory as loss.
         // The caller holds the installation/deletion lock for this entire pass.
-        let inventory = self.kernel.list()?;
+        let inventory = self.kernel.list().await?;
         let mut retained = HashSet::new();
         let mut cleanup_error = None;
         for current in inventory {
@@ -223,7 +234,7 @@ impl<K: SaKernel> Sas<K> {
             {
                 continue;
             }
-            if let Err(error) = self.kernel.delete(&current.handle) {
+            if let Err(error) = self.kernel.delete(&current.handle).await {
                 cleanup_error.get_or_insert(error);
             }
         }
@@ -241,10 +252,10 @@ impl<K: SaKernel> Sas<K> {
             cleanup_error,
         })
     }
-    pub fn clear(&mut self) -> io::Result<()> {
+    pub async fn clear(&mut self) -> io::Result<()> {
         self.installed.clear();
         self.reservations.clear();
-        self.kernel.flush()
+        self.kernel.flush().await
     }
 }
 
@@ -274,7 +285,7 @@ mod tests {
         fn features(&self) -> KernelFeatures {
             KernelFeatures::empty()
         }
-        fn allocate(
+        async fn allocate(
             &mut self,
             src: &Endpoint,
             dst: &Endpoint,
@@ -295,7 +306,7 @@ mod tests {
                 .insert(id, (None, SaState::Larval, 1, SaUsage::default()));
             Ok(min)
         }
-        fn list(&mut self) -> io::Result<Vec<ObservedSa<Handle, u32>>> {
+        async fn list(&mut self) -> io::Result<Vec<ObservedSa<Handle, u32>>> {
             if self.fail_list {
                 return Err(io::Error::from_raw_os_error(libc::EINTR));
             }
@@ -311,13 +322,14 @@ mod tests {
                 })
                 .collect())
         }
-        fn get(&mut self, id: &SaId) -> io::Result<ObservedSa<Handle, u32>> {
-            self.list()?
+        async fn get(&mut self, id: &SaId) -> io::Result<ObservedSa<Handle, u32>> {
+            self.list()
+                .await?
                 .into_iter()
                 .find(|current| current.handle.id() == &id.key())
                 .ok_or_else(missing)
         }
-        fn create(&mut self, spec: &SaSpec<'_>) -> io::Result<ObservedSa<Handle, u32>> {
+        async fn create(&mut self, spec: &SaSpec<'_>) -> io::Result<ObservedSa<Handle, u32>> {
             self.creates += 1;
             self.objects.retain(|id, (_, state, _, _)| {
                 !(*state == SaState::Larval && Reservation::from(id) == Reservation::from(spec.id))
@@ -331,16 +343,16 @@ mod tests {
                     SaUsage::default(),
                 ),
             );
-            self.get(spec.id)
+            self.get(spec.id).await
         }
-        fn delete(&mut self, handle: &Handle) -> io::Result<()> {
+        async fn delete(&mut self, handle: &Handle) -> io::Result<()> {
             if self.fail_delete {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
             self.objects.remove(handle.id());
             Ok(())
         }
-        fn flush(&mut self) -> io::Result<()> {
+        async fn flush(&mut self) -> io::Result<()> {
             self.objects.clear();
             Ok(())
         }
@@ -410,90 +422,91 @@ mod tests {
             },
         )
     }
-    #[test]
-    fn audits_retire_loss_and_drift_without_reinstalling() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn audits_retire_loss_and_drift_without_reinstalling() {
         let (id, data) = fixture();
         let mut sas = Sas::new(MemoryKernel::default());
-        sas.install(&id, &data).unwrap();
+        sas.install(&id, &data).await.unwrap();
         sas.kernel.objects.get_mut(&id.key()).unwrap().3 = SaUsage {
             bytes: 100,
             packets: 10,
             last_use: 5,
         };
-        assert!(sas.reconcile().unwrap().expired.is_empty());
-        assert_eq!(sas.query(&id).unwrap().packets, 10);
+        assert!(sas.reconcile().await.unwrap().expired.is_empty());
+        assert_eq!(sas.query(&id).await.unwrap().packets, 10);
         sas.kernel.objects.get_mut(&id.key()).unwrap().0 = Some(43);
-        assert_eq!(sas.reconcile().unwrap().expired, vec![id.key()]);
+        assert_eq!(sas.reconcile().await.unwrap().expired, vec![id.key()]);
         assert!(sas.kernel.objects.is_empty());
-        assert!(sas.reconcile().unwrap().expired.is_empty());
+        assert!(sas.reconcile().await.unwrap().expired.is_empty());
         assert_eq!(sas.kernel.creates, 1);
-        sas.install(&id, &data).unwrap();
+        sas.install(&id, &data).await.unwrap();
         sas.kernel.objects.clear();
-        assert_eq!(sas.reconcile().unwrap().expired, vec![id.key()]);
+        assert_eq!(sas.reconcile().await.unwrap().expired, vec![id.key()]);
         assert_eq!(sas.kernel.creates, 2);
-        sas.remove(&id).unwrap();
+        sas.remove(&id).await.unwrap();
     }
-    #[test]
-    fn failed_inventory_does_not_expire_and_failed_cleanup_does_not_lose_events() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_inventory_does_not_expire_and_failed_cleanup_does_not_lose_events() {
         let (id, data) = fixture();
         let mut sas = Sas::new(MemoryKernel::default());
-        sas.install(&id, &data).unwrap();
+        sas.install(&id, &data).await.unwrap();
         sas.kernel.fail_list = true;
-        assert!(sas.reconcile().is_err());
+        assert!(sas.reconcile().await.is_err());
         assert!(sas.contains(&id));
         sas.kernel.fail_list = false;
         sas.kernel.objects.get_mut(&id.key()).unwrap().2 += 1;
         sas.kernel.fail_delete = true;
-        let changes = sas.reconcile().unwrap();
+        let changes = sas.reconcile().await.unwrap();
         assert_eq!(changes.expired, vec![id.key()]);
         assert!(changes.cleanup_error.is_some());
         assert!(!sas.contains(&id));
         sas.kernel.fail_delete = false;
-        assert!(sas.reconcile().unwrap().expired.is_empty());
+        assert!(sas.reconcile().await.unwrap().expired.is_empty());
         assert!(sas.kernel.objects.is_empty());
     }
-    #[test]
-    fn reservations_are_not_established_and_expiry_is_not_resurrected() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn reservations_are_not_established_and_expiry_is_not_resurrected() {
         let (mut id, mut data) = fixture();
         let mut sas = Sas::new(MemoryKernel::default());
         id.spi = sas
             .allocate(id.src, id.dst, 50, 0xc0000000, 0xcfffffff)
+            .await
             .unwrap();
-        assert!(sas.reconcile().unwrap().expired.is_empty());
+        assert!(sas.reconcile().await.unwrap().expired.is_empty());
         assert_eq!(sas.kernel.objects.len(), 1);
         data.update = true;
         sas.kernel.objects.clear(); // Expired reservation is safe to complete.
-        sas.install(&id, &data).unwrap();
+        sas.install(&id, &data).await.unwrap();
         assert_eq!(
-            sas.install(&id, &data).unwrap_err().raw_os_error(),
+            sas.install(&id, &data).await.unwrap_err().raw_os_error(),
             Some(libc::EEXIST)
         );
         assert!(sas.expire(&id, true));
         assert!(!sas.expire(&id, true));
         assert_eq!(
-            sas.install(&id, &data).unwrap_err().raw_os_error(),
+            sas.install(&id, &data).await.unwrap_err().raw_os_error(),
             Some(libc::ENOENT)
         );
-        assert!(sas.reconcile().unwrap().expired.is_empty());
+        assert!(sas.reconcile().await.unwrap().expired.is_empty());
         assert!(sas.kernel.objects.is_empty());
     }
-    #[test]
-    fn removing_one_sa_keeps_overlapping_rekey_and_prunes_unwanted_objects() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn removing_one_sa_keeps_overlapping_rekey_and_prunes_unwanted_objects() {
         let (old, data) = fixture();
         let mut new = old.clone();
         new.spi += 1;
         let mut sas = Sas::new(MemoryKernel::default());
-        sas.install(&old, &data).unwrap();
-        sas.install(&new, &data).unwrap();
-        sas.remove(&old).unwrap();
+        sas.install(&old, &data).await.unwrap();
+        sas.install(&new, &data).await.unwrap();
+        sas.remove(&old).await.unwrap();
         sas.kernel.objects.insert(
             old.key(),
             (Some(42), SaState::Installed, 10, SaUsage::default()),
         );
-        assert!(sas.reconcile().unwrap().expired.is_empty());
+        assert!(sas.reconcile().await.unwrap().expired.is_empty());
         assert!(!sas.kernel.objects.contains_key(&old.key()));
         assert!(sas.contains(&new));
-        sas.clear().unwrap();
+        sas.clear().await.unwrap();
         assert!(sas.is_empty() && sas.kernel.objects.is_empty());
     }
 }

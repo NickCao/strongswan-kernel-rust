@@ -18,8 +18,7 @@ libc = "0.2"
 kernel-rust-protocol = { path = "protocol" }
 rustix = { version = "1.1", features = ["net", "process", "fs", "time", "system", "event"] }
 nix = { version = "0.31", features = ["user", "signal"] }
-# 0.7.5's EINTR handler reads the event buffer instead of retrying; see README.
-neli = "=0.7.4"
+neli = { version = "0.7.5", default-features = false, features = ["async"] }
 ipnet = "2.12.2"
 netlink-packet-xfrm = "0.5.0"
 netlink-packet-core = "0.9.0"
@@ -27,7 +26,7 @@ netlink-packet-route = "0.33.0"
 clap = { version = "4.6.7", features = ["derive"] }
 sd-notify = "0.5.0"
 tarpc = { version = "0.38", features = ["serde-transport-bincode", "unix"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "io-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal", "macros", "io-util", "io-std"] }
 futures = "0.3"
 
 [dev-dependencies]

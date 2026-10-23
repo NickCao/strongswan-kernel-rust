@@ -107,20 +107,21 @@ pub fn index(name: &str) -> io::Result<u32> {
     rustix::net::netdevice::name_to_index(&socket, name).map_err(io::Error::from)
 }
 impl Network {
-    pub fn new() -> io::Result<Self> {
+    pub async fn new() -> io::Result<Self> {
         Ok(Self {
-            socket: Netlink::new(NlFamily::Route)?,
+            socket: Netlink::new(NlFamily::Route).await?,
             config: SessionConfig::default(),
             snapshot: None,
         })
     }
-    pub(crate) fn request(
+    pub(crate) async fn request(
         &self,
         request: RouteNetlinkMessage,
         flags: NlmF,
     ) -> io::Result<Vec<RouteNetlinkMessage>> {
         self.socket
-            .request(&Message::new(request.message_type(), flags, &request))?
+            .request(&Message::new(request.message_type(), flags, &request))
+            .await?
             .into_iter()
             .map(|reply| {
                 RouteNetlinkMessage::parse_with_param(&reply.payload, reply.kind)
@@ -131,19 +132,19 @@ impl Network {
     pub fn invalidate(&mut self) {
         self.snapshot = None;
     }
-    fn snapshot(&mut self) -> io::Result<Arc<Snapshot>> {
+    async fn snapshot(&mut self) -> io::Result<Arc<Snapshot>> {
         if self.snapshot.is_none() {
             self.snapshot = Some(Arc::new(Snapshot {
-                links: self.links()?,
-                addresses: self.addresses()?,
+                links: self.links().await?,
+                addresses: self.addresses().await?,
             }));
         }
         Ok(self.snapshot.as_ref().unwrap().clone())
     }
-    pub fn links(&mut self) -> io::Result<Vec<Link>> {
+    pub async fn links(&mut self) -> io::Result<Vec<Link>> {
         let mut links = Vec::new();
         let request = RouteNetlinkMessage::GetLink(LinkMessage::default());
-        for reply in self.request(request, NlmF::DUMP)? {
+        for reply in self.request(request, NlmF::DUMP).await? {
             let RouteNetlinkMessage::NewLink(info) = reply else {
                 continue;
             };
@@ -154,10 +155,13 @@ impl Network {
         }
         Ok(links)
     }
-    pub(crate) fn link(&mut self, index: u32) -> io::Result<Option<Link>> {
+    pub(crate) async fn link(&mut self, index: u32) -> io::Result<Option<Link>> {
         let mut request = LinkMessage::default();
         request.header.index = index;
-        let replies = match self.request(RouteNetlinkMessage::GetLink(request), NlmF::empty()) {
+        let replies = match self
+            .request(RouteNetlinkMessage::GetLink(request), NlmF::empty())
+            .await
+        {
             Ok(replies) => replies,
             Err(error) if error.raw_os_error() == Some(libc::ENODEV) => return Ok(None),
             Err(error) => return Err(error),
@@ -167,10 +171,10 @@ impl Network {
             _ => None,
         }))
     }
-    pub fn addresses(&mut self) -> io::Result<Vec<AddressEntry>> {
+    pub async fn addresses(&mut self) -> io::Result<Vec<AddressEntry>> {
         let mut out = Vec::new();
         let request = RouteNetlinkMessage::GetAddress(AddressMessage::default());
-        for reply in self.request(request, NlmF::DUMP)? {
+        for reply in self.request(request, NlmF::DUMP).await? {
             let RouteNetlinkMessage::NewAddress(info) = reply else {
                 continue;
             };
@@ -203,11 +207,11 @@ impl Network {
         }
         Ok(out)
     }
-    pub fn enumerate(&mut self, which: AddressTypes) -> io::Result<Vec<Endpoint>> {
+    pub async fn enumerate(&mut self, which: AddressTypes) -> io::Result<Vec<Endpoint>> {
         if !which.contains(AddressTypes::REGULAR) {
             return Ok(Vec::new());
         }
-        let snapshot = self.snapshot()?;
+        let snapshot = self.snapshot().await?;
         Ok(snapshot
             .addresses
             .iter()
@@ -233,8 +237,8 @@ impl Network {
             .map(|a| a.host)
             .collect())
     }
-    pub fn subnets(&mut self) -> io::Result<Vec<(Endpoint, u8, String)>> {
-        let snapshot = self.snapshot()?;
+    pub async fn subnets(&mut self) -> io::Result<Vec<(Endpoint, u8, String)>> {
+        let snapshot = self.snapshot().await?;
         Ok(snapshot
             .addresses
             .iter()
@@ -254,8 +258,8 @@ impl Network {
             })
             .collect())
     }
-    pub fn interface(&mut self, host: &Endpoint) -> io::Result<String> {
-        let snapshot = self.snapshot()?;
+    pub async fn interface(&mut self, host: &Endpoint) -> io::Result<String> {
+        let snapshot = self.snapshot().await?;
         for a in &snapshot.addresses {
             if a.host.address == host.address {
                 if let Some(link) = snapshot
@@ -274,7 +278,7 @@ impl Network {
             && link.xfrm_if_id.is_none()
             && self.config.usable(&link.name)
     }
-    pub fn lookup(
+    pub async fn lookup(
         &mut self,
         dest: &Endpoint,
         src: Option<&Endpoint>,
@@ -305,7 +309,8 @@ impl Network {
         // Use the kernel's FIB and routing rules, without dumping BGP tables
         // or trying to choose an alternative to an excluded kernel route.
         let info = self
-            .request(RouteNetlinkMessage::GetRoute(query), NlmF::empty())?
+            .request(RouteNetlinkMessage::GetRoute(query), NlmF::empty())
+            .await?
             .into_iter()
             .find_map(|reply| match reply {
                 RouteNetlinkMessage::NewRoute(info) => Some(info),
@@ -325,7 +330,7 @@ impl Network {
                 _ => (),
             }
         }
-        let snapshot = self.snapshot()?;
+        let snapshot = self.snapshot().await?;
         let link = snapshot
             .links
             .iter()
@@ -365,15 +370,16 @@ impl Network {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn actual_network_discovery() {
-        let mut net = Network::new().unwrap();
-        let links = net.links().unwrap();
+    #[tokio::test(flavor = "current_thread")]
+    async fn actual_network_discovery() {
+        let mut net = Network::new().await.unwrap();
+        let links = net.links().await.unwrap();
         assert!(links.iter().any(|l| l.name == "lo"));
-        let addresses = net.addresses().unwrap();
+        let addresses = net.addresses().await.unwrap();
         assert!(addresses.iter().any(|a| a.host.address.is_loopback()));
         assert_eq!(
             net.interface(&Endpoint::new("127.0.0.1".parse().unwrap(), 0))
+                .await
                 .unwrap(),
             "lo"
         );

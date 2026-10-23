@@ -3,12 +3,13 @@ use super::*;
 
 #[rstest]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn fib_lookups_follow_route_changes(
+#[tokio::test(flavor = "current_thread")]
+async fn fib_lookups_follow_route_changes(
     daemon: Fixture,
     #[values(Family::V4, Family::V6)] family: Family,
     #[values(false, true)] explicit_source: bool,
 ) {
-    let rpc = daemon.session();
+    let rpc = daemon.session().await;
     let destination = family.destination();
     let source = explicit_source.then(|| {
         let mut s = family.local();
@@ -27,6 +28,7 @@ fn fib_lookups_follow_route_changes(
     ]);
     let selected = rpc
         .call(rpc.kernel.get_source_address(ctx(), destination, source))
+        .await
         .unwrap();
     assert_eq!(selected.address, family.local().address);
     if let Some(source) = source {
@@ -34,6 +36,7 @@ fn fib_lookups_follow_route_changes(
     }
     let route = rpc
         .call(rpc.kernel.get_next_hop(ctx(), destination, source, None))
+        .await
         .unwrap();
     assert_eq!(
         (route.gateway.address, route.interface.as_str()),
@@ -51,16 +54,18 @@ fn fib_lookups_follow_route_changes(
     ]);
     assert_eq!(
         rpc.call(rpc.kernel.get_next_hop(ctx(), destination, source, None))
+            .await
             .unwrap()
             .gateway
             .address,
         replacement.address
     );
     assert!(matches!(
-        rpc.call(rpc.kernel.get_next_hop(ctx(), destination, None, Some(24))),
+        rpc.call(rpc.kernel.get_next_hop(ctx(), destination, None, Some(24)))
+            .await,
         Err(Error::Kernel(libc::EOPNOTSUPP))
     ));
-    rpc.close();
+    rpc.close().await;
 }
 
 #[rstest]
@@ -69,19 +74,21 @@ fn fib_lookups_follow_route_changes(
 #[case::allowlist_wins("underlay", "underlay", 0)]
 #[case::exact_names("", "under*", 0)]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn route_interface_filters(
+#[tokio::test(flavor = "current_thread")]
+async fn route_interface_filters(
     daemon: Fixture,
     #[values(Family::V4, Family::V6)] family: Family,
     #[case] allow: &str,
     #[case] ignore: &str,
     #[case] errno: i32,
 ) {
-    let rpc = daemon.connect();
+    let rpc = daemon.connect().await;
     rpc.open(SessionConfig {
         interfaces_use: allow.into(),
         interfaces_ignore: ignore.into(),
         ..Default::default()
-    });
+    })
+    .await;
     ip(&[
         "route",
         "add",
@@ -91,27 +98,30 @@ fn route_interface_filters(
         "dev",
         "underlay",
     ]);
-    let result = rpc.call(
-        rpc.kernel
-            .get_source_address(ctx(), family.destination(), None),
-    );
+    let result = rpc
+        .call(
+            rpc.kernel
+                .get_source_address(ctx(), family.destination(), None),
+        )
+        .await;
     if errno == 0 {
         assert_eq!(result.unwrap().address, family.local().address);
     } else {
         assert_eq!(result, Err(Error::Kernel(errno)));
     }
-    rpc.close();
+    rpc.close().await;
 }
 
 #[rstest]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn xfrm_egress_and_policy_rules_are_honored(
+#[tokio::test(flavor = "current_thread")]
+async fn xfrm_egress_and_policy_rules_are_honored(
     daemon: Fixture,
     #[values(Family::V4, Family::V6)] family: Family,
 ) {
     ip(&["link", "add", "foreign", "type", "xfrm", "if_id", "77"]);
     ip(&["link", "set", "foreign", "up"]);
-    let rpc = daemon.session();
+    let rpc = daemon.session().await;
     ip(&[
         "route",
         "add",
@@ -123,14 +133,16 @@ fn xfrm_egress_and_policy_rules_are_honored(
         rpc.call(
             rpc.kernel
                 .get_source_address(ctx(), family.destination(), None)
-        ),
+        )
+        .await,
         Err(Error::Kernel(libc::ENETUNREACH))
     );
     assert_eq!(
         rpc.call(
             rpc.kernel
                 .get_next_hop(ctx(), family.destination(), Some(family.local()), None)
-        ),
+        )
+        .await,
         Err(Error::Kernel(libc::ENETUNREACH))
     );
     ip(&["route", "del", &family.destination().address.to_string()]);
@@ -172,10 +184,11 @@ fn xfrm_egress_and_policy_rules_are_honored(
         rpc.call(
             rpc.kernel
                 .get_source_address(ctx(), family.destination(), None)
-        ),
+        )
+        .await,
         Err(Error::Kernel(libc::EHOSTUNREACH))
     );
-    rpc.close();
+    rpc.close().await;
 }
 
 #[rstest]
@@ -186,7 +199,8 @@ fn xfrm_egress_and_policy_rules_are_honored(
 #[case::modifier_only(AddressTypes::IGNORED, false, false)]
 #[case::all(AddressTypes::all(), true, true)]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn address_enumeration_flags(
+#[tokio::test(flavor = "current_thread")]
+async fn address_enumeration_flags(
     daemon: Fixture,
     #[case] which: AddressTypes,
     #[case] down: bool,
@@ -224,12 +238,16 @@ fn address_enumeration_flags(
         "foreign",
         "nodad",
     ]);
-    let rpc = daemon.connect();
+    let rpc = daemon.connect().await;
     rpc.open(SessionConfig {
         interfaces_ignore: "ignored".into(),
         ..Default::default()
-    });
-    let addresses = rpc.call(rpc.kernel.list_addresses(ctx(), which)).unwrap();
+    })
+    .await;
+    let addresses = rpc
+        .call(rpc.kernel.list_addresses(ctx(), which))
+        .await
+        .unwrap();
     let contains = |s: &str| addresses.iter().any(|e| e.address.to_string() == s);
     assert_eq!(contains("198.18.1.1"), down);
     assert_eq!(contains("198.18.2.1"), ignored);
@@ -247,20 +265,22 @@ fn address_enumeration_flags(
             rpc.call(
                 rpc.kernel
                     .get_interface(ctx(), Endpoint::new(address.parse().unwrap(), 0))
-            ),
+            )
+            .await,
             Err(Error::Kernel(libc::ENOENT))
         );
     }
-    let subnets = rpc.call(rpc.kernel.list_subnets(ctx())).unwrap();
+    let subnets = rpc.call(rpc.kernel.list_subnets(ctx())).await.unwrap();
     assert!(subnets.iter().all(|s| s.interface == "underlay"));
-    rpc.close();
+    rpc.close().await;
 }
 
 #[rstest]
 #[case::ignored_dummy(false)]
 #[case::xfrm(true)]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn multihomed_sources_are_independent_of_egress_filters(
+#[tokio::test(flavor = "current_thread")]
+async fn multihomed_sources_are_independent_of_egress_filters(
     daemon: Fixture,
     #[case] xfrm: bool,
     #[values(Family::V4, Family::V6)] family: Family,
@@ -278,11 +298,12 @@ fn multihomed_sources_are_independent_of_egress_filters(
     if source_up {
         ip(&["link", "set", "spare", "up"]);
     }
-    let rpc = daemon.connect();
+    let rpc = daemon.connect().await;
     rpc.open(SessionConfig {
         interfaces_ignore: "spare".into(),
         ..Default::default()
-    });
+    })
+    .await;
     ip(&[
         "route",
         "add",
@@ -300,6 +321,7 @@ fn multihomed_sources_are_independent_of_egress_filters(
             rpc.kernel
                 .get_source_address(ctx(), family.destination(), explicit)
         )
+        .await
         .unwrap()
         .address,
         source.address
@@ -309,21 +331,24 @@ fn multihomed_sources_are_independent_of_egress_filters(
             rpc.kernel
                 .get_next_hop(ctx(), family.destination(), explicit, None)
         )
+        .await
         .unwrap()
         .interface,
         "underlay"
     );
     assert!(!rpc
         .call(rpc.kernel.list_addresses(ctx(), AddressTypes::REGULAR))
+        .await
         .unwrap()
         .iter()
         .any(|e| e.address == source.address));
-    rpc.close();
+    rpc.close().await;
 }
 
 #[rstest]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn discovery_cache_tracks_link_state_changes(
+#[tokio::test(flavor = "current_thread")]
+async fn discovery_cache_tracks_link_state_changes(
     daemon: Fixture,
     #[values(Family::V4, Family::V6)] family: Family,
 ) {
@@ -339,40 +364,43 @@ fn discovery_cache_tracks_link_state_changes(
         "spare",
         "nodad",
     ]);
-    let rpc = daemon.connect();
+    let rpc = daemon.connect().await;
     rpc.open(SessionConfig {
         interfaces_ignore: "spare".into(),
         ..Default::default()
-    });
-    let listed = |which| {
+    })
+    .await;
+    let listed = async |which| {
         rpc.call(rpc.kernel.list_addresses(ctx(), which))
+            .await
             .unwrap()
             .iter()
             .any(|e| e.address == source.address)
     };
-    assert!(!listed(AddressTypes::REGULAR | AddressTypes::IGNORED));
-    assert!(listed(
-        AddressTypes::REGULAR | AddressTypes::IGNORED | AddressTypes::DOWN
-    ));
+    assert!(!listed(AddressTypes::REGULAR | AddressTypes::IGNORED).await);
+    assert!(listed(AddressTypes::REGULAR | AddressTypes::IGNORED | AddressTypes::DOWN).await);
     ip(&["link", "set", "spare", "up"]);
-    eventually(|| listed(AddressTypes::REGULAR | AddressTypes::IGNORED));
-    assert!(!listed(AddressTypes::REGULAR));
+    eventually(async || listed(AddressTypes::REGULAR | AddressTypes::IGNORED).await).await;
+    assert!(!listed(AddressTypes::REGULAR).await);
     ip(&["link", "set", "spare", "down"]);
-    eventually(|| !listed(AddressTypes::REGULAR | AddressTypes::IGNORED));
-    assert!(listed(
-        AddressTypes::REGULAR | AddressTypes::IGNORED | AddressTypes::DOWN
-    ));
-    rpc.close();
+    eventually(async || !listed(AddressTypes::REGULAR | AddressTypes::IGNORED).await).await;
+    assert!(listed(AddressTypes::REGULAR | AddressTypes::IGNORED | AddressTypes::DOWN).await);
+    rpc.close().await;
 }
 
 #[rstest]
 #[case::single_route(1)]
 #[case::route_burst(1000)]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn route_events_coalesce_without_losing_address_changes(daemon: Fixture, #[case] routes: u32) {
-    let rpc = daemon.session();
+#[tokio::test(flavor = "current_thread")]
+async fn route_events_coalesce_without_losing_address_changes(
+    daemon: Fixture,
+    #[case] routes: u32,
+) {
+    let rpc = daemon.session().await;
     // Populate discovery's cache, then mutate after subscribing.
     rpc.call(rpc.kernel.list_addresses(ctx(), AddressTypes::REGULAR))
+        .await
         .unwrap();
     ip(&["addr", "add", "192.0.2.3/24", "dev", "underlay"]);
     for n in 0..routes {
@@ -387,8 +415,8 @@ fn route_events_coalesce_without_losing_address_changes(daemon: Fixture, #[case]
         ]);
     }
     let mut events = Vec::new();
-    eventually(|| {
-        events.extend(rpc.events());
+    eventually(async || {
+        events.extend(rpc.events().await);
         events.iter().any(|e| {
             matches!(
                 e,
@@ -397,7 +425,8 @@ fn route_events_coalesce_without_losing_address_changes(daemon: Fixture, #[case]
                 }
             )
         })
-    });
+    })
+    .await;
     assert!(
         events.len() < 50,
         "one event per route would overwhelm charon"
@@ -407,13 +436,14 @@ fn route_events_coalesce_without_losing_address_changes(daemon: Fixture, #[case]
             rpc.kernel
                 .get_interface(ctx(), Endpoint::new("192.0.2.3".parse().unwrap(), 0))
         )
+        .await
         .unwrap(),
         "underlay"
     );
     // No polling RPC is needed to wake an otherwise idle client.
     use rustix::event::{poll, PollFd, PollFlags, Timespec};
     rpc.notification.drain().unwrap();
-    while !rpc.events().is_empty() {}
+    while !rpc.events().await.is_empty() {}
     ip(&["addr", "add", "192.0.2.4/24", "dev", "underlay"]);
     assert_eq!(
         poll(
@@ -427,5 +457,5 @@ fn route_events_coalesce_without_losing_address_changes(daemon: Fixture, #[case]
         1
     );
     assert!(rpc.notification.drain().unwrap());
-    rpc.close();
+    rpc.close().await;
 }

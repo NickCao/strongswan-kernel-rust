@@ -334,14 +334,14 @@ nonzero exit. SIGKILL, aborts and crashes skip orderly cleanup; the next session
 clears leftover kernel objects. Desired state and established sessions are
 not recovered across daemon restarts.
 
-System suspend/resume or suspending the daemon with SIGSTOP/SIGCONT can strand
-netlink requests: neli 0.7.4's receive threads exit on an interrupted
-`epoll_wait`. Restart the service pair after this happens.
-
-neli is pinned to 0.7.4. The [0.7.5 EINTR handler](https://github.com/jbaublitz/neli/blob/3c02b178dd0b736de9ce8afaa238b91aa3e5aef9/src/router/synchronous.rs#L213-L228)
-logs a retry but does not continue the loop. It then casts the negative event
-count to `usize` and reads potentially uninitialized event entries. Keep the
-pin until this upstream defect is fixed.
+Netlink uses neli's unmodified async router on the daemon's shared Tokio runtime.
+It avoids neli's synchronous receive loop, which mishandles interrupted waits
+after suspend/resume, SIGSTOP/SIGCONT and systemd freeze/thaw. Notification tasks
+and shutdown cleanup use the same runtime, without a separate Netlink runtime.
+Netlink requests have a five-second deadline. A timed-out request may already
+have changed kernel state, so the socket is retired and the session fails;
+mutations are not automatically replayed. Cleanup errors are reported, and
+the next session retires leftover kernel objects.
 
 The eventfd signals event availability. It does not signal daemon death;
 the client detects transport failure when it next makes an RPC. The NixOS

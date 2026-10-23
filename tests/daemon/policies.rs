@@ -11,10 +11,12 @@ use netlink_packet_core::Parseable;
 use netlink_packet_xfrm::{self as packet, XfrmMessage, XFRM_MSG_GETPOLICY};
 use std::collections::HashMap;
 
-fn inventory() -> HashMap<PolicyKey, charon_kernel_daemon::policy::PolicyConfig> {
+async fn inventory() -> HashMap<PolicyKey, charon_kernel_daemon::policy::PolicyConfig> {
     LinuxPolicies::new()
+        .await
         .unwrap()
         .list()
+        .await
         .unwrap()
         .into_iter()
         .map(|p| {
@@ -26,14 +28,16 @@ fn inventory() -> HashMap<PolicyKey, charon_kernel_daemon::policy::PolicyConfig>
         .collect()
 }
 
-fn native_inventory() -> Vec<packet::policy::ModifyMessage> {
+async fn native_inventory() -> Vec<packet::policy::ModifyMessage> {
     let mut policies: Vec<_> = Netlink::new(NlFamily::Xfrm)
+        .await
         .unwrap()
         .request(&Message::new(
             XFRM_MSG_GETPOLICY,
             NlmF::DUMP,
             &XfrmMessage::GetPolicy(Default::default()),
         ))
+        .await
         .unwrap()
         .into_iter()
         .map(|r| packet::policy::ModifyMessage::parse(r.payload.as_slice()).unwrap())
@@ -42,13 +46,15 @@ fn native_inventory() -> Vec<packet::policy::ModifyMessage> {
     policies
 }
 
-fn install_policy_set(rpc: &Rpc, outer: Family) {
+async fn install_policy_set(rpc: &Rpc, outer: Family) {
     for inner in [Family::V4, Family::V6] {
         assert_eq!(
-            rpc.call(rpc.kernel.bypass_port(ctx(), inner.af(), 500)),
+            rpc.call(rpc.kernel.bypass_port(ctx(), inner.af(), 500))
+                .await,
             Err(Error::Kernel(libc::EINVAL))
         );
         rpc.call(rpc.kernel.bypass_port(ctx(), inner.af(), 13000))
+            .await
             .unwrap();
         for direction in [
             PolicyDirection::Inbound,
@@ -60,19 +66,25 @@ fn install_policy_set(rpc: &Rpc, outer: Family) {
                 inner.policy(direction),
                 policy_config(outer, 0x10001),
             ))
+            .await
             .unwrap();
         }
     }
-    assert_eq!(inventory().len(), 10, "six tunnel and four bypass policies");
+    assert_eq!(
+        inventory().await.len(),
+        10,
+        "six tunnel and four bypass policies"
+    );
 }
 
 #[rstest]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn rejects_unsupported_modes(
+#[tokio::test(flavor = "current_thread")]
+async fn rejects_unsupported_modes(
     daemon: Fixture,
     #[values(IpsecMode::Transport, IpsecMode::Other(u32::MAX))] mode: IpsecMode,
 ) {
-    let rpc = daemon.session();
+    let rpc = daemon.session().await;
     let mut config = policy_config(Family::V4, 0x10001);
     config.sa.as_mut().unwrap().mode = mode;
     assert_eq!(
@@ -80,11 +92,12 @@ fn rejects_unsupported_modes(
             ctx(),
             Family::V4.policy(PolicyDirection::Outbound),
             config
-        )),
+        ))
+        .await,
         Err(Error::Kernel(libc::EOPNOTSUPP))
     );
-    assert!(inventory().is_empty() && owned_links().is_empty());
-    rpc.close();
+    assert!(inventory().await.is_empty() && owned_links().await.is_empty());
+    rpc.close().await;
 }
 
 #[rstest]
@@ -92,7 +105,8 @@ fn rejects_unsupported_modes(
 #[case::tcp_host_port(32, libc::IPPROTO_TCP as u8, (443, 443))]
 #[case::udp_port_range(24, libc::IPPROTO_UDP as u8, (1024, 2047))]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn policy_selectors_and_flags(
+#[tokio::test(flavor = "current_thread")]
+async fn policy_selectors_and_flags(
     daemon: Fixture,
     #[values(Family::V4, Family::V6)] inner: Family,
     #[values(Family::V4, Family::V6)] outer: Family,
@@ -106,7 +120,7 @@ fn policy_selectors_and_flags(
     #[case] protocol: u8,
     #[case] ports: (u16, u16),
 ) {
-    let rpc = daemon.session();
+    let rpc = daemon.session().await;
     let prefix = if matches!(inner, Family::V6) && prefix != 0 {
         prefix + 96
     } else {
@@ -123,8 +137,9 @@ fn policy_selectors_and_flags(
         c
     };
     rpc.call(rpc.kernel.install_policy(ctx(), id(), config()))
+        .await
         .unwrap();
-    let native = inventory();
+    let native = inventory().await;
     assert_eq!(native.len(), 1);
     let (key, config_native) = native.iter().next().unwrap();
     assert_eq!(
@@ -150,24 +165,31 @@ fn policy_selectors_and_flags(
             0
         }
     );
-    assert_eq!(rpc.call(rpc.kernel.query_policy(ctx(), id())).unwrap(), 0);
+    assert_eq!(
+        rpc.call(rpc.kernel.query_policy(ctx(), id()))
+            .await
+            .unwrap(),
+        0
+    );
     assert!(
-        owned_links().is_empty(),
+        owned_links().await.is_empty(),
         "policies alone must not create interfaces"
     );
     rpc.call(rpc.kernel.remove_policy(ctx(), id(), config()))
+        .await
         .unwrap();
-    assert!(inventory().is_empty());
-    rpc.close();
+    assert!(inventory().await.is_empty());
+    rpc.close().await;
 }
 
 #[rstest]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn icmp_code_specificity_controls_priority(
+#[tokio::test(flavor = "current_thread")]
+async fn icmp_code_specificity_controls_priority(
     daemon: Fixture,
     #[values(Family::V4, Family::V6)] family: Family,
 ) {
-    let rpc = daemon.session();
+    let rpc = daemon.session().await;
     let (protocol, icmp_type) = match family {
         Family::V4 => (libc::IPPROTO_ICMP, 3),
         Family::V6 => (libc::IPPROTO_ICMPV6, 128),
@@ -185,8 +207,9 @@ fn icmp_code_specificity_controls_priority(
             rpc.kernel
                 .install_policy(ctx(), id(), policy_config(family, 0x10001)),
         )
+        .await
         .unwrap();
-        let (key, config) = inventory().into_iter().next().unwrap();
+        let (key, config) = inventory().await.into_iter().next().unwrap();
         assert_eq!((key.src_port, key.dst_port), (icmp_type, code));
         assert_eq!(key.dst_port_mask != 0, code != 0);
         priorities.push(config.priority);
@@ -194,10 +217,11 @@ fn icmp_code_specificity_controls_priority(
             rpc.kernel
                 .remove_policy(ctx(), id(), policy_config(family, 0x10001)),
         )
+        .await
         .unwrap();
     }
     assert!(priorities[1] < priorities[0]);
-    rpc.close();
+    rpc.close().await;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -209,7 +233,8 @@ enum Mutation {
 }
 #[rstest]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn policy_repair_preserves_sas_and_bypasses(
+#[tokio::test(flavor = "current_thread")]
+async fn policy_repair_preserves_sas_and_bypasses(
     daemon: Fixture,
     #[values(Family::V4, Family::V6)] family: Family,
     #[values(
@@ -220,17 +245,18 @@ fn policy_repair_preserves_sas_and_bypasses(
     )]
     mutation: Mutation,
 ) {
-    let rpc = daemon.session();
+    let rpc = daemon.session().await;
     rpc.call(rpc.kernel.install_sa(
         ctx(),
         family.sa(0x10001),
         sa_config(Cipher::Gcm, false, true),
     ))
+    .await
     .unwrap();
-    install_policy_set(&rpc, family);
-    let expected = inventory();
-    let states_before = states();
-    let index = owned_links()[0].index;
+    install_policy_set(&rpc, family).await;
+    let expected = inventory().await;
+    let states_before = states().await;
+    let index = owned_links().await[0].index;
     let subnet = match family {
         Family::V4 => "0.0.0.0/0",
         Family::V6 => "::/0",
@@ -286,8 +312,8 @@ fn policy_repair_preserves_sas_and_bypasses(
         }
     }
     ip(&args);
-    eventually(|| {
-        let native = LinuxPolicies::new().unwrap().list().unwrap();
+    eventually(async || {
+        let native = LinuxPolicies::new().await.unwrap().list().await.unwrap();
         native.len() == expected.len()
             && native.iter().all(|p| {
                 p.handle
@@ -295,36 +321,40 @@ fn policy_repair_preserves_sas_and_bypasses(
                     .and_then(|id| expected.get(id))
                     .is_some_and(|config| p.config.as_ref() == Some(config))
             })
-    });
-    assert_eq!(states(), states_before);
-    assert_eq!(owned_links()[0].index, index);
+    })
+    .await;
+    assert_eq!(states().await, states_before);
+    assert_eq!(owned_links().await[0].index, index);
     rpc.call(rpc.kernel.remove_sa(ctx(), family.sa(0x10001), 0))
+        .await
         .unwrap();
     assert!(
-        owned_links().is_empty(),
+        owned_links().await.is_empty(),
         "policies must not retain interfaces"
     );
-    rpc.call(rpc.kernel.flush_policies(ctx())).unwrap();
-    let bypasses = inventory();
+    rpc.call(rpc.kernel.flush_policies(ctx())).await.unwrap();
+    let bypasses = inventory().await;
     assert_eq!(bypasses.len(), 4);
     assert!(bypasses.keys().all(|key| key.if_id == 0));
-    rpc.close();
-    assert!(inventory().is_empty());
+    rpc.close().await;
+    assert!(inventory().await.is_empty());
 }
 
 #[rstest]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn periodic_policy_audits_do_not_rewrite_or_resurrect_objects(
+#[tokio::test(flavor = "current_thread")]
+async fn periodic_policy_audits_do_not_rewrite_or_resurrect_objects(
     daemon: Fixture,
     #[values(false, true)] with_sa: bool,
 ) {
-    let rpc = daemon.session();
+    let rpc = daemon.session().await;
     if with_sa {
         rpc.call(rpc.kernel.install_sa(
             ctx(),
             Family::V4.sa(0x10001),
             sa_config(Cipher::Gcm, false, true),
         ))
+        .await
         .unwrap();
         // Stop background traffic before XFRM so native SA counters stay stable.
         for args in [
@@ -347,16 +377,16 @@ fn periodic_policy_audits_do_not_rewrite_or_resurrect_objects(
                 .success());
         }
     }
-    install_policy_set(&rpc, Family::V4);
-    let before = native_inventory();
-    let states_before = states();
-    std::thread::sleep(std::time::Duration::from_millis(5300));
+    install_policy_set(&rpc, Family::V4).await;
+    let before = native_inventory().await;
+    let states_before = states().await;
+    tokio::time::sleep(std::time::Duration::from_millis(5300)).await;
     assert_eq!(
-        native_inventory(),
+        native_inventory().await,
         before,
         "unchanged policies, including indices and add times, must survive an audit"
     );
-    assert_eq!(states(), states_before);
+    assert_eq!(states().await, states_before);
     // Flush while a repair is pending. Only the bypass desires may survive.
     ip(&[
         "xfrm",
@@ -371,41 +401,44 @@ fn periodic_policy_audits_do_not_rewrite_or_resurrect_objects(
         "if_id",
         "41",
     ]);
-    rpc.call(rpc.kernel.flush_policies(ctx())).unwrap();
-    let bypasses = native_inventory();
+    rpc.call(rpc.kernel.flush_policies(ctx())).await.unwrap();
+    let bypasses = native_inventory().await;
     assert_eq!(bypasses.len(), 4);
     assert!(bypasses.iter().all(|p| p.user_policy_info.priority == 32));
-    std::thread::sleep(std::time::Duration::from_millis(5300));
+    tokio::time::sleep(std::time::Duration::from_millis(5300)).await;
     assert_eq!(
-        native_inventory(),
+        native_inventory().await,
         bypasses,
         "flushed desires must not return"
     );
-    assert_eq!(states(), states_before);
-    rpc.call(rpc.kernel.flush_sas(ctx())).unwrap();
-    rpc.close();
+    assert_eq!(states().await, states_before);
+    rpc.call(rpc.kernel.flush_sas(ctx())).await.unwrap();
+    rpc.close().await;
 }
 
 #[rstest]
 #[case::one_reference(1)]
 #[case::repeated_rekey_races(20)]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn repair_uses_surviving_rekey_reference(daemon: Fixture, #[case] count: u32) {
-    let rpc = daemon.session();
+#[tokio::test(flavor = "current_thread")]
+async fn repair_uses_surviving_rekey_reference(daemon: Fixture, #[case] count: u32) {
+    let rpc = daemon.session().await;
     let family = Family::V4;
     rpc.call(rpc.kernel.install_policy(
         ctx(),
         family.policy(PolicyDirection::Outbound),
         policy_config(family, 0x10001),
     ))
+    .await
     .unwrap();
-    let expected = inventory();
+    let expected = inventory().await;
     for n in 0..count {
         rpc.call(rpc.kernel.install_policy(
             ctx(),
             family.policy(PolicyDirection::Outbound),
             policy_config(family, 0x20000 + n),
         ))
+        .await
         .unwrap();
         ip(&[
             "xfrm",
@@ -425,30 +458,33 @@ fn repair_uses_surviving_rekey_reference(daemon: Fixture, #[case] count: u32) {
             family.policy(PolicyDirection::Outbound),
             policy_config(family, 0x20000 + n),
         ))
+        .await
         .unwrap();
     }
-    eventually(|| inventory() == expected);
-    rpc.call(rpc.kernel.flush_policies(ctx())).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(5200));
+    eventually(async || inventory().await == expected).await;
+    rpc.call(rpc.kernel.flush_policies(ctx())).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5200)).await;
     assert!(
-        inventory().is_empty(),
+        inventory().await.is_empty(),
         "removed desires must not return during the next audit"
     );
-    rpc.close();
+    rpc.close().await;
 }
 
 #[rstest]
 #[ignore = "requires root and iproute2; creates a network namespace"]
-fn acquire_events_preserve_packet_selectors(
+#[tokio::test(flavor = "current_thread")]
+async fn acquire_events_preserve_packet_selectors(
     daemon: Fixture,
     #[values(Family::V4, Family::V6)] family: Family,
 ) {
-    let rpc = daemon.session();
+    let rpc = daemon.session().await;
     rpc.call(rpc.kernel.install_sa(
         ctx(),
         family.sa(0x10001),
         sa_config(Cipher::Gcm, false, true),
     ))
+    .await
     .unwrap();
     // A different reqid ensures traffic triggers acquisition instead of using the installed SA.
     let mut config = policy_config(family, 0);
@@ -457,6 +493,7 @@ fn acquire_events_preserve_packet_selectors(
         rpc.kernel
             .install_policy(ctx(), family.policy(PolicyDirection::Outbound), config),
     )
+    .await
     .unwrap();
     let dst = family.destination();
     ip(&[
@@ -480,13 +517,14 @@ fn acquire_events_preserve_packet_selectors(
         "{sent:?}"
     );
     let mut received = None;
-    eventually(|| {
-        received = rpc.events().into_iter().find_map(|e| match e {
+    eventually(async || {
+        received = rpc.events().await.into_iter().find_map(|e| match e {
             Event::Acquire(acquire) => Some(acquire),
             _ => None,
         });
         received.is_some()
-    });
+    })
+    .await;
     let acquire = received.unwrap();
     assert_eq!(acquire.reqid, 43);
     assert_ne!(acquire.sequence, 0);
@@ -509,7 +547,7 @@ fn acquire_events_preserve_packet_selectors(
             (address, address, libc::IPPROTO_UDP as u8, port, port)
         );
     }
-    rpc.call(rpc.kernel.flush_policies(ctx())).unwrap();
-    rpc.call(rpc.kernel.flush_sas(ctx())).unwrap();
-    rpc.close();
+    rpc.call(rpc.kernel.flush_policies(ctx())).await.unwrap();
+    rpc.call(rpc.kernel.flush_sas(ctx())).await.unwrap();
+    rpc.close().await;
 }

@@ -104,8 +104,8 @@ impl Service {
     }
 }
 
-pub(super) fn run(session: Arc<Session>, xfrm: bool, notifications: Notifications) {
-    for notification in notifications {
+pub(super) async fn run(session: Arc<Session>, xfrm: bool, mut notifications: Notifications) {
+    while let Some(notification) = notifications.next().await {
         if session.closed.load(Ordering::Acquire) {
             return;
         }
@@ -156,13 +156,13 @@ pub(super) fn run(session: Arc<Session>, xfrm: bool, notifications: Notification
             continue;
         }
         let result = {
-            let mut backend = session.backend.lock().unwrap();
+            let mut backend = session.backend.lock().await;
             if session.closed.load(Ordering::Acquire) {
                 return;
             }
             let Backend { sas, policies, .. } = &mut *backend;
             let result = xfrm::event(&r, sas, policies);
-            if let Err(e) = backend.cleanup_interfaces() {
+            if let Err(e) = backend.cleanup_interfaces().await {
                 eprintln!("kernel-daemon: interface cleanup: {e}");
             }
             result
@@ -270,6 +270,6 @@ mod tests {
             "no periodic pushes when idle"
         );
         service.close_session(context::current()).await.unwrap();
-        server.shutdown().unwrap();
+        server.shutdown().await.unwrap();
     }
 }

@@ -45,10 +45,11 @@ call `Runtime::block_on()` on charon's calling threads. Concurrent callers
 share its scheduler without serializing whole RPCs under a mutex.
 The plugin creates no threads.
 
-The daemon handles each accepted connection on a thread with its own
-current-thread Tokio runtime. An open session starts route and XFRM notification
-workers and a reconciliation worker. Backend operations are serialized by
-the session's backend mutex.
+The daemon uses one current-thread Tokio runtime for RPCs, asynchronous Netlink
+I/O, route and XFRM notification tasks, reconciliation and shutdown cleanup.
+Backend I/O traits return futures. Backend operations are serialized by the
+session's async mutex; the runtime remains active while an operation waits
+for the kernel and while shutdown removes owned objects.
 
 The daemon queues typed expiry, acquire and NAT mapping events in a bounded
 queue of 256 batches. Network changes are accumulated separately and coalesced
@@ -194,8 +195,8 @@ Unexpected loss of an opened session, failure of an active Netlink notification
 worker or event-queue overflow wakes the daemon's main loop. It stops accepting
 clients, disables mutations and repairs, cleans the global policy/state tables
 and owned interfaces, and exits with an error.
-SIGTERM and SIGINT use signalfd to request the same cleanup in normal Rust
-execution context; successful signal-driven cleanup exits normally.
+SIGTERM and SIGINT request the same cleanup through Tokio's signal streams;
+successful signal-driven cleanup exits normally.
 
 A failed exchange can leave a mutation applied without its reply.
 The client neither replays nor reconnects. Recovery requires restarting the

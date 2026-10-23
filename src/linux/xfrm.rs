@@ -172,7 +172,7 @@ pub struct LinuxSas {
     iptfs: rpc::IptfsConfig,
 }
 impl LinuxSas {
-    pub fn new(iptfs: rpc::IptfsConfig) -> io::Result<Self> {
+    pub async fn new(iptfs: rpc::IptfsConfig) -> io::Result<Self> {
         // The service's ProcSubset=pid sandbox hides global /proc files.
         let uname = rustix::system::uname();
         let release = uname.release().to_str().map_err(io::Error::other)?;
@@ -182,7 +182,7 @@ impl LinuxSas {
             .map(|s| s.parse::<u32>().unwrap_or(0));
         let version = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
         Ok(Self {
-            socket: Netlink::new(NlFamily::Xfrm)?,
+            socket: Netlink::new(NlFamily::Xfrm).await?,
             sa_dir: version >= (6, 10),
             lastused: version >= (6, 2),
             iptfs,
@@ -199,7 +199,7 @@ impl LinuxSas {
                 KernelFeatures::empty()
             }
     }
-    fn allocate_spi(
+    async fn allocate_spi(
         &mut self,
         src: &Endpoint,
         dst: &Endpoint,
@@ -236,7 +236,11 @@ impl LinuxSas {
                 Vec::new()
             },
         });
-        for reply in self.socket.request(&message(NlmF::empty(), &request))? {
+        for reply in self
+            .socket
+            .request(&message(NlmF::empty(), &request))
+            .await?
+        {
             if reply.kind == NEWSA {
                 let sa = sa_reply(&reply)?;
                 let spi = sa.user_sa_info.id.spi;
@@ -406,12 +410,13 @@ impl LinuxSas {
         })
     }
 
-    fn read(&mut self, id: &SaId) -> io::Result<packet::state::ModifyMessage> {
+    async fn read(&mut self, id: &SaId) -> io::Result<packet::state::ModifyMessage> {
         self.socket
             .request(&message(
                 NlmF::empty(),
                 &XfrmMessage::GetSa(native_request(id)),
-            ))?
+            ))
+            .await?
             .into_iter()
             .find(|reply| reply.kind == NEWSA)
             .ok_or_else(missing)
@@ -553,7 +558,7 @@ impl SaKernel for LinuxSas {
     fn features(&self) -> KernelFeatures {
         self.feature_flags()
     }
-    fn allocate(
+    async fn allocate(
         &mut self,
         src: &Endpoint,
         dst: &Endpoint,
@@ -561,27 +566,33 @@ impl SaKernel for LinuxSas {
         min: u32,
         max: u32,
     ) -> io::Result<u32> {
-        self.allocate_spi(src, dst, proto, min, max)
+        self.allocate_spi(src, dst, proto, min, max).await
     }
-    fn list(&mut self) -> io::Result<Vec<ObservedSa<SaHandle, Configuration>>> {
+    async fn list(&mut self) -> io::Result<Vec<ObservedSa<SaHandle, Configuration>>> {
         // A GETSA dump takes only optional filter attributes, not the fixed
         // usersa_id record required for a single-object GETSA request.
-        let replies = self.socket.request(&Message {
-            kind: packet::XFRM_MSG_GETSA,
-            flags: NlmF::DUMP,
-            payload: Vec::new(),
-        })?;
+        let replies = self
+            .socket
+            .request(&Message {
+                kind: packet::XFRM_MSG_GETSA,
+                flags: NlmF::DUMP,
+                payload: Vec::new(),
+            })
+            .await?;
         replies
             .iter()
             .filter(|reply| reply.kind == NEWSA)
             .map(|reply| self.observe(sa_reply(reply)?))
             .collect()
     }
-    fn get(&mut self, id: &SaId) -> io::Result<ObservedSa<SaHandle, Configuration>> {
-        let sa = self.read(id)?;
+    async fn get(&mut self, id: &SaId) -> io::Result<ObservedSa<SaHandle, Configuration>> {
+        let sa = self.read(id).await?;
         self.observe(sa)
     }
-    fn create(&mut self, spec: &SaSpec<'_>) -> io::Result<ObservedSa<SaHandle, Configuration>> {
+    async fn create(
+        &mut self,
+        spec: &SaSpec<'_>,
+    ) -> io::Result<ObservedSa<SaHandle, Configuration>> {
         if spec.id.proto != ipproto::ESP.as_raw().get() as u8 || spec.id.if_id == 0 {
             return Err(unsupported());
         }
@@ -589,7 +600,7 @@ impl SaKernel for LinuxSas {
         if spec.config.update {
             // UPDSA is only for maturation of a larval reservation. In
             // particular, never apply it to an already established SA.
-            match self.get(spec.id) {
+            match self.get(spec.id).await {
                 Ok(current) if current.state != SaState::Installed => (),
                 Ok(_) => return Err(io::Error::from_raw_os_error(libc::EEXIST)),
                 Err(error) if is_missing(&error) => {
@@ -600,35 +611,42 @@ impl SaKernel for LinuxSas {
                 Err(error) => return Err(error),
             }
         }
-        match self.socket.ack(&message(NlmF::ACK, &request)) {
+        match self.socket.ack(&message(NlmF::ACK, &request)).await {
             Err(error) if is_missing(&error) && spec.config.update => {
                 // It may expire between GETSA and the maturation request.
                 // The controller has verified this is still first installation.
                 if let XfrmMessage::UpdateSa(sa) = request {
                     self.socket
-                        .ack(&message(NlmF::ACK, &XfrmMessage::AddSa(sa)))?;
+                        .ack(&message(NlmF::ACK, &XfrmMessage::AddSa(sa)))
+                        .await?;
                 } else {
                     return Err(error);
                 }
             }
             result => result?,
         }
-        self.get(spec.id)
+        self.get(spec.id).await
     }
-    fn delete(&mut self, handle: &SaHandle) -> io::Result<()> {
-        match self.socket.ack(&message(
-            NlmF::ACK,
-            &XfrmMessage::DeleteSa(native_request(handle.id())),
-        )) {
+    async fn delete(&mut self, handle: &SaHandle) -> io::Result<()> {
+        match self
+            .socket
+            .ack(&message(
+                NlmF::ACK,
+                &XfrmMessage::DeleteSa(native_request(handle.id())),
+            ))
+            .await
+        {
             Err(error) if is_missing(&error) => Ok(()),
             result => result,
         }
     }
-    fn flush(&mut self) -> io::Result<()> {
-        self.socket.ack(&message(
-            NlmF::ACK,
-            &XfrmMessage::FlushSa(packet::state::FlushMessage::default()),
-        ))
+    async fn flush(&mut self) -> io::Result<()> {
+        self.socket
+            .ack(&message(
+                NlmF::ACK,
+                &XfrmMessage::FlushSa(packet::state::FlushMessage::default()),
+            ))
+            .await
     }
 }
 
@@ -748,9 +766,9 @@ pub fn event(
 mod tests {
     use super::*;
 
-    #[test]
-    fn snapshots_ignore_packet_state_but_detect_managed_configuration_drift() {
-        let backend = LinuxSas::new(Default::default()).unwrap();
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshots_ignore_packet_state_but_detect_managed_configuration_drift() {
+        let backend = LinuxSas::new(Default::default()).await.unwrap();
         let sa = packet::state::ModifyMessage {
             user_sa_info: packet::UserSaInfo {
                 family: libc::AF_INET as u16,

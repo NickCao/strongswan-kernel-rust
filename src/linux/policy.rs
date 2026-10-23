@@ -75,9 +75,9 @@ pub struct LinuxPolicies {
     socket: Netlink,
 }
 impl LinuxPolicies {
-    pub fn new() -> io::Result<Self> {
+    pub async fn new() -> io::Result<Self> {
         Ok(Self {
-            socket: Netlink::new(NlFamily::Xfrm)?,
+            socket: Netlink::new(NlFamily::Xfrm).await?,
         })
     }
     fn selector_key(
@@ -165,13 +165,14 @@ impl LinuxPolicies {
             nlas: id_attrs(id.mark, id.if_id),
         })
     }
-    fn read(
+    async fn read(
         &mut self,
         request: packet::policy::DelGetMessage,
     ) -> io::Result<ObservedPolicy<PolicyHandle>> {
         let reply = self
             .socket
-            .request(&message(NlmF::empty(), &XfrmMessage::GetPolicy(request)))?
+            .request(&message(NlmF::empty(), &XfrmMessage::GetPolicy(request)))
+            .await?
             .into_iter()
             .find(|reply| reply.kind == packet::XFRM_MSG_NEWPOLICY)
             .ok_or_else(missing)?;
@@ -290,10 +291,10 @@ impl LinuxPolicies {
 impl PolicyKernel for LinuxPolicies {
     type Handle = PolicyHandle;
 
-    fn list(&mut self) -> io::Result<Vec<ObservedPolicy<PolicyHandle>>> {
+    async fn list(&mut self) -> io::Result<Vec<ObservedPolicy<PolicyHandle>>> {
         let request = XfrmMessage::GetPolicy(packet::policy::DelGetMessage::default());
         let mut observed = Vec::new();
-        for reply in self.socket.request(&message(NlmF::DUMP, &request))? {
+        for reply in self.socket.request(&message(NlmF::DUMP, &request)).await? {
             if reply.kind != packet::XFRM_MSG_NEWPOLICY {
                 continue;
             }
@@ -308,29 +309,29 @@ impl PolicyKernel for LinuxPolicies {
         }
         Ok(observed)
     }
-    fn get(&mut self, id: &PolicyKey) -> io::Result<ObservedPolicy<PolicyHandle>> {
-        self.read(Self::policy_id(id)?)
+    async fn get(&mut self, id: &PolicyKey) -> io::Result<ObservedPolicy<PolicyHandle>> {
+        self.read(Self::policy_id(id)?).await
     }
-    fn create(&mut self, spec: &PolicySpec) -> io::Result<PolicyHandle> {
-        self.socket.ack(&Self::policy_message(spec, false)?)?;
-        Ok(self.get(&spec.id)?.handle)
+    async fn create(&mut self, spec: &PolicySpec) -> io::Result<PolicyHandle> {
+        self.socket.ack(&Self::policy_message(spec, false)?).await?;
+        Ok(self.get(&spec.id).await?.handle)
     }
-    fn update(&mut self, handle: &PolicyHandle, spec: &PolicySpec) -> io::Result<()> {
+    async fn update(&mut self, handle: &PolicyHandle, spec: &PolicySpec) -> io::Result<()> {
         let request = Self::policy_message(spec, true)?;
-        let current = self.read(handle.request())?;
+        let current = self.read(handle.request()).await?;
         if current.handle.id.as_ref() != Some(&spec.id) {
             // Linux updates locate policies by selectors, not by index.
             // Replacing this native object lets update() repair identities
             // outside the supported model without touching a different index.
-            self.delete(handle)?;
-            self.create(spec)?;
+            self.delete(handle).await?;
+            self.create(spec).await?;
             return Ok(());
         }
-        self.socket.ack(&request)
+        self.socket.ack(&request).await
     }
-    fn delete(&mut self, handle: &PolicyHandle) -> io::Result<()> {
+    async fn delete(&mut self, handle: &PolicyHandle) -> io::Result<()> {
         let request = XfrmMessage::DeletePolicy(handle.request());
-        match self.socket.ack(&message(NlmF::ACK, &request)) {
+        match self.socket.ack(&message(NlmF::ACK, &request)).await {
             Ok(()) => Ok(()),
             Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
                 Ok(())
@@ -349,11 +350,11 @@ mod tests {
     use netlink_packet_core::Emitable;
     use std::collections::HashSet;
 
-    #[test]
+    #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires root; creates a network namespace"]
-    fn global_inventory_and_mutations_use_native_policy_indices() {
+    async fn global_inventory_and_mutations_use_native_policy_indices() {
         let _namespace = crate::test_netns::Netns::new();
-        let mut kernel = LinuxPolicies::new().unwrap();
+        let mut kernel = LinuxPolicies::new().await.unwrap();
         let mut spec = PolicySpec {
             id: PolicyKey {
                 src: "192.0.2.0/24".parse().unwrap(),
@@ -377,21 +378,21 @@ mod tests {
                 template: None,
             },
         };
-        let handle = kernel.create(&spec).unwrap();
+        let handle = kernel.create(&spec).await.unwrap();
         assert_ne!(handle.index, 0);
         assert_eq!(handle.id(), Some(&spec.id));
         // The index is unique, but omitting XFRM's extra addressing qualifiers
         // cannot retrieve a marked policy bound to a nonzero interface ID.
         let mut bare = handle.request();
         bare.nlas.clear();
-        assert!(is_missing(&kernel.read(bare).unwrap_err()));
+        assert!(is_missing(&kernel.read(bare).await.unwrap_err()));
         assert_eq!(
-            kernel.read(handle.request()).unwrap().handle.index,
+            kernel.read(handle.request()).await.unwrap().handle.index,
             handle.index
         );
         spec.config.priority = 200;
-        kernel.update(&handle, &spec).unwrap();
-        let current = kernel.get(&spec.id).unwrap();
+        kernel.update(&handle, &spec).await.unwrap();
+        let current = kernel.get(&spec.id).await.unwrap();
         assert_eq!(current.handle.index, handle.index);
         assert_eq!(current.config.as_ref(), Some(&spec.config));
 
@@ -411,24 +412,25 @@ mod tests {
                 spi: 0,
             });
             assert_eq!(
-                kernel.create(&rejected).unwrap_err().raw_os_error(),
+                kernel.create(&rejected).await.unwrap_err().raw_os_error(),
                 Some(libc::EOPNOTSUPP)
             );
             assert_eq!(
                 kernel
                     .update(&handle, &rejected)
+                    .await
                     .unwrap_err()
                     .raw_os_error(),
                 Some(libc::EOPNOTSUPP)
             );
-            let unchanged = kernel.get(&spec.id).unwrap();
+            let unchanged = kernel.get(&spec.id).await.unwrap();
             assert_eq!(unchanged.handle.index, handle.index);
             assert_eq!(unchanged.config.as_ref(), Some(&spec.config));
         }
 
         // Replace the native object at the same index with a different logical
         // identity. Deletion still targets that index, not the stale selector.
-        kernel.delete(&handle).unwrap();
+        kernel.delete(&handle).await.unwrap();
         let mut replacement = spec.clone();
         replacement.id.dst = "203.0.113.0/24".parse().unwrap();
         let mut native = LinuxPolicies::policy_spec(&replacement).unwrap();
@@ -436,14 +438,15 @@ mod tests {
         kernel
             .socket
             .ack(&message(NlmF::ACK, &XfrmMessage::AddPolicy(native)))
+            .await
             .unwrap();
         assert_eq!(
-            kernel.get(&replacement.id).unwrap().handle.index,
+            kernel.get(&replacement.id).await.unwrap().handle.index,
             handle.index
         );
-        kernel.delete(&handle).unwrap();
-        assert!(kernel.list().unwrap().is_empty());
-        kernel.delete(&handle).unwrap();
+        kernel.delete(&handle).await.unwrap();
+        assert!(kernel.list().await.unwrap().is_empty());
+        kernel.delete(&handle).await.unwrap();
 
         // Unknown identities must remain in inventory so empty desired state
         // deletes them too, including native selector scopes we never create.
@@ -452,14 +455,15 @@ mod tests {
         kernel
             .socket
             .ack(&message(NlmF::ACK, &XfrmMessage::AddPolicy(native)))
+            .await
             .unwrap();
-        let unknown = kernel.list().unwrap().pop().unwrap();
+        let unknown = kernel.list().await.unwrap().pop().unwrap();
         assert!(unknown.handle.id().is_none() && unknown.config.is_none());
         // update() chooses replacement when the native selector cannot be
         // represented; the reconciler need not understand Linux's limitation.
-        kernel.update(&unknown.handle, &spec).unwrap();
+        kernel.update(&unknown.handle, &spec).await.unwrap();
         assert_eq!(
-            kernel.get(&spec.id).unwrap().config.as_ref(),
+            kernel.get(&spec.id).await.unwrap().config.as_ref(),
             Some(&spec.config)
         );
         // Sub policies share the global inventory but need their own type
@@ -472,29 +476,36 @@ mod tests {
         match kernel
             .socket
             .ack(&message(NlmF::ACK, &XfrmMessage::AddPolicy(sub)))
+            .await
         {
             Ok(()) => {
-                let inventory = kernel.list().unwrap();
+                let inventory = kernel.list().await.unwrap();
                 assert_eq!(inventory.len(), 2);
                 let sub = inventory
                     .iter()
                     .find(|entry| entry.handle.policy_type == packet::XFRM_POLICY_TYPE_SUB)
                     .unwrap();
                 assert!(sub.handle.id().is_none());
-                kernel.delete(&sub.handle).unwrap();
+                kernel.delete(&sub.handle).await.unwrap();
             }
             // CONFIG_XFRM_SUB_POLICY is optional. Linux rejects SUB with
             // EINVAL when it is disabled; the main policy must be unaffected.
             Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EINVAL)),
         }
         assert_eq!(
-            kernel.get(&spec.id).unwrap().config.as_ref(),
+            kernel.get(&spec.id).await.unwrap().config.as_ref(),
             Some(&spec.config)
         );
         let mut policies = crate::policy::Policies::new(kernel);
-        policies.reconcile().unwrap();
+        policies.reconcile().await.unwrap();
         // A fresh backend discovers the table without a retained handle map.
-        assert!(LinuxPolicies::new().unwrap().list().unwrap().is_empty());
+        assert!(LinuxPolicies::new()
+            .await
+            .unwrap()
+            .list()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     fn is_missing(error: &io::Error) -> bool {

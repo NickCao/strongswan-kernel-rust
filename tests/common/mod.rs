@@ -22,16 +22,15 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tokio::runtime::Runtime;
 
-pub fn eventually(mut condition: impl FnMut() -> bool) {
+pub async fn eventually(mut condition: impl std::ops::AsyncFnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !condition() {
+    while !condition().await {
         assert!(
             Instant::now() < deadline,
             "condition did not converge within 10 seconds"
         );
-        thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -48,33 +47,39 @@ pub fn ip(args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-pub fn links() -> Vec<Link> {
-    let mut network = Network::new().unwrap();
+pub async fn links() -> Vec<Link> {
+    let mut network = Network::new().await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match network.links() {
+        match network.links().await {
             // The daemon may change links during a dump. Discard the partial
             // inventory and observe again, as a later reconciliation would.
             Err(error)
                 if error.kind() == std::io::ErrorKind::Interrupted && Instant::now() < deadline =>
             {
-                thread::sleep(Duration::from_millis(20));
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
             result => return result.unwrap(),
         }
     }
 }
-pub fn owned_links() -> Vec<Link> {
-    links().into_iter().filter(|l| l.group == 17227).collect()
+pub async fn owned_links() -> Vec<Link> {
+    links()
+        .await
+        .into_iter()
+        .filter(|l| l.group == 17227)
+        .collect()
 }
-pub fn states() -> Vec<ModifyMessage> {
+pub async fn states() -> Vec<ModifyMessage> {
     Netlink::new(NlFamily::Xfrm)
+        .await
         .unwrap()
         .request(&Message::new(
             XFRM_MSG_GETSA,
             NlmF::DUMP,
             &XfrmMessage::GetSa(Default::default()),
         ))
+        .await
         .unwrap()
         .into_iter()
         .map(|r| ModifyMessage::parse(r.payload.as_slice()).unwrap())
@@ -277,63 +282,64 @@ pub struct Rpc {
     pub kernel: KernelClient,
     pub notification: Notification,
     pub socket: UnixStream,
-    runtime: Runtime,
 }
 impl Rpc {
-    pub fn connect(path: &PathBuf) -> Self {
+    pub async fn connect(path: &PathBuf) -> Self {
         let socket = UnixStream::connect(path).unwrap();
         let notification = Notification::receive(&socket).unwrap();
         socket.set_nonblocking(true).unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let kernel = runtime.block_on(async {
-            KernelClient::new(
-                tarpc::client::Config::default(),
-                transport::framed(
-                    tokio::net::UnixStream::from_std(socket.try_clone().unwrap()).unwrap(),
-                ),
-            )
-            .spawn()
-        });
+        let kernel = KernelClient::new(
+            tarpc::client::Config::default(),
+            transport::framed(
+                tokio::net::UnixStream::from_std(socket.try_clone().unwrap()).unwrap(),
+            ),
+        )
+        .spawn();
         Self {
             kernel,
             notification,
             socket,
-            runtime,
         }
     }
-    pub fn call<T>(
+    pub async fn call<T>(
         &self,
         call: impl Future<Output = std::result::Result<Result<T>, RpcError>>,
     ) -> Result<T> {
-        self.run(call).expect("RPC transport failed")
+        self.run(call).await.expect("RPC transport failed")
     }
-    pub fn run<F: Future>(&self, future: F) -> F::Output {
-        self.runtime.block_on(future)
+    pub async fn run<F: Future>(&self, future: F) -> F::Output {
+        future.await
     }
-    pub fn open(&self, config: SessionConfig) {
+    pub async fn open(&self, config: SessionConfig) {
         self.call(self.kernel.open_session(context::current(), config))
+            .await
             .unwrap();
     }
-    pub fn close(&self) {
+    pub async fn close(&self) {
         self.call(self.kernel.close_session(context::current()))
+            .await
             .unwrap();
     }
-    pub fn events(&self) -> Vec<Event> {
+    pub async fn events(&self) -> Vec<Event> {
         self.call(self.kernel.next_events(context::current()))
+            .await
             .unwrap()
     }
-    pub fn expiries(&self, count: usize) -> Vec<Expiry> {
+    pub async fn expiries(&self, count: usize) -> Vec<Expiry> {
         let mut expiries = Vec::new();
-        eventually(|| {
-            expiries.extend(self.events().into_iter().filter_map(|event| match event {
-                Event::Expire(expiry) => Some(expiry),
-                _ => None,
-            }));
+        eventually(async || {
+            expiries.extend(
+                self.events()
+                    .await
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        Event::Expire(expiry) => Some(expiry),
+                        _ => None,
+                    }),
+            );
             expiries.len() >= count
-        });
+        })
+        .await;
         assert_eq!(expiries.len(), count);
         expiries
     }
@@ -369,33 +375,39 @@ impl Daemon {
             path,
             directory,
         };
-        eventually(|| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !daemon.path.exists() {
             assert!(
                 daemon.process.try_wait().unwrap().is_none(),
                 "daemon exited during startup: {}",
                 daemon.log()
             );
-            daemon.path.exists()
-        });
+            assert!(
+                Instant::now() < deadline,
+                "daemon did not create its socket"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         daemon
     }
-    pub fn connect(&self) -> Rpc {
-        Rpc::connect(&self.path)
+    pub async fn connect(&self) -> Rpc {
+        Rpc::connect(&self.path).await
     }
-    pub fn session(&self) -> Rpc {
-        let rpc = self.connect();
-        rpc.open(SessionConfig::default());
+    pub async fn session(&self) -> Rpc {
+        let rpc = self.connect().await;
+        rpc.open(SessionConfig::default()).await;
         rpc
     }
     pub fn signal(&self, signal: Signal) {
         kill(Pid::from_raw(self.process.id() as i32), signal).unwrap();
     }
-    pub fn wait(&mut self) -> ExitStatus {
+    pub async fn wait(&mut self) -> ExitStatus {
         let mut status = None;
-        eventually(|| {
+        eventually(async || {
             status = self.process.try_wait().unwrap();
             status.is_some()
-        });
+        })
+        .await;
         status.unwrap()
     }
     fn log(&self) -> String {

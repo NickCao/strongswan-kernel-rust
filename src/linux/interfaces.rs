@@ -54,13 +54,13 @@ pub struct LinuxInterfaces {
     group: u32,
 }
 impl LinuxInterfaces {
-    pub fn new(prefix: String, group: u32) -> io::Result<Self> {
+    pub async fn new(prefix: String, group: u32) -> io::Result<Self> {
         name_prefix(&prefix).map_err(io::Error::other)?;
         if group == 0 {
             return Err(invalid());
         }
         Ok(Self {
-            net: Network::new()?,
+            net: Network::new().await?,
             prefix,
             group,
         })
@@ -106,8 +106,8 @@ impl LinuxInterfaces {
 impl InterfaceKernel for LinuxInterfaces {
     type Handle = InterfaceHandle;
 
-    fn list(&mut self) -> io::Result<Vec<ObservedInterface<InterfaceHandle>>> {
-        let links = self.net.links()?;
+    async fn list(&mut self) -> io::Result<Vec<ObservedInterface<InterfaceHandle>>> {
+        let links = self.net.links().await?;
         links
             .iter()
             .filter(|link| link.group == self.group)
@@ -142,43 +142,48 @@ impl InterfaceKernel for LinuxInterfaces {
             .collect()
     }
 
-    fn create(&mut self, spec: &InterfaceSpec) -> io::Result<InterfaceHandle> {
+    async fn create(&mut self, spec: &InterfaceSpec) -> io::Result<InterfaceHandle> {
         let mut message = self.settings(spec, 0)?;
         message.attributes.push(LinkAttribute::Group(self.group));
-        self.net.request(
-            RouteNetlinkMessage::NewLink(message),
-            NlmF::ACK | NlmF::CREATE | NlmF::EXCL,
-        )?;
+        self.net
+            .request(
+                RouteNetlinkMessage::NewLink(message),
+                NlmF::ACK | NlmF::CREATE | NlmF::EXCL,
+            )
+            .await?;
         Ok(InterfaceHandle {
             index: network::index(&self.name(spec.id))?,
             id: Some(spec.id),
         })
     }
 
-    fn update(&mut self, handle: &InterfaceHandle, spec: &InterfaceSpec) -> io::Result<()> {
+    async fn update(&mut self, handle: &InterfaceHandle, spec: &InterfaceSpec) -> io::Result<()> {
         let current = self
             .net
-            .link(handle.index)?
+            .link(handle.index)
+            .await?
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
         let message = self.settings(spec, handle.index)?;
         if current.xfrm_if_id.is_none() {
             // Linux cannot change an interface's kind. Replacement is a
             // backend implementation detail of updating this logical object.
-            self.delete(handle)?;
-            self.create(spec)?;
+            self.delete(handle).await?;
+            self.create(spec).await?;
             return Ok(());
         }
         self.net
-            .request(RouteNetlinkMessage::NewLink(message), NlmF::ACK)?;
+            .request(RouteNetlinkMessage::NewLink(message), NlmF::ACK)
+            .await?;
         Ok(())
     }
 
-    fn delete(&mut self, handle: &InterfaceHandle) -> io::Result<()> {
+    async fn delete(&mut self, handle: &InterfaceHandle) -> io::Result<()> {
         let mut message = LinkMessage::default();
         message.header.index = handle.index;
         match self
             .net
             .request(RouteNetlinkMessage::DelLink(message), NlmF::ACK)
+            .await
         {
             Ok(_) => Ok(()),
             Err(error) if error.raw_os_error() == Some(libc::ENODEV) => Ok(()),
@@ -202,12 +207,14 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires root and iproute2; creates a network namespace"]
-    fn mutations_target_the_current_interface_at_the_handle_index() {
+    async fn mutations_target_the_current_interface_at_the_handle_index() {
         let _namespace = crate::test_netns::Netns::new();
-        let mut kernel = LinuxInterfaces::new("idx".into(), DEFAULT_INTERFACE_GROUP).unwrap();
-        let mut net = Network::new().unwrap();
+        let mut kernel = LinuxInterfaces::new("idx".into(), DEFAULT_INTERFACE_GROUP)
+            .await
+            .unwrap();
+        let mut net = Network::new().await.unwrap();
         let mut spec = InterfaceSpec {
             id: "00000007".parse().unwrap(),
             config: InterfaceConfig {
@@ -218,7 +225,7 @@ mod tests {
                 multicast: true,
             },
         };
-        let original = kernel.create(&spec).unwrap();
+        let original = kernel.create(&spec).await.unwrap();
         // The index remains the key after group, name and native settings change.
         ip(&[
             "link",
@@ -230,12 +237,12 @@ mod tests {
             "changed",
         ]);
         ip(&["link", "set", "changed", "type", "xfrm", "if_id", "66"]);
-        assert!(kernel.list().unwrap().is_empty());
+        assert!(kernel.list().await.unwrap().is_empty());
         spec.id = "00000008".parse().unwrap();
         spec.config.if_id = 42;
         spec.config.mtu = 1300;
-        kernel.update(&original, &spec).unwrap();
-        let current = net.link(original.index).unwrap().unwrap();
+        kernel.update(&original, &spec).await.unwrap();
+        let current = net.link(original.index).await.unwrap().unwrap();
         assert_eq!(current.name, "idx00000008");
         assert_eq!(current.group, 0);
         assert_eq!(current.xfrm_if_id, Some(42));
@@ -252,8 +259,8 @@ mod tests {
             "type",
             "dummy",
         ]);
-        kernel.update(&original, &spec).unwrap();
-        let recreated = kernel.list().unwrap().pop().unwrap();
+        kernel.update(&original, &spec).await.unwrap();
+        let recreated = kernel.list().await.unwrap().pop().unwrap();
         assert_eq!(recreated.handle.id(), Some(spec.id));
         assert_eq!(recreated.config, Some(spec.config));
         ip(&[
@@ -265,9 +272,9 @@ mod tests {
             "name",
             "released",
         ]);
-        kernel.delete(&recreated.handle).unwrap();
-        assert!(net.link(recreated.handle.index).unwrap().is_none());
-        kernel.delete(&recreated.handle).unwrap();
+        kernel.delete(&recreated.handle).await.unwrap();
+        assert!(net.link(recreated.handle.index).await.unwrap().is_none());
+        kernel.delete(&recreated.handle).await.unwrap();
 
         // Deletion also uses the index directly when the kernel reuses it.
         ip(&[
@@ -279,7 +286,7 @@ mod tests {
             "type",
             "dummy",
         ]);
-        kernel.delete(&recreated.handle).unwrap();
-        assert!(net.link(recreated.handle.index).unwrap().is_none());
+        kernel.delete(&recreated.handle).await.unwrap();
+        assert!(net.link(recreated.handle.index).await.unwrap().is_none());
     }
 }

@@ -837,9 +837,25 @@ in
             wait_overlay_config(machine, peer, links(machine)[0]["ifname"])
             ping_overlay(machine, peer)
 
-    with subtest("stopping strongSwan stops the backend and removes runtime directories"):
+    with subtest("backend freeze/thaw preserves its session, SAs and notifications"):
+        previous = pair_pids(left)
+        previous_spis = spis(left)
+        previous_indices = indices(left)
+        for _ in range(3):
+            left.succeed("systemctl freeze charon-kernel.service")
+            assert property(left, "charon-kernel.service", "FreezerState") == "frozen"
+            left.succeed("systemctl thaw charon-kernel.service")
+            assert property(left, "charon-kernel.service", "FreezerState") == "running"
+            assert "INSTALLED" in ctl(left, "--list-sas")
+        assert pair_pids(left) == previous
+        assert spis(left) == previous_spis
+        assert indices(left) == previous_indices
+        for peer, machine in enumerate(machines, 1):
+            ping_overlay(machine, peer)
+
+    with subtest("stopping strongSwan after freeze/thaw cleans up without a stop timeout"):
         for machine in machines:
-            machine.succeed("systemctl stop strongswan-swanctl.service")
+            machine.succeed("timeout 15s systemctl stop strongswan-swanctl.service")
             machine.succeed("test ! -e /run/strongswan")
             machine.succeed("test ! -e /run/charon-kernel")
         assert_stopped(left, "charon-kernel.service")

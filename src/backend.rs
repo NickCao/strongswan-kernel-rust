@@ -17,7 +17,7 @@ pub struct Backend<I: InterfaceKernel = LinuxInterfaces> {
     interfaces: Interfaces<I>,
 }
 impl Backend {
-    pub fn new(
+    pub async fn new(
         prefix: String,
         master_device: Option<String>,
         mtu: u32,
@@ -27,16 +27,16 @@ impl Backend {
         if !(1280..=65535).contains(&mtu) {
             return Err(invalid());
         }
-        let mut net = Network::new()?;
-        let sas = LinuxSas::new(config.iptfs)?;
+        let mut net = Network::new().await?;
+        let sas = LinuxSas::new(config.iptfs).await?;
         // Host routes, policy rules and virtual addresses belong to ranet.
         net.config = config;
         Ok(Self {
             sas: Sas::new(sas),
             net,
-            policies: Policies::new(LinuxPolicies::new()?),
+            policies: Policies::new(LinuxPolicies::new().await?),
             interfaces: Interfaces::new(
-                LinuxInterfaces::new(prefix, interface_group)?,
+                LinuxInterfaces::new(prefix, interface_group).await?,
                 master_device,
                 mtu,
             ),
@@ -47,22 +47,24 @@ impl<I: InterfaceKernel> Backend<I> {
     fn desired_interfaces(&self) -> HashSet<u32> {
         self.sas.ids().map(|sa| sa.if_id).collect()
     }
-    pub fn cleanup_interfaces(&mut self) -> io::Result<()> {
-        self.interfaces.remove_unused(&self.desired_interfaces())
+    pub async fn cleanup_interfaces(&mut self) -> io::Result<()> {
+        self.interfaces
+            .remove_unused(&self.desired_interfaces())
+            .await
     }
-    pub fn reconcile_interfaces(&mut self) -> io::Result<()> {
-        self.interfaces.reconcile(&self.desired_interfaces())
+    pub async fn reconcile_interfaces(&mut self) -> io::Result<()> {
+        self.interfaces.reconcile(&self.desired_interfaces()).await
     }
-    pub fn reconcile_sas(&mut self) -> io::Result<SaChanges> {
-        let mut changes = self.sas.reconcile()?;
+    pub async fn reconcile_sas(&mut self) -> io::Result<SaChanges> {
+        let mut changes = self.sas.reconcile().await?;
         // Release the failed tunnel's interface before asking strongSwan to
         // recover, so routing daemons can immediately choose another tunnel.
-        if let Err(error) = self.cleanup_interfaces() {
+        if let Err(error) = self.cleanup_interfaces().await {
             changes.cleanup_error.get_or_insert(error);
         }
         Ok(changes)
     }
-    pub fn install_sa(&mut self, id: rpc::SaId, config: rpc::SaConfig) -> io::Result<()> {
+    pub async fn install_sa(&mut self, id: rpc::SaId, config: rpc::SaConfig) -> io::Result<()> {
         let id = sa_id(id)?;
         // These checks used to run in the plugin. All options now arrive at
         // this boundary, even when the current backend does not support them.
@@ -89,40 +91,40 @@ impl<I: InterfaceKernel> Backend<I> {
         if config.udp_encapsulation && (id.src.port < 1024 || id.dst.port < 1024) {
             return Err(invalid());
         }
-        self.interfaces.ensure(id.if_id)?;
-        let result = self.sas.install(&id, &config);
+        self.interfaces.ensure(id.if_id).await?;
+        let result = self.sas.install(&id, &config).await;
         // Charon must record successful installation even if interface cleanup
         // fails. Reconciliation retries cleanup independently.
-        if let Err(error) = self.cleanup_interfaces() {
+        if let Err(error) = self.cleanup_interfaces().await {
             eprintln!("kernel-daemon: interface cleanup after SA installation: {error}");
         }
         result
     }
-    pub fn remove_sa(&mut self, id: rpc::SaId) -> io::Result<()> {
-        let result = self.sas.remove(&sa_id(id)?);
-        let cleanup = self.cleanup_interfaces();
+    pub async fn remove_sa(&mut self, id: rpc::SaId) -> io::Result<()> {
+        let result = self.sas.remove(&sa_id(id)?).await;
+        let cleanup = self.cleanup_interfaces().await;
         result.and(cleanup)
     }
-    pub fn flush_sas(&mut self) -> io::Result<()> {
-        let result = self.sas.clear();
-        let cleanup = self.cleanup_interfaces();
+    pub async fn flush_sas(&mut self) -> io::Result<()> {
+        let result = self.sas.clear().await;
+        let cleanup = self.cleanup_interfaces().await;
         result.and(cleanup)
     }
-    pub fn shutdown(&mut self) -> io::Result<()> {
+    pub async fn shutdown(&mut self) -> io::Result<()> {
         self.policies.clear();
-        let policies = self.policies.reconcile();
-        let sas = self.sas.clear();
-        let interfaces = self.interfaces.reconcile(&HashSet::new());
+        let policies = self.policies.reconcile().await;
+        let sas = self.sas.clear().await;
+        let interfaces = self.interfaces.reconcile(&HashSet::new()).await;
         policies.and(sas).and(interfaces)
     }
-    pub fn close(&mut self) -> io::Result<()> {
+    pub async fn close(&mut self) -> io::Result<()> {
         // Remove bypasses only after all tunnel objects are gone.
         if !self.sas.is_empty() || self.policies.has_tunnel_policies() {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
-        self.flush_sas()?;
+        self.flush_sas().await?;
         self.policies.clear();
-        self.policies.reconcile()
+        self.policies.reconcile().await
     }
 }
 pub fn validate_endpoint(endpoint: Endpoint) -> io::Result<Endpoint> {
@@ -280,22 +282,22 @@ mod tests {
     impl InterfaceKernel for InterruptedCleanup {
         type Handle = <LinuxInterfaces as InterfaceKernel>::Handle;
 
-        fn list(&mut self) -> io::Result<Vec<ObservedInterface<Self::Handle>>> {
+        async fn list(&mut self) -> io::Result<Vec<ObservedInterface<Self::Handle>>> {
             // The first inventory prepares the interface. Interrupt the next
             // dump, which cleans up interfaces after the SA install attempt.
             if self.dumps.fetch_add(1, Ordering::SeqCst) == 1 {
                 return Err(io::Error::from_raw_os_error(libc::EINTR));
             }
-            self.kernel.list()
+            self.kernel.list().await
         }
-        fn create(&mut self, spec: &InterfaceSpec) -> io::Result<Self::Handle> {
-            self.kernel.create(spec)
+        async fn create(&mut self, spec: &InterfaceSpec) -> io::Result<Self::Handle> {
+            self.kernel.create(spec).await
         }
-        fn update(&mut self, handle: &Self::Handle, spec: &InterfaceSpec) -> io::Result<()> {
-            self.kernel.update(handle, spec)
+        async fn update(&mut self, handle: &Self::Handle, spec: &InterfaceSpec) -> io::Result<()> {
+            self.kernel.update(handle, spec).await
         }
-        fn delete(&mut self, handle: &Self::Handle) -> io::Result<()> {
-            self.kernel.delete(handle)
+        async fn delete(&mut self, handle: &Self::Handle) -> io::Result<()> {
+            self.kernel.delete(handle).await
         }
     }
 
@@ -303,17 +305,18 @@ mod tests {
     #[case::installed(true)]
     #[case::rejected(false)]
     #[ignore = "requires root; creates a network namespace"]
-    fn sa_installation_result_survives_cleanup_failure(#[case] successful: bool) {
+    #[tokio::test(flavor = "current_thread")]
+    async fn sa_installation_result_survives_cleanup_failure(#[case] successful: bool) {
         let _namespace = crate::test_netns::Netns::new();
         let dumps = Arc::new(AtomicUsize::new(0));
-        let kernel = || LinuxInterfaces::new("tst".into(), 17227).unwrap();
+        let kernel = async || LinuxInterfaces::new("tst".into(), 17227).await.unwrap();
         let mut backend = Backend {
-            sas: Sas::new(LinuxSas::new(Default::default()).unwrap()),
-            net: Network::new().unwrap(),
-            policies: Policies::new(LinuxPolicies::new().unwrap()),
+            sas: Sas::new(LinuxSas::new(Default::default()).await.unwrap()),
+            net: Network::new().await.unwrap(),
+            policies: Policies::new(LinuxPolicies::new().await.unwrap()),
             interfaces: Interfaces::new(
                 InterruptedCleanup {
-                    kernel: kernel(),
+                    kernel: kernel().await,
                     dumps: dumps.clone(),
                 },
                 None,
@@ -378,25 +381,28 @@ mod tests {
             inbound: false,
             update: false,
         };
-        let result = backend.install_sa(id(), config);
+        let result = backend.install_sa(id(), config).await;
         assert_eq!(dumps.load(Ordering::SeqCst), 2, "cleanup was interrupted");
         if successful {
             result.unwrap();
-            backend.sas.query(&sa_id(id()).unwrap()).unwrap();
+            backend.sas.query(&sa_id(id()).unwrap()).await.unwrap();
         } else {
             assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
         }
-        let mut native = LinuxSas::new(Default::default()).unwrap();
-        assert_eq!(native.list().unwrap().len(), usize::from(successful));
+        let mut native = LinuxSas::new(Default::default()).await.unwrap();
+        assert_eq!(native.list().await.unwrap().len(), usize::from(successful));
         // A later cleanup retries the interrupted dump. It retains an
         // installed SA's interface and removes a rejected install's interface.
-        backend.cleanup_interfaces().unwrap();
-        assert_eq!(kernel().list().unwrap().len(), usize::from(successful));
+        backend.cleanup_interfaces().await.unwrap();
+        assert_eq!(
+            kernel().await.list().await.unwrap().len(),
+            usize::from(successful)
+        );
         if successful {
-            backend.remove_sa(id()).unwrap();
+            backend.remove_sa(id()).await.unwrap();
         }
-        assert!(native.list().unwrap().is_empty());
-        assert!(kernel().list().unwrap().is_empty());
+        assert!(native.list().await.unwrap().is_empty());
+        assert!(kernel().await.list().await.unwrap().is_empty());
     }
 
     #[rstest]
