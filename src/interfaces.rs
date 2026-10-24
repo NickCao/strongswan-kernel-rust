@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! SA-owned tunnel interface lifecycle and reconciliation, independent of the
-//! device API. The caller serializes this controller with SA ownership changes.
+//! Tunnel interface lifecycle and reconciliation, independent of the device API.
+//! The caller serializes this controller with SA and policy ownership changes.
 use std::{collections::HashSet, fmt, io, str::FromStr};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,7 +104,7 @@ impl<K: InterfaceKernel> Interfaces<K> {
 
     fn spec(&self, if_id: u32) -> InterfaceSpec {
         InterfaceSpec {
-            // The caller currently uses the SA binding as its logical key.
+            // The caller uses the SA/policy binding as its logical key.
             // Device backends receive the key and native configuration separately.
             id: InterfaceId(if_id),
             config: InterfaceConfig {
@@ -165,7 +165,7 @@ impl<K: InterfaceKernel> Interfaces<K> {
         Ok(observed)
     }
 
-    /// Prepare an interface before installing an SA. If installation fails,
+    /// Prepare an interface before installing an SA or policy. If installation fails,
     /// remove_unused() rolls this temporary ownership back.
     pub async fn ensure(&mut self, id: u32) -> io::Result<()> {
         let observed = self.inventory().await?;
@@ -174,7 +174,7 @@ impl<K: InterfaceKernel> Interfaces<K> {
         cleanup.and(repair)
     }
 
-    /// Immediate cleanup after SA deletion, hard expiry or failed installation.
+    /// Immediate cleanup after ownership removal or failed installation.
     /// This also runs after session loss, without repairing retained interfaces.
     pub async fn remove_unused(&mut self, desired: &HashSet<u32>) -> io::Result<()> {
         let observed = self.inventory().await?;
@@ -182,8 +182,8 @@ impl<K: InterfaceKernel> Interfaces<K> {
         self.prune(&observed, |id| desired.contains(&id)).await
     }
 
-    /// Desired IDs come from the current SA ownership set, not from observed
-    /// kernel SAs or policy references. One listing serves the entire pass.
+    /// Desired IDs come from current SA and policy ownership, independently of
+    /// kernel inventory. One listing serves the entire pass.
     pub async fn reconcile(&mut self, desired: &HashSet<u32>) -> io::Result<()> {
         let observed = self.inventory().await?;
         let ids: HashSet<_> = desired.iter().map(|id| InterfaceId(*id)).collect();

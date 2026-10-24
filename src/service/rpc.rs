@@ -108,15 +108,8 @@ impl Kernel for Service {
         id: PolicyId,
         config: PolicyConfig,
     ) -> Result<()> {
-        self.request(|backend| {
-            Box::pin(async move {
-                backend
-                    .policies
-                    .add_policy(backend::policy_id(id)?, backend::policy_config(config)?)
-                    .await
-            })
-        })
-        .await
+        self.request(|backend| Box::pin(async move { backend.install_policy(id, config).await }))
+            .await
     }
     async fn remove_policy(
         self,
@@ -124,15 +117,8 @@ impl Kernel for Service {
         id: PolicyId,
         config: PolicyConfig,
     ) -> Result<()> {
-        self.request(|backend| {
-            Box::pin(async move {
-                backend
-                    .policies
-                    .delete_policy(&backend::policy_id(id)?, &backend::policy_config(config)?)
-                    .await
-            })
-        })
-        .await
+        self.request(|backend| Box::pin(async move { backend.remove_policy(id, config).await }))
+            .await
     }
     async fn query_policy(self, _: tarpc::context::Context, id: PolicyId) -> Result<u64> {
         self.request(|backend| {
@@ -146,7 +132,7 @@ impl Kernel for Service {
         .await
     }
     async fn flush_policies(self, _: tarpc::context::Context) -> Result<()> {
-        self.request(|backend| Box::pin(async move { backend.policies.flush_policies().await }))
+        self.request(|backend| Box::pin(backend.flush_policies()))
             .await
     }
     async fn bypass_port(self, _: tarpc::context::Context, family: u16, port: u16) -> Result<()> {

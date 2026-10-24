@@ -76,7 +76,7 @@ in
       default = "gravity";
       description = ''
         Existing master interface, usually a VRF, for daemon-owned XFRM
-        interfaces. It must exist before the first CHILD_SA is installed.
+        interfaces. It must exist before the first SA or trap policy is installed.
         The daemon manages attachment, but does not create or remove the master.
       '';
     };

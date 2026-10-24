@@ -83,8 +83,8 @@ Rust RPC frames are not subject to pthread cancellation.
 | `update_sa` | Return unsupported. strongSwan's host-update path may request a fresh CHILD_SA rekey. |
 | `query_sa` / `query_policy` | Return usage from a direct kernel lookup. |
 | `remove_sa` / `flush_sas` | Release desired SAs and unused interfaces. Flush also clears the entire XFRM state table and SPI reservations. |
-| `install_policy` / `remove_policy` | Maintain strongSwan policy references and the selected effective policy. |
-| `flush_policies` | Clear tunnel-policy references and reconcile, retaining desired IKE bypasses. |
+| `install_policy` / `remove_policy` | Maintain strongSwan policy references and the selected effective policy. Prepare its interface before installation and release interfaces without remaining SA or policy owners. |
+| `flush_policies` | Clear tunnel-policy references and reconcile, retaining desired IKE bypasses and interfaces still used by SAs. |
 | `bypass_port` | Install global UDP port bypasses for IPv4/IPv6, requiring a port of at least 1024. |
 | `get_source_address` / `get_next_hop` | Read the host route from the kernel FIB. Subnet nexthop queries are unsupported. |
 | `get_interface` / `list_addresses` / `list_subnets` | Read usable underlay interfaces, addresses and subnets. |
@@ -133,7 +133,8 @@ audit also runs. Scheduling and lock contention can delay actual execution.
   all global policies, including unsupported native configurations. Its opaque
   handles contain the policy index and native lookup qualifiers.
 - `InterfaceKernel` provides list/create/update/delete. Desired interfaces
-  derive from installed SA ownership. Observations expose managed settings;
+  derive from installed SAs and desired policy references with nonzero interface
+  IDs, including traps without SAs. Observations expose managed settings;
   handles expose logical identity. Linux discovers ownership through the numeric
   link group and identity through the encoded name, without an identity cache.
   Mutations target the interface index.

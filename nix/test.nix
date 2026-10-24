@@ -25,6 +25,10 @@ let
     connectionWithAuth peer proposal mode "psk";
   connectionWithAuth =
     peer: proposal: mode: auth:
+    connectionConfig peer proposal mode auth false;
+  trapConnection = peer: connectionConfig peer "aes128gcm128-esn" "tunnel" "psk" true;
+  connectionConfig =
+    peer: proposal: mode: auth: trap:
     let
       config = pkgs.writeText "swanctl-${toString peer}-${proposal}-${mode}-${auth}.conf" ''
         connections {
@@ -38,8 +42,8 @@ let
             # The Rust backend must force ESP-in-UDP without a connection override.
             encap = no
             mobike = no
-            if_id_in = ${if peer == 1 then "%unique" else "42"}
-            if_id_out = ${if peer == 1 then "%unique" else "42"}
+            if_id_in = ${if peer == 1 && !trap then "%unique" else "42"}
+            if_id_out = ${if peer == 1 && !trap then "%unique" else "42"}
             local {
               auth = ${auth}
               ${pkgs.lib.optionalString (
@@ -56,8 +60,16 @@ let
             }
             children {
               net {
-                local_ts = 0.0.0.0/0, ::/0
-                remote_ts = 0.0.0.0/0, ::/0
+                local_ts = ${
+                  if trap then "10.${toString peer}.0.1/32, fd10:${toString peer}::1/128" else "0.0.0.0/0, ::/0"
+                }
+                remote_ts = ${
+                  if trap then
+                    "10.${toString (3 - peer)}.0.1/32, fd10:${toString (3 - peer)}::1/128"
+                  else
+                    "0.0.0.0/0, ::/0"
+                }
+                start_action = ${if trap then "trap" else "none"}
                 mode = ${mode}
                 icmp = yes
                 esp_proposals = ${proposal}
@@ -492,6 +504,48 @@ in
         )
         assert not links(left) and not spis(left)
 
+    with subtest("trap-only policies create an interface before SAs and ping triggers negotiation"):
+        for machine, config_file in zip(machines, ["${trapConnection 1}", "${trapConnection 2}"]):
+            ctl(machine, "--load-all --noprompt --file " + config_file)
+        trap_indices = []
+        for peer, machine in enumerate(machines, 1):
+            interface = "gn0000002a" if machine is left else "stock0000002a"
+            wait_interface(machine, peer, interface)
+            wait_overlay_config(machine, peer, interface)
+            assert "net" in ctl(machine, "--list-pols --trap --child net")
+            policies = [policy for policy in policy_specs(machine) if "if_id" in policy]
+            assert len(policies) == 6, policies
+            assert all("proto esp" in policy and "spi 0x" not in policy for policy in policies), policies
+            assert not machine.succeed("ip xfrm state").strip(), "trap loading established an SA"
+            assert "INSTALLED" not in ctl(machine, "--list-sas")
+            trap_indices.append(indices(machine))
+
+        # No --initiate or start action: only this ping may trigger acquisition.
+        left.wait_until_succeeds("ip vrf exec overlay ping -c 1 -W 2 -I 10.1.0.1 10.2.0.1")
+        for peer, machine in enumerate(machines, 1):
+            assert "INSTALLED" in ctl(machine, "--list-sas")
+            assert spis(machine)
+            assert indices(machine) == trap_indices[peer - 1]
+            ping_overlay(machine, peer)
+
+        # Removing SAs leaves the trap and its interface ready for new traffic.
+        ctl(left, "--terminate --ike tunnel")
+        for peer, machine in enumerate(machines, 1):
+            machine.wait_until_succeeds("test -z \"$(ip xfrm state)\"")
+            assert indices(machine) == trap_indices[peer - 1]
+            assert "net" in ctl(machine, "--list-pols --trap --child net")
+        left.wait_until_succeeds("ip vrf exec overlay ping -c 1 -W 2 -I 10.1.0.1 10.2.0.1")
+        assert indices(left) == trap_indices[0]
+        assert "INSTALLED" in ctl(left, "--list-sas")
+
+        for machine in machines:
+            ctl(machine, "--uninstall --child net")
+        ctl(left, "--terminate --ike tunnel")
+        for machine in machines:
+            machine.wait_until_succeeds("test -z \"$(ip xfrm state)\"")
+        left.wait_until_succeeds("test \"$(ip -j link show type xfrm)\" = '[]'")
+        assert indices(right) == trap_indices[1]
+
     proposals = [
         ("AES-GCM", "${connection 1 "aes128gcm128-esn"}", "${connection 2 "aes128gcm128-esn"}", "rfc4106(gcm(aes))"),
         ("AES-CBC/HMAC", "${connection 1 "aes128-sha256-esn"}", "${connection 2 "aes128-sha256-esn"}", "cbc(aes)"),
@@ -680,8 +734,8 @@ in
                         wait_interface(machine, peer, interface)
                         wait_overlay_config(machine, peer, interface)
                         ping_overlay(machine, peer)
-                        if mutation == "flush" and peer == 1:
-                            assert indices(machine)[interface] != original_indices[0][interface]
+                        # Policy ownership may preserve the interface while
+                        # fresh SAs are negotiated after a kernel state flush.
                         original_indices[peer - 1] = indices(machine)
                 finally:
                     if mutation == "rekey-flush":

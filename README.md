@@ -39,6 +39,12 @@ Use nonzero `if_id_in` and `if_id_out` in the connection configuration.
 ones. Remove scripts that create or delete these interfaces. Overlay addresses
 and routes remain the responsibility of the network configuration.
 
+For `start_action = trap`, configure fixed nonzero interface IDs shared by the
+trap and negotiated CHILD_SAs, for example `if_id_in = 42` and `if_id_out = 42`.
+Assign different IDs to logical tunnels that need separate interfaces.
+With strongSwan 6.1.0, a trap's `%unique` allocation is not passed to the
+CHILD_SA it triggers, so their policies can bind to different interfaces.
+
 Unsupported configuration includes transport/BEET mode, AH, IPComp, hardware
 offload (including automatic offload), security labels, per-CPU SAs/acquires,
 and SA/policy interface-name restrictions. Virtual address and host route/rule
@@ -112,7 +118,7 @@ Import this flake's `nixosModules.default`, then enable
 | `interfaceGroup` | `17227` | Reserved nonzero numeric Linux link group. |
 | `masterDevice` | `"gravity"` | Existing master interface for tunnel links. |
 
-The module requires its master device to exist before the first CHILD_SA is
+The module requires its master device to exist before the first SA or trap policy is
 installed. For example, create a VRF using systemd-networkd:
 
 ```nix
@@ -280,12 +286,18 @@ The master must already exist and remains managed by the network configuration.
 
 ## Interfaces and reconciliation
 
-An interface named `ranet<if_id as eight hexadecimal digits>` is created
-before the first SA using that ID is installed. It is UP and multicast-enabled.
-Inbound/outbound SAs and overlapping rekeys share an interface when their IDs
-match. Removing, retiring or hard-expiring its final SA releases the interface.
-Failed first installation rolls back the temporary interface.
-Policies and larval SPI reservations do not retain interfaces.
+An interface named `ranet<if_id as eight hexadecimal digits>` is created before
+the first SA or policy using that ID is installed. It is UP and multicast-enabled.
+SAs and policy references, including traps and overlapping rekeys, share an
+interface when their IDs match. The interface remains while any installed SA
+or desired policy uses the ID. Removing the final owner releases the interface;
+failed first installation rolls back temporary ownership.
+IKE bypasses (`if_id = 0`) and larval SPI reservations do not retain interfaces.
+
+A trap can therefore create an interface before any SA exists. Once the network
+configuration supplies a route through it, matching traffic triggers ACQUIRE
+delivery to charon and CHILD_SA negotiation. The interface remains available for
+new traffic after the SAs are removed while the trap is still configured.
 
 All interfaces in the configured numeric link group belong to the daemon,
 regardless of native type or name. Group membership survives crashes and does
@@ -304,9 +316,10 @@ coalesced over 100 ms, and audits every five seconds:
 
 Reconciliation and RPC mutations share a backend lock.
 An external policy flush can recover without replacing SAs or interfaces.
-SA loss instead requests fresh CHILD_SA negotiation. Releasing the final SA's
-interface also removes its routes, allowing routing software to select another
-tunnel.
+SA loss instead requests fresh CHILD_SA negotiation. Policies can retain the
+interface and its routes while no usable SA exists, so routing software must
+detect peer reachability independently. Removing the final SA and policy owner
+also removes the interface and its routes.
 
 In-place interface repairs preserve unmanaged settings such as addresses,
 aliases and queue lengths. Replacement loses these settings and routes.
@@ -396,7 +409,8 @@ The separate NixOS test uses actual strongSwan with this backend on one machine 
 upstream `kernel-netlink` on the other. It checks both initiation directions,
 PSK and Ed25519 raw-public-key authentication, encrypted IPv4/IPv6 traffic,
 AES-GCM, AES-CBC/HMAC, ESN, TFC and ICMP flags,
-IP-TFS aggregation/fragmentation, rekeying, policy/interface repair, SA-loss
+IP-TFS aggregation/fragmentation, trap-only interface creation and traffic-triggered
+negotiation, rekeying, policy/interface repair, SA-loss
 recovery, VICI loading/reloading of 200 unreachable-peer configurations under
 route churn, socket access, service hardening and paired restart/shutdown behavior.
 It also checks the plugin ABI against actual strongSwan libraries.

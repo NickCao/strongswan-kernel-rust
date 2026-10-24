@@ -193,7 +193,7 @@ impl<K: SaKernel> Sas<K> {
     }
     pub async fn remove(&mut self, id: &SaId) -> io::Result<()> {
         // Desired state is removed even if native deletion fails. Future
-        // inventories retry deletion; neither the SA nor its interface revives.
+        // inventories retry deletion without restoring this SA's ownership.
         self.installed.remove(&id.key());
         self.reservations.remove(&Reservation::from(id));
         match self.kernel.get(id).await {

@@ -271,6 +271,12 @@ impl<K: PolicyKernel> Policies<K> {
             .iter()
             .any(|(key, uses)| key.if_id == if_id && uses.iter().any(|data| data.reqid == reqid))
     }
+    pub fn interface_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.policies
+            .keys()
+            .map(|key| key.if_id)
+            .filter(|id| *id != 0)
+    }
     /// Clear desired state. Backend inventory retains unwanted objects for
     /// deletion retries, including after a controller restart.
     pub fn clear(&mut self) {

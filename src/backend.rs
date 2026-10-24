@@ -45,7 +45,11 @@ impl Backend {
 }
 impl<I: InterfaceKernel> Backend<I> {
     fn desired_interfaces(&self) -> HashSet<u32> {
-        self.sas.ids().map(|sa| sa.if_id).collect()
+        self.sas
+            .ids()
+            .map(|sa| sa.if_id)
+            .chain(self.policies.interface_ids())
+            .collect()
     }
     pub async fn cleanup_interfaces(&mut self) -> io::Result<()> {
         self.interfaces
@@ -57,12 +61,49 @@ impl<I: InterfaceKernel> Backend<I> {
     }
     pub async fn reconcile_sas(&mut self) -> io::Result<SaChanges> {
         let mut changes = self.sas.reconcile().await?;
-        // Release the failed tunnel's interface before asking strongSwan to
-        // recover, so routing daemons can immediately choose another tunnel.
+        // Policies, including traps, keep their interfaces after SA loss.
+        // Release only interfaces that have no remaining owner.
         if let Err(error) = self.cleanup_interfaces().await {
             changes.cleanup_error.get_or_insert(error);
         }
         Ok(changes)
+    }
+    pub async fn install_policy(
+        &mut self,
+        id: rpc::PolicyId,
+        config: rpc::PolicyConfig,
+    ) -> io::Result<()> {
+        let id = policy_id(id)?;
+        let data = policy_config(config)?;
+        let result = async {
+            self.interfaces.ensure(id.if_id).await?;
+            self.policies.add_policy(id, data).await
+        }
+        .await;
+        // Retain a successful policy reference even if interface cleanup
+        // fails. Failed installations have no reference and release their
+        // temporary interface; reconciliation retries interrupted cleanup.
+        if let Err(error) = self.cleanup_interfaces().await {
+            eprintln!("kernel-daemon: interface cleanup after policy installation: {error}");
+        }
+        result
+    }
+    pub async fn remove_policy(
+        &mut self,
+        id: rpc::PolicyId,
+        config: rpc::PolicyConfig,
+    ) -> io::Result<()> {
+        let result = self
+            .policies
+            .delete_policy(&policy_id(id)?, &policy_config(config)?)
+            .await;
+        let cleanup = self.cleanup_interfaces().await;
+        result.and(cleanup)
+    }
+    pub async fn flush_policies(&mut self) -> io::Result<()> {
+        let result = self.policies.flush_policies().await;
+        let cleanup = self.cleanup_interfaces().await;
+        result.and(cleanup)
     }
     pub async fn install_sa(&mut self, id: rpc::SaId, config: rpc::SaConfig) -> io::Result<()> {
         let id = sa_id(id)?;

@@ -171,14 +171,14 @@ async fn policy_selectors_and_flags(
             .unwrap(),
         0
     );
-    assert!(
-        owned_links().await.is_empty(),
-        "policies alone must not create interfaces"
-    );
+    let interfaces = owned_links().await;
+    assert_eq!(interfaces.len(), 1);
+    assert_eq!(interfaces[0].xfrm_if_id, Some(41));
     rpc.call(rpc.kernel.remove_policy(ctx(), id(), config()))
         .await
         .unwrap();
     assert!(inventory().await.is_empty());
+    assert!(owned_links().await.is_empty());
     rpc.close().await;
 }
 
@@ -328,11 +328,9 @@ async fn policy_repair_preserves_sas_and_bypasses(
     rpc.call(rpc.kernel.remove_sa(ctx(), family.sa(0x10001), 0))
         .await
         .unwrap();
-    assert!(
-        owned_links().await.is_empty(),
-        "policies must not retain interfaces"
-    );
+    assert_eq!(owned_links().await[0].index, index);
     rpc.call(rpc.kernel.flush_policies(ctx())).await.unwrap();
+    assert!(owned_links().await.is_empty());
     let bypasses = inventory().await;
     assert_eq!(bypasses.len(), 4);
     assert!(bypasses.keys().all(|key| key.if_id == 0));
@@ -356,30 +354,51 @@ async fn periodic_policy_audits_do_not_rewrite_or_resurrect_objects(
         ))
         .await
         .unwrap();
-        // Stop background traffic before XFRM so native SA counters stay stable.
-        for args in [
-            vec!["qdisc", "add", "dev", "ranet00000029", "clsact"],
-            vec![
-                "filter",
-                "add",
-                "dev",
-                "ranet00000029",
-                "egress",
-                "matchall",
-                "action",
-                "drop",
-            ],
-        ] {
-            assert!(std::process::Command::new("tc")
-                .args(args)
-                .status()
-                .unwrap()
-                .success());
-        }
+    } else {
+        // An inbound policy creates the interface without allowing background
+        // IPv6 traffic to trigger an outbound acquisition before the guard.
+        rpc.call(rpc.kernel.install_policy(
+            ctx(),
+            Family::V4.policy(PolicyDirection::Inbound),
+            policy_config(Family::V4, 0x10001),
+        ))
+        .await
+        .unwrap();
+    }
+    // Stop background traffic before XFRM so the idle audit cannot change
+    // counters or create acquisition placeholders in the case without SAs.
+    for args in [
+        vec!["qdisc", "add", "dev", "ranet00000029", "clsact"],
+        vec![
+            "filter",
+            "add",
+            "dev",
+            "ranet00000029",
+            "egress",
+            "matchall",
+            "action",
+            "drop",
+        ],
+    ] {
+        assert!(std::process::Command::new("tc")
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
     }
     install_policy_set(&rpc, Family::V4).await;
+    if !with_sa {
+        rpc.call(rpc.kernel.remove_policy(
+            ctx(),
+            Family::V4.policy(PolicyDirection::Inbound),
+            policy_config(Family::V4, 0x10001),
+        ))
+        .await
+        .unwrap();
+    }
     let before = native_inventory().await;
     let states_before = states().await;
+    let index = owned_links().await[0].index;
     tokio::time::sleep(std::time::Duration::from_millis(5300)).await;
     assert_eq!(
         native_inventory().await,
@@ -405,6 +424,11 @@ async fn periodic_policy_audits_do_not_rewrite_or_resurrect_objects(
     let bypasses = native_inventory().await;
     assert_eq!(bypasses.len(), 4);
     assert!(bypasses.iter().all(|p| p.user_policy_info.priority == 32));
+    if with_sa {
+        assert_eq!(owned_links().await[0].index, index);
+    } else {
+        assert!(owned_links().await.is_empty());
+    }
     tokio::time::sleep(std::time::Duration::from_millis(5300)).await;
     assert_eq!(
         native_inventory().await,
@@ -413,6 +437,7 @@ async fn periodic_policy_audits_do_not_rewrite_or_resurrect_objects(
     );
     assert_eq!(states().await, states_before);
     rpc.call(rpc.kernel.flush_sas(ctx())).await.unwrap();
+    assert!(owned_links().await.is_empty());
     rpc.close().await;
 }
 
@@ -431,6 +456,7 @@ async fn repair_uses_surviving_rekey_reference(daemon: Fixture, #[case] count: u
     ))
     .await
     .unwrap();
+    let index = owned_links().await[0].index;
     let expected = inventory().await;
     for n in 0..count {
         rpc.call(rpc.kernel.install_policy(
@@ -462,39 +488,66 @@ async fn repair_uses_surviving_rekey_reference(daemon: Fixture, #[case] count: u
         .unwrap();
     }
     eventually(async || inventory().await == expected).await;
+    assert_eq!(owned_links().await[0].index, index);
     rpc.call(rpc.kernel.flush_policies(ctx())).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(5200)).await;
     assert!(
         inventory().await.is_empty(),
         "removed desires must not return during the next audit"
     );
+    assert!(owned_links().await.is_empty());
     rpc.close().await;
 }
 
 #[rstest]
 #[ignore = "requires root and iproute2; creates a network namespace"]
 #[tokio::test(flavor = "current_thread")]
-async fn acquire_events_preserve_packet_selectors(
+async fn rejected_policy_interface_does_not_retain_desired_state(daemon: Fixture) {
+    ip(&["link", "add", "foreign", "type", "xfrm", "if_id", "41"]);
+    let rpc = daemon.session().await;
+    let mut config = policy_config(Family::V4, 0);
+    config.priority = PolicyPriority::Routed;
+    assert_eq!(
+        rpc.call(rpc.kernel.install_policy(
+            ctx(),
+            Family::V4.policy(PolicyDirection::Outbound),
+            config,
+        ))
+        .await,
+        Err(Error::Kernel(libc::EEXIST))
+    );
+    ip(&["link", "del", "foreign"]);
+    // A notification-driven reconciliation must not recreate a rejected owner.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(inventory().await.is_empty());
+    assert!(owned_links().await.is_empty());
+    rpc.close().await;
+}
+
+#[rstest]
+#[ignore = "requires root and iproute2; creates a network namespace"]
+#[tokio::test(flavor = "current_thread")]
+async fn trap_without_sa_creates_interface_and_forwards_acquire(
     daemon: Fixture,
     #[values(Family::V4, Family::V6)] family: Family,
 ) {
     let rpc = daemon.session().await;
-    rpc.call(rpc.kernel.install_sa(
-        ctx(),
-        family.sa(0x10001),
-        sa_config(Cipher::Gcm, false, true),
-    ))
-    .await
-    .unwrap();
-    // A different reqid ensures traffic triggers acquisition instead of using the installed SA.
+    let mut id = family.policy(PolicyDirection::Outbound);
+    id.src.from = family.local().address;
+    id.src.to = id.src.from;
+    id.dst.from = family.destination().address;
+    id.dst.to = id.dst.from;
+    // Narrow selectors exclude background IPv6 traffic before the test packet.
     let mut config = policy_config(family, 0);
+    config.priority = PolicyPriority::Routed;
     config.sa.as_mut().unwrap().reqid = 43;
-    rpc.call(
-        rpc.kernel
-            .install_policy(ctx(), family.policy(PolicyDirection::Outbound), config),
-    )
-    .await
-    .unwrap();
+    rpc.call(rpc.kernel.install_policy(ctx(), id, config))
+        .await
+        .unwrap();
+    assert!(states().await.is_empty(), "a trap must not install an SA");
+    let interfaces = owned_links().await;
+    assert_eq!(interfaces.len(), 1);
+    assert_eq!(interfaces[0].xfrm_if_id, Some(41));
     let dst = family.destination();
     ip(&[
         "route",
