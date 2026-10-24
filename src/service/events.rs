@@ -125,9 +125,6 @@ pub(super) async fn run(session: Arc<Session>, xfrm: bool, mut notifications: No
             // Keep one pending roam update, retaining address/link changes,
             // instead of queueing a separate IKE-wide job for every route.
             let kind = Rtm::from(r.kind);
-            if matches!(kind, Rtm::Newlink | Rtm::Dellink) {
-                let _ = session.repair_wakeup.try_send(());
-            }
             let change = match kind {
                 Rtm::Newlink | Rtm::Dellink | Rtm::Newaddr | Rtm::Deladdr => {
                     session.network_changed.store(true, Ordering::Release);
@@ -162,13 +159,15 @@ pub(super) async fn run(session: Arc<Session>, xfrm: bool, mut notifications: No
             }
             let Backend { sas, policies, .. } = &mut *backend;
             let result = xfrm::event(&r, sas, policies);
-            if let Err(e) = backend.cleanup_interfaces().await {
-                eprintln!("kernel-daemon: interface cleanup: {e}");
+            if let Ok(Some((_, Some(if_id)))) = &result {
+                if let Err(e) = backend.cleanup_interface(*if_id).await {
+                    eprintln!("kernel-daemon: interface cleanup: {e}");
+                }
             }
             result
         };
         match result {
-            Ok(Some(event)) if session.connected.load(Ordering::Acquire) => {
+            Ok(Some((event, _))) if session.connected.load(Ordering::Acquire) => {
                 session.emit_events(vec![event]);
             }
             Err(e) => eprintln!("kernel-daemon: kernel event: {e}"),

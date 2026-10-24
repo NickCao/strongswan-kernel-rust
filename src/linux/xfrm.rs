@@ -658,11 +658,12 @@ fn nonzero(v: u64) -> u64 {
     }
 }
 
+/// Return the notification and the interface ID released by a hard expiry.
 pub fn event(
     message: &Reply,
     sas: &mut Sas<LinuxSas>,
     policies: &Policies<LinuxPolicies>,
-) -> io::Result<Option<rpc::Event>> {
+) -> io::Result<Option<(rpc::Event, Option<u32>)>> {
     let bytes = &message.payload;
     let event = match message.kind {
         packet::XFRM_MSG_ACQUIRE => {
@@ -685,12 +686,15 @@ pub fn event(
             if !policies.contains_reqid(if_id, reqid) {
                 return Ok(None);
             }
-            rpc::Event::Acquire(rpc::Acquire {
-                reqid,
-                src: rpc_selector(selector_ts(&acquire.selector, true)?),
-                dst: rpc_selector(selector_ts(&acquire.selector, false)?),
-                sequence: acquire.seq,
-            })
+            (
+                rpc::Event::Acquire(rpc::Acquire {
+                    reqid,
+                    src: rpc_selector(selector_ts(&acquire.selector, true)?),
+                    dst: rpc_selector(selector_ts(&acquire.selector, false)?),
+                    sequence: acquire.seq,
+                }),
+                None,
+            )
         }
         packet::XFRM_MSG_EXPIRE => {
             // ExpireMessage omits trailing attributes in this crate version.
@@ -729,12 +733,15 @@ pub fn event(
             if !sas.expire(&id, hard) {
                 return Ok(None);
             }
-            rpc::Event::Expire(rpc::Expiry {
-                protocol: sa.id.proto,
-                spi: sa.id.spi,
-                destination: dst,
-                hard,
-            })
+            (
+                rpc::Event::Expire(rpc::Expiry {
+                    protocol: sa.id.proto,
+                    spi: sa.id.spi,
+                    destination: dst,
+                    hard,
+                }),
+                hard.then_some(if_id),
+            )
         }
         packet::XFRM_MSG_MAPPING => {
             let mapping = packet::UserMapping::parse(bytes).map_err(io::Error::other)?;
@@ -751,11 +758,14 @@ pub fn event(
                 return Ok(None);
             }
             let remote = host(family, mapping.new_saddr, mapping.new_sport)?;
-            rpc::Event::Mapping(rpc::Mapping {
-                spi,
-                destination: dst,
-                remote,
-            })
+            (
+                rpc::Event::Mapping(rpc::Mapping {
+                    spi,
+                    destination: dst,
+                    remote,
+                }),
+                None,
+            )
         }
         _ => return Ok(None),
     };

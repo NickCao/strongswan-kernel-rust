@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Exercise ranet's VICI request sequence while routing updates keep arriving.
+"""Exercise ranet's VICI request sequence under route and link churn.
 
 Run in a disposable VM/namespace with charon already running and the upstream
 Python vici package on PYTHONPATH. The remote address must be unused.
@@ -19,6 +19,7 @@ def run(args):
     names = []
     errors = []
     updates = 0
+    interfaces = [f"churn{i}" for i in range(200)]
     stop = threading.Event()
 
     def batch(commands):
@@ -33,6 +34,9 @@ def run(args):
                     f"route replace 198.18.0.{i}/32 via {gateway} "
                     f"dev {args.interface} table {table} proto 192\n"
                     for i in range(1, 101)
+                ) + "".join(
+                    f"link set dev {interface} mtu {1400 + updates % 2}\n"
+                    for interface in interfaces[:100]
                 ))
                 updates += 1
                 stop.wait(0.05)
@@ -44,6 +48,9 @@ def run(args):
         f"table {table} proto 192\n"
         for i in range(10000)
     ))
+    # Unrelated interfaces must not turn each link notification into a full
+    # reconciliation pass. Their unused attributes also exercise link dumps.
+    batch("".join(f"link add {interface} type dummy\n" for interface in interfaces))
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(5)
     sock.connect(args.socket)
@@ -81,11 +88,11 @@ def run(args):
                 if not sas:
                     client.request("initiate", {"ike": name, "child": "net", "timeout": "-1"})
             elapsed = time.monotonic() - started
-            assert elapsed < 15, f"VICI stalled for {elapsed:.2f}s under route churn"
+            assert elapsed < 15, f"VICI stalled for {elapsed:.2f}s under route/link churn"
             timings.append(elapsed)
         assert updates > 0 and not errors, errors
         print(f"PASS: 200 VICI connections loaded/reloaded in {timings}, "
-              f"during {updates * 100} route updates", flush=True)
+              f"during {updates * 100} route and {updates * 100} link updates", flush=True)
     finally:
         stop.set()
         worker.join()
@@ -97,6 +104,7 @@ def run(args):
             client.unload_conn({"name": name})
         sock.close()
         subprocess.run(["ip", "route", "flush", "table", table], check=True)
+        batch("".join(f"link del dev {interface}\n" for interface in interfaces))
 
 
 if __name__ == "__main__":

@@ -48,7 +48,7 @@ pub struct ObservedInterface<H> {
     pub config: Option<InterfaceConfig>,
 }
 
-/// Logical identity captured by list(), read from the snapshot without I/O.
+/// Logical identity captured by get()/list(), read from the snapshot without I/O.
 /// All managed configuration is exposed through ObservedInterface::config.
 pub trait InterfaceHandle {
     /// The caller-supplied logical ID, or None for an unidentified owned object.
@@ -65,15 +65,21 @@ pub trait InterfaceKernel: Send {
     fn list(
         &mut self,
     ) -> impl std::future::Future<Output = io::Result<Vec<ObservedInterface<Self::Handle>>>> + Send;
+    /// Look up one logical ID without listing interfaces. Return only an owned
+    /// object; foreign objects that conflict with creation must be preserved.
+    fn get(
+        &mut self,
+        id: InterfaceId,
+    ) -> impl std::future::Future<Output = io::Result<Option<ObservedInterface<Self::Handle>>>> + Send;
     /// Create only: an existing object must not be replaced. Existing owned
-    /// interfaces are discovered via list() and updated by the controller.
+    /// interfaces are discovered via get()/list() and updated by the controller.
     fn create(
         &mut self,
         spec: &InterfaceSpec,
     ) -> impl std::future::Future<Output = io::Result<Self::Handle>> + Send;
     /// Achieve this configuration for the object identified by the handle.
-    /// The backend chooses in-place repair or replacement. Callers must list
-    /// again before reusing a handle after a potentially replacing update.
+    /// The backend chooses in-place repair or replacement. Callers must look up
+    /// the object again before reusing a handle after a potentially replacing update.
     fn update(
         &mut self,
         handle: &Self::Handle,
@@ -166,20 +172,19 @@ impl<K: InterfaceKernel> Interfaces<K> {
     }
 
     /// Prepare an interface before installing an SA or policy. If installation fails,
-    /// remove_unused() rolls this temporary ownership back.
+    /// remove() rolls this temporary ownership back.
     pub async fn ensure(&mut self, id: u32) -> io::Result<()> {
-        let observed = self.inventory().await?;
-        let cleanup = self.prune(&observed, |_| true).await;
-        let repair = self.repair(id, &observed).await;
-        cleanup.and(repair)
+        let observed = self.kernel.get(InterfaceId(id)).await?;
+        self.repair(id, observed.as_slice()).await
     }
 
-    /// Immediate cleanup after ownership removal or failed installation.
-    /// This also runs after session loss, without repairing retained interfaces.
-    pub async fn remove_unused(&mut self, desired: &HashSet<u32>) -> io::Result<()> {
-        let observed = self.inventory().await?;
-        let desired: HashSet<_> = desired.iter().map(|id| InterfaceId(*id)).collect();
-        self.prune(&observed, |id| desired.contains(&id)).await
+    /// Release one ID after its final owner is removed, without an inventory.
+    /// Renamed leftovers and failed deletions are retried by periodic discovery.
+    pub async fn remove(&mut self, id: u32) -> io::Result<()> {
+        if let Some(current) = self.kernel.get(InterfaceId(id)).await? {
+            self.kernel.delete(&current.handle).await?;
+        }
+        Ok(())
     }
 
     /// Desired IDs come from current SA and policy ownership, independently of
@@ -222,6 +227,7 @@ mod tests {
         updates: usize,
         reject: HashSet<u32>,
         reject_delete: HashSet<u64>,
+        lists: usize,
     }
     impl MemoryKernel {
         fn name(id: InterfaceId) -> String {
@@ -231,12 +237,25 @@ mod tests {
     impl InterfaceKernel for MemoryKernel {
         type Handle = MemoryHandle;
         async fn list(&mut self) -> io::Result<Vec<ObservedInterface<MemoryHandle>>> {
+            self.lists += 1;
             Ok(self
                 .objects
                 .iter()
                 .filter(|entry| !self.unowned.contains(&entry.handle.identity))
                 .cloned()
                 .collect())
+        }
+        async fn get(
+            &mut self,
+            id: InterfaceId,
+        ) -> io::Result<Option<ObservedInterface<MemoryHandle>>> {
+            Ok(self
+                .objects
+                .iter()
+                .find(|entry| {
+                    entry.handle.id == Some(id) && !self.unowned.contains(&entry.handle.identity)
+                })
+                .cloned())
         }
         async fn create(&mut self, spec: &InterfaceSpec) -> io::Result<MemoryHandle> {
             if self.reject.contains(&spec.config.if_id) {
@@ -366,10 +385,7 @@ mod tests {
         assert!(interfaces.ensure(42).await.is_err());
         assert_eq!(interfaces.kernel.objects.len(), 1);
         interfaces.ensure(43).await.unwrap();
-        interfaces
-            .remove_unused(&HashSet::from([41]))
-            .await
-            .unwrap();
+        interfaces.remove(43).await.unwrap();
         assert_eq!(
             interfaces.kernel.objects.len(),
             1,
@@ -379,6 +395,22 @@ mod tests {
         interfaces.reconcile(&HashSet::new()).await.unwrap();
         interfaces.reconcile(&HashSet::new()).await.unwrap();
         assert!(interfaces.kernel.objects.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn individual_operations_never_list_interfaces() {
+        let mut interfaces = controller();
+        interfaces.ensure(41).await.unwrap();
+        interfaces.ensure(42).await.unwrap();
+        interfaces.ensure(41).await.unwrap();
+        interfaces.remove(42).await.unwrap();
+        interfaces.remove(42).await.unwrap();
+        assert_eq!(interfaces.kernel.lists, 0);
+        assert_eq!(interfaces.kernel.objects.len(), 1);
+        assert_eq!(interfaces.kernel.creates, 2);
+        assert_eq!(interfaces.kernel.updates, 0);
+        interfaces.reconcile(&HashSet::from([41])).await.unwrap();
+        assert_eq!(interfaces.kernel.lists, 1, "one inventory per audit");
     }
 
     #[tokio::test(flavor = "current_thread")]

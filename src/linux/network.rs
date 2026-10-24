@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Network semantics ported from kernel_netlink_net.c, Copyright secunet
 // Security Networks AG, Martin Willi, Tobias Brunner and contributors.
-use super::netlink::{Message, Netlink, NlFamily, NlmF};
+use super::netlink::{Message, Netlink, NlFamily, NlmF, Reply};
 use crate::{error::invalid, model::*, rpc_api::AddressTypes};
-use netlink_packet_core::ParseableParametrized;
+use netlink_packet_core::{
+    parse_string, parse_u32, Emitable, Nla, NlasIterator, ParseableParametrized,
+};
 use netlink_packet_route::{
     address::{AddressAttribute, AddressFlags, AddressMessage, AddressScope},
-    link::{InfoData, InfoKind, InfoXfrm, LinkAttribute, LinkFlags, LinkInfo, LinkMessage},
+    link::{InfoXfrm, LinkAttribute, LinkFlags, LinkHeader, LinkMessage},
     route::{RouteAddress, RouteAttribute, RouteMessage, RouteType},
     AddressFamily, RouteNetlinkMessage,
 };
@@ -23,44 +25,67 @@ pub struct Link {
     pub xfrm_if_id: Option<u32>,
 }
 impl Link {
-    fn from_message(info: LinkMessage) -> Self {
+    fn parse(payload: &[u8]) -> io::Result<Self> {
+        let header = LinkHeader::parse(payload).map_err(io::Error::other)?;
         let mut link = Self {
-            index: info.header.index,
-            flags: info.header.flags,
+            index: header.index,
+            flags: header.flags,
             name: String::new(),
             mtu: 0,
             master: 0,
             group: 0,
             xfrm_if_id: None,
         };
-        for attr in info.attributes {
-            match attr {
-                LinkAttribute::IfName(name) => link.name = name,
-                LinkAttribute::Mtu(mtu) => link.mtu = mtu,
-                LinkAttribute::Controller(master) => link.master = master,
-                LinkAttribute::Group(group) => link.group = group,
-                LinkAttribute::LinkInfo(infos) => {
-                    for info in infos {
-                        match info {
-                            LinkInfo::Kind(InfoKind::Xfrm) => {
-                                link.xfrm_if_id.get_or_insert(0);
-                            }
-                            LinkInfo::Data(InfoData::Xfrm(attrs)) => {
-                                let if_id = link.xfrm_if_id.get_or_insert(0);
-                                for attr in attrs {
-                                    if let InfoXfrm::IfId(value) = attr {
-                                        *if_id = value;
-                                    }
-                                }
-                            }
-                            _ => (),
-                        }
-                    }
+        // Walk attribute framing, decoding only the fields consumed by this
+        // daemon. AF_SPEC, statistics, VF data and other kinds' nested settings
+        // can dwarf these fields on production hosts.
+        for attr in NlasIterator::new(&payload[header.buffer_len()..]) {
+            let attr = attr.map_err(io::Error::other)?;
+            match attr.kind() {
+                libc::IFLA_IFNAME => {
+                    link.name = parse_string(attr.value()).map_err(io::Error::other)?
                 }
+                libc::IFLA_MTU => link.mtu = parse_u32(attr.value()).map_err(io::Error::other)?,
+                libc::IFLA_MASTER => {
+                    link.master = parse_u32(attr.value()).map_err(io::Error::other)?
+                }
+                libc::IFLA_GROUP => {
+                    link.group = parse_u32(attr.value()).map_err(io::Error::other)?
+                }
+                libc::IFLA_LINKINFO => link.xfrm_if_id = Self::xfrm_id(attr.value())?,
                 _ => (),
             }
         }
-        link
+        Ok(link)
+    }
+
+    fn xfrm_id(payload: &[u8]) -> io::Result<Option<u32>> {
+        let mut xfrm = false;
+        let mut data = None;
+        for attr in NlasIterator::new(payload) {
+            let attr = attr.map_err(io::Error::other)?;
+            match attr.kind() {
+                libc::IFLA_INFO_KIND => {
+                    let value = attr.value();
+                    xfrm = value.strip_suffix(&[0]).unwrap_or(value) == b"xfrm";
+                }
+                libc::IFLA_INFO_DATA => data = Some(attr),
+                _ => (),
+            }
+        }
+        if !xfrm {
+            return Ok(None);
+        }
+        let mut id = 0;
+        if let Some(data) = data {
+            for attr in NlasIterator::new(data.value()) {
+                let attr = attr.map_err(io::Error::other)?;
+                if attr.kind() == InfoXfrm::IfId(0).kind() {
+                    id = parse_u32(attr.value()).map_err(io::Error::other)?;
+                }
+            }
+        }
+        Ok(Some(id))
     }
 }
 #[derive(Clone, Debug)]
@@ -119,8 +144,7 @@ impl Network {
         request: RouteNetlinkMessage,
         flags: NlmF,
     ) -> io::Result<Vec<RouteNetlinkMessage>> {
-        self.socket
-            .request(&Message::new(request.message_type(), flags, &request))
+        self.request_raw(request, flags)
             .await?
             .into_iter()
             .map(|reply| {
@@ -128,6 +152,15 @@ impl Network {
                     .map_err(io::Error::other)
             })
             .collect()
+    }
+    async fn request_raw(
+        &self,
+        request: RouteNetlinkMessage,
+        flags: NlmF,
+    ) -> io::Result<Vec<Reply>> {
+        self.socket
+            .request(&Message::new(request.message_type(), flags, &request))
+            .await
     }
     pub fn invalidate(&mut self) {
         self.snapshot = None;
@@ -144,11 +177,11 @@ impl Network {
     pub async fn links(&mut self) -> io::Result<Vec<Link>> {
         let mut links = Vec::new();
         let request = RouteNetlinkMessage::GetLink(LinkMessage::default());
-        for reply in self.request(request, NlmF::DUMP).await? {
-            let RouteNetlinkMessage::NewLink(info) = reply else {
+        for reply in self.request_raw(request, NlmF::DUMP).await? {
+            if reply.kind != libc::RTM_NEWLINK {
                 continue;
-            };
-            let link = Link::from_message(info);
+            }
+            let link = Link::parse(&reply.payload)?;
             if !link.name.is_empty() {
                 links.push(link);
             }
@@ -158,18 +191,29 @@ impl Network {
     pub(crate) async fn link(&mut self, index: u32) -> io::Result<Option<Link>> {
         let mut request = LinkMessage::default();
         request.header.index = index;
+        self.get_link(request).await
+    }
+    pub(crate) async fn link_by_name(&mut self, name: &str) -> io::Result<Option<Link>> {
+        let mut request = LinkMessage::default();
+        request
+            .attributes
+            .push(LinkAttribute::IfName(name.to_owned()));
+        self.get_link(request).await
+    }
+    async fn get_link(&self, request: LinkMessage) -> io::Result<Option<Link>> {
         let replies = match self
-            .request(RouteNetlinkMessage::GetLink(request), NlmF::empty())
+            .request_raw(RouteNetlinkMessage::GetLink(request), NlmF::empty())
             .await
         {
             Ok(replies) => replies,
             Err(error) if error.raw_os_error() == Some(libc::ENODEV) => return Ok(None),
             Err(error) => return Err(error),
         };
-        Ok(replies.into_iter().find_map(|reply| match reply {
-            RouteNetlinkMessage::NewLink(info) => Some(Link::from_message(info)),
-            _ => None,
-        }))
+        replies
+            .into_iter()
+            .find(|reply| reply.kind == libc::RTM_NEWLINK)
+            .map(|reply| Link::parse(&reply.payload))
+            .transpose()
     }
     pub async fn addresses(&mut self) -> io::Result<Vec<AddressEntry>> {
         let mut out = Vec::new();
@@ -370,6 +414,85 @@ impl Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use netlink_packet_core::{DefaultNla, Parseable, NLA_F_NESTED};
+    use netlink_packet_route::link::{InfoData, InfoKind, LinkInfo};
+
+    fn link_payload(attributes: Vec<LinkAttribute>) -> Vec<u8> {
+        let mut message = LinkMessage::default();
+        message.header.index = 7;
+        message.header.flags = LinkFlags::Up | LinkFlags::Multicast;
+        message.attributes = attributes;
+        let mut payload = vec![0; message.buffer_len()];
+        message.emit(&mut payload);
+        payload
+    }
+
+    #[test]
+    fn link_parsing_decodes_needed_fields_and_skips_unmanaged_payloads() {
+        let payload = link_payload(vec![
+            LinkAttribute::IfName("ranet00000029".into()),
+            LinkAttribute::Mtu(1400),
+            LinkAttribute::Controller(3),
+            LinkAttribute::Group(17227),
+            LinkAttribute::LinkInfo(vec![
+                LinkInfo::Kind(InfoKind::Xfrm),
+                LinkInfo::Data(InfoData::Xfrm(vec![InfoXfrm::IfId(41)])),
+                LinkInfo::Other(DefaultNla::new(libc::IFLA_INFO_XSTATS, vec![0xff])),
+            ]),
+            // Valid framing with deliberately invalid unused payloads proves
+            // that statistics and deeply nested address-family data are skipped.
+            LinkAttribute::Other(DefaultNla::new(libc::IFLA_STATS64, vec![0xff])),
+            LinkAttribute::Other(DefaultNla::new(
+                libc::IFLA_AF_SPEC | NLA_F_NESTED,
+                vec![0xff],
+            )),
+        ]);
+        assert!(LinkMessage::parse(payload.as_slice()).is_err());
+        let link = Link::parse(&payload).unwrap();
+        assert_eq!(link.index, 7);
+        assert_eq!(link.flags, LinkFlags::Up | LinkFlags::Multicast);
+        assert_eq!(link.name, "ranet00000029");
+        assert_eq!(
+            (link.mtu, link.master, link.group, link.xfrm_if_id),
+            (1400, 3, 17227, Some(41))
+        );
+    }
+
+    #[test]
+    fn link_parsing_skips_other_device_kinds_data() {
+        for kind in [InfoKind::Veth, InfoKind::Bridge, InfoKind::Vrf] {
+            let payload = link_payload(vec![LinkAttribute::LinkInfo(vec![
+                LinkInfo::Kind(kind),
+                LinkInfo::Other(DefaultNla::new(libc::IFLA_INFO_DATA, vec![0xff])),
+            ])]);
+            assert_eq!(Link::parse(&payload).unwrap().xfrm_if_id, None);
+        }
+        let payload = link_payload(vec![LinkAttribute::LinkInfo(vec![LinkInfo::Kind(
+            InfoKind::Xfrm,
+        )])]);
+        assert_eq!(Link::parse(&payload).unwrap().xfrm_if_id, Some(0));
+    }
+
+    #[test]
+    fn link_parsing_rejects_invalid_needed_fields_and_framing() {
+        assert!(Link::parse(&[0; 15]).is_err());
+        let mut payload = link_payload(Vec::new());
+        payload.extend_from_slice(&[1, 0]);
+        assert!(Link::parse(&payload).is_err());
+        for kind in [libc::IFLA_MTU, libc::IFLA_MASTER, libc::IFLA_GROUP] {
+            let payload = link_payload(vec![LinkAttribute::Other(DefaultNla::new(kind, vec![1]))]);
+            assert!(Link::parse(&payload).is_err());
+        }
+        let payload = link_payload(vec![LinkAttribute::LinkInfo(vec![
+            LinkInfo::Kind(InfoKind::Xfrm),
+            LinkInfo::Data(InfoData::Xfrm(vec![InfoXfrm::Other(DefaultNla::new(
+                InfoXfrm::IfId(0).kind(),
+                vec![1],
+            ))])),
+        ])]);
+        assert!(Link::parse(&payload).is_err());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn actual_network_discovery() {
         let mut net = Network::new().await.unwrap();

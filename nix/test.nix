@@ -497,7 +497,7 @@ in
     with subtest("C ABI and complete IPv6 endpoints through tarpc"):
         left.succeed("unshare --net python3 ${../tests/plugin.py} ${abiPrefix}")
 
-    with subtest("VICI stays responsive with 200 connections and continuous route updates"):
+    with subtest("VICI stays responsive with 200 connections and continuous route/link updates"):
         left.succeed(
             "PYTHONPATH=${pkgs.strongswan.src}/src/libcharon/plugins/vici/python "
             "timeout 45s python3 ${../tests/vici_churn.py}"

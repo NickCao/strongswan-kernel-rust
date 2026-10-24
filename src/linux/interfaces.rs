@@ -74,6 +74,19 @@ impl LinuxInterfaces {
         link.name.strip_prefix(&self.prefix)?.parse().ok()
     }
 
+    fn observed(&self, link: &Link, master: Option<String>) -> ObservedInterface<InterfaceHandle> {
+        ObservedInterface {
+            handle: InterfaceHandle::from_link(link, self.id(link)),
+            config: link.xfrm_if_id.map(|if_id| InterfaceConfig {
+                if_id,
+                mtu: link.mtu,
+                master,
+                up: link.flags.contains(LinkFlags::Up),
+                multicast: link.flags.contains(LinkFlags::Multicast),
+            }),
+        }
+    }
+
     fn settings(&self, spec: &InterfaceSpec, index: u32) -> io::Result<LinkMessage> {
         if spec.config.if_id == 0 {
             return Err(invalid());
@@ -112,34 +125,45 @@ impl InterfaceKernel for LinuxInterfaces {
             .iter()
             .filter(|link| link.group == self.group)
             .map(|link| {
-                let id = self.id(link);
-                let handle = InterfaceHandle::from_link(link, id);
-                let config = if let Some(if_id) = link.xfrm_if_id {
-                    let master = if link.master == 0 {
-                        None
-                    } else {
-                        Some(
-                            links
-                                .iter()
-                                .find(|other| other.index == link.master)
-                                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?
-                                .name
-                                .clone(),
-                        )
-                    };
-                    Some(InterfaceConfig {
-                        if_id,
-                        mtu: link.mtu,
-                        master,
-                        up: link.flags.contains(LinkFlags::Up),
-                        multicast: link.flags.contains(LinkFlags::Multicast),
-                    })
+                let master = if link.master != 0 && link.xfrm_if_id.is_some() {
+                    Some(
+                        links
+                            .iter()
+                            .find(|other| other.index == link.master)
+                            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?
+                            .name
+                            .clone(),
+                    )
                 } else {
                     None
                 };
-                Ok(ObservedInterface { handle, config })
+                Ok(self.observed(link, master))
             })
             .collect()
+    }
+
+    async fn get(
+        &mut self,
+        id: InterfaceId,
+    ) -> io::Result<Option<ObservedInterface<InterfaceHandle>>> {
+        let Some(link) = self.net.link_by_name(&self.name(id)).await? else {
+            return Ok(None);
+        };
+        if link.group != self.group {
+            return Ok(None);
+        }
+        let master = if link.master != 0 && link.xfrm_if_id.is_some() {
+            Some(
+                self.net
+                    .link(link.master)
+                    .await?
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?
+                    .name,
+            )
+        } else {
+            None
+        };
+        Ok(Some(self.observed(&link, master)))
     }
 
     async fn create(&mut self, spec: &InterfaceSpec) -> io::Result<InterfaceHandle> {

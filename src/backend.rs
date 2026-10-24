@@ -51,10 +51,23 @@ impl<I: InterfaceKernel> Backend<I> {
             .chain(self.policies.interface_ids())
             .collect()
     }
-    pub async fn cleanup_interfaces(&mut self) -> io::Result<()> {
-        self.interfaces
-            .remove_unused(&self.desired_interfaces())
-            .await
+    pub(crate) async fn cleanup_interface(&mut self, if_id: u32) -> io::Result<()> {
+        if self.sas.ids().any(|sa| sa.if_id == if_id)
+            || self.policies.interface_ids().any(|id| id == if_id)
+        {
+            return Ok(());
+        }
+        self.interfaces.remove(if_id).await
+    }
+    pub(crate) async fn cleanup_interfaces(&mut self, candidates: &HashSet<u32>) -> io::Result<()> {
+        let desired = self.desired_interfaces();
+        let mut first_error = None;
+        for id in candidates.difference(&desired) {
+            if let Err(error) = self.interfaces.remove(*id).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
     pub async fn reconcile_interfaces(&mut self) -> io::Result<()> {
         self.interfaces.reconcile(&self.desired_interfaces()).await
@@ -63,7 +76,8 @@ impl<I: InterfaceKernel> Backend<I> {
         let mut changes = self.sas.reconcile().await?;
         // Policies, including traps, keep their interfaces after SA loss.
         // Release only interfaces that have no remaining owner.
-        if let Err(error) = self.cleanup_interfaces().await {
+        let candidates = changes.expired.iter().map(|id| id.if_id).collect();
+        if let Err(error) = self.cleanup_interfaces(&candidates).await {
             changes.cleanup_error.get_or_insert(error);
         }
         Ok(changes)
@@ -74,17 +88,19 @@ impl<I: InterfaceKernel> Backend<I> {
         config: rpc::PolicyConfig,
     ) -> io::Result<()> {
         let id = policy_id(id)?;
+        let if_id = id.if_id;
         let data = policy_config(config)?;
         let result = async {
             self.interfaces.ensure(id.if_id).await?;
             self.policies.add_policy(id, data).await
         }
         .await;
-        // Retain a successful policy reference even if interface cleanup
-        // fails. Failed installations have no reference and release their
-        // temporary interface; reconciliation retries interrupted cleanup.
-        if let Err(error) = self.cleanup_interfaces().await {
-            eprintln!("kernel-daemon: interface cleanup after policy installation: {error}");
+        // Failed installations release only their temporary interface.
+        // Periodic reconciliation retries interrupted cleanup.
+        if result.is_err() {
+            if let Err(error) = self.cleanup_interface(if_id).await {
+                eprintln!("kernel-daemon: interface cleanup after policy installation: {error}");
+            }
         }
         result
     }
@@ -93,16 +109,18 @@ impl<I: InterfaceKernel> Backend<I> {
         id: rpc::PolicyId,
         config: rpc::PolicyConfig,
     ) -> io::Result<()> {
+        let id = policy_id(id)?;
         let result = self
             .policies
-            .delete_policy(&policy_id(id)?, &policy_config(config)?)
+            .delete_policy(&id, &policy_config(config)?)
             .await;
-        let cleanup = self.cleanup_interfaces().await;
+        let cleanup = self.cleanup_interface(id.if_id).await;
         result.and(cleanup)
     }
     pub async fn flush_policies(&mut self) -> io::Result<()> {
+        let candidates = self.policies.interface_ids().collect();
         let result = self.policies.flush_policies().await;
-        let cleanup = self.cleanup_interfaces().await;
+        let cleanup = self.cleanup_interfaces(&candidates).await;
         result.and(cleanup)
     }
     pub async fn install_sa(&mut self, id: rpc::SaId, config: rpc::SaConfig) -> io::Result<()> {
@@ -134,21 +152,24 @@ impl<I: InterfaceKernel> Backend<I> {
         }
         self.interfaces.ensure(id.if_id).await?;
         let result = self.sas.install(&id, &config).await;
-        // Charon must record successful installation even if interface cleanup
-        // fails. Reconciliation retries cleanup independently.
-        if let Err(error) = self.cleanup_interfaces().await {
-            eprintln!("kernel-daemon: interface cleanup after SA installation: {error}");
+        // Preserve the installation result if rolling back its interface fails.
+        if result.is_err() {
+            if let Err(error) = self.cleanup_interface(id.if_id).await {
+                eprintln!("kernel-daemon: interface cleanup after SA installation: {error}");
+            }
         }
         result
     }
     pub async fn remove_sa(&mut self, id: rpc::SaId) -> io::Result<()> {
-        let result = self.sas.remove(&sa_id(id)?).await;
-        let cleanup = self.cleanup_interfaces().await;
+        let id = sa_id(id)?;
+        let result = self.sas.remove(&id).await;
+        let cleanup = self.cleanup_interface(id.if_id).await;
         result.and(cleanup)
     }
     pub async fn flush_sas(&mut self) -> io::Result<()> {
+        let candidates = self.sas.ids().map(|id| id.if_id).collect();
         let result = self.sas.clear().await;
-        let cleanup = self.cleanup_interfaces().await;
+        let cleanup = self.cleanup_interfaces(&candidates).await;
         result.and(cleanup)
     }
     pub async fn shutdown(&mut self) -> io::Result<()> {
@@ -164,6 +185,9 @@ impl<I: InterfaceKernel> Backend<I> {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
         self.flush_sas().await?;
+        // Session teardown also discovers leftovers from interrupted targeted
+        // cleanup, including owned interfaces renamed by another process.
+        self.reconcile_interfaces().await?;
         self.policies.clear();
         self.policies.reconcile().await
     }
@@ -318,18 +342,25 @@ mod tests {
 
     struct InterruptedCleanup {
         kernel: LinuxInterfaces,
-        dumps: Arc<AtomicUsize>,
+        lookups: Arc<AtomicUsize>,
+        interrupt: bool,
     }
     impl InterfaceKernel for InterruptedCleanup {
         type Handle = <LinuxInterfaces as InterfaceKernel>::Handle;
 
         async fn list(&mut self) -> io::Result<Vec<ObservedInterface<Self::Handle>>> {
-            // The first inventory prepares the interface. Interrupt the next
-            // dump, which cleans up interfaces after the SA install attempt.
-            if self.dumps.fetch_add(1, Ordering::SeqCst) == 1 {
+            panic!("individual SA operations must not list interfaces")
+        }
+        async fn get(
+            &mut self,
+            id: crate::interfaces::InterfaceId,
+        ) -> io::Result<Option<ObservedInterface<Self::Handle>>> {
+            // The first lookup prepares the interface. Interrupt the lookup
+            // used to roll back a rejected installation.
+            if self.lookups.fetch_add(1, Ordering::SeqCst) == 1 && self.interrupt {
                 return Err(io::Error::from_raw_os_error(libc::EINTR));
             }
-            self.kernel.list().await
+            self.kernel.get(id).await
         }
         async fn create(&mut self, spec: &InterfaceSpec) -> io::Result<Self::Handle> {
             self.kernel.create(spec).await
@@ -347,9 +378,11 @@ mod tests {
     #[case::rejected(false)]
     #[ignore = "requires root; creates a network namespace"]
     #[tokio::test(flavor = "current_thread")]
-    async fn sa_installation_result_survives_cleanup_failure(#[case] successful: bool) {
+    async fn sa_installation_uses_targeted_rollback_and_preserves_its_result(
+        #[case] successful: bool,
+    ) {
         let _namespace = crate::test_netns::Netns::new();
-        let dumps = Arc::new(AtomicUsize::new(0));
+        let lookups = Arc::new(AtomicUsize::new(0));
         let kernel = async || LinuxInterfaces::new("tst".into(), 17227).await.unwrap();
         let mut backend = Backend {
             sas: Sas::new(LinuxSas::new(Default::default()).await.unwrap()),
@@ -358,7 +391,8 @@ mod tests {
             interfaces: Interfaces::new(
                 InterruptedCleanup {
                     kernel: kernel().await,
-                    dumps: dumps.clone(),
+                    lookups: lookups.clone(),
+                    interrupt: !successful,
                 },
                 None,
                 1400,
@@ -423,7 +457,10 @@ mod tests {
             update: false,
         };
         let result = backend.install_sa(id(), config).await;
-        assert_eq!(dumps.load(Ordering::SeqCst), 2, "cleanup was interrupted");
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            if successful { 1 } else { 2 }
+        );
         if successful {
             result.unwrap();
             backend.sas.query(&sa_id(id()).unwrap()).await.unwrap();
@@ -432,9 +469,9 @@ mod tests {
         }
         let mut native = LinuxSas::new(Default::default()).await.unwrap();
         assert_eq!(native.list().await.unwrap().len(), usize::from(successful));
-        // A later cleanup retries the interrupted dump. It retains an
+        // A later cleanup retries the interrupted lookup. It retains an
         // installed SA's interface and removes a rejected install's interface.
-        backend.cleanup_interfaces().await.unwrap();
+        backend.cleanup_interface(41).await.unwrap();
         assert_eq!(
             kernel().await.list().await.unwrap().len(),
             usize::from(successful)

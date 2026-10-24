@@ -305,8 +305,10 @@ not require an iproute2 group-name entry. Names encode logical identity;
 renaming an owned interface can cause replacement.
 
 The daemon retains desired policies and the managed configuration of installed
-SAs in memory. Reconciliation responds to SA/policy/link notifications,
-coalesced over 100 ms, and audits every five seconds:
+SAs in memory. Normal ownership changes use targeted interface lookups,
+creation and deletion. SA/policy notifications request repairs coalesced over
+100 ms. Full interface discovery and repair run every five seconds, and during
+session startup/shutdown; link notifications do not trigger full scans:
 
 | Resource | Reconciliation |
 | --- | --- |
@@ -412,7 +414,7 @@ AES-GCM, AES-CBC/HMAC, ESN, TFC and ICMP flags,
 IP-TFS aggregation/fragmentation, trap-only interface creation and traffic-triggered
 negotiation, rekeying, policy/interface repair, SA-loss
 recovery, VICI loading/reloading of 200 unreachable-peer configurations under
-route churn, socket access, service hardening and paired restart/shutdown behavior.
+route/link churn, socket access, service hardening and paired restart/shutdown behavior.
 It also checks the plugin ABI against actual strongSwan libraries.
 
 ```sh
