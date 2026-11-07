@@ -98,6 +98,7 @@ let
       STRONGSWAN_SOURCE = headers;
       CONFIG_H_DIR = headers;
       doCheck = false; # Host symbols are provided by charon; exercised in the VM test.
+      dontPatchELF = true;
       buildPhase = ''
         runHook preBuild
         cargo cbuild -p strongswan-kernel-rust --release --offline --locked \
