@@ -54,20 +54,6 @@ let
     '';
   });
 
-  # Plugin installation mode requires cargo-c >= 0.10.26.
-  cargoC = (pkgs.cargo-c.override { inherit rustPlatform; }).overrideAttrs (old: rec {
-    version = "0.10.26";
-    src = pkgs.fetchCrate {
-      pname = "cargo-c";
-      version = "${version}+cargo-0.100.0";
-      hash = "sha256-rt7LegE5DEOF/BP7OCSkl8hcziUpz7dJr7kMNDwXw1c=";
-    };
-    cargoDeps = rustPlatform.fetchCargoVendor {
-      inherit src;
-      hash = "sha256-j4PIJnPy04vEzTPTo2aD5xMKLUTeyXt13+YdZaqCm2E=";
-    };
-  });
-
   cargoDeps = rustPlatform.importCargoLock { lockFile = ../Cargo.lock; };
   common = {
     inherit version src cargoDeps;
@@ -104,7 +90,7 @@ let
     // {
       pname = "kernel-rust-plugin";
       nativeBuildInputs = [
-        cargoC
+        pkgs.cargo-c
         rustPlatform.bindgenHook
       ];
       # Included by strongSwan headers when configured with libcap support.
@@ -184,7 +170,6 @@ in
   inherit
     pkgs
     toolchain
-    cargoC
     daemon
     plugin
     strongswan

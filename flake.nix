@@ -2,7 +2,7 @@
   description = "strongSwan kernel privilege separation with Rust and tarpc";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable-small";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -58,7 +58,7 @@
         default = builds.${system}.pkgs.mkShell {
           packages = with builds.${system}; [
             toolchain
-            cargoC
+            pkgs.cargo-c
             pkgs.pkg-config
             pkgs.rustPlatform.bindgenHook
           ];
