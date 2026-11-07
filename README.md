@@ -186,9 +186,8 @@ configuration.
 
 ## Cargo build and installation
 
-The repository pins Rust 1.99.1 in `rust-toolchain.toml`. Building the plugin
-also requires a native linker, libclang, cargo-c 0.10.26 or later, and two
-absolute header paths:
+Building the plugin also requires a native linker, libclang, cargo-c 0.10.26
+or later, and two absolute header paths:
 
 - `STRONGSWAN_SOURCE`: the full source tree matching the installed strongSwan.
 - `CONFIG_H_DIR`: a directory containing that build's generated `config.h`.

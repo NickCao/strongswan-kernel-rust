@@ -3,17 +3,12 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable-small";
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
   outputs =
     {
       self,
       nixpkgs,
-      rust-overlay,
     }:
     let
       systems = [
@@ -26,7 +21,6 @@
         import ./nix/packages.nix {
           pkgs = import nixpkgs {
             inherit system;
-            overlays = [ rust-overlay.overlays.default ];
           };
         }
       );
@@ -57,7 +51,8 @@
       devShells = forAllSystems (system: {
         default = builds.${system}.pkgs.mkShell {
           packages = with builds.${system}; [
-            toolchain
+            pkgs.rustc
+            pkgs.cargo
             pkgs.cargo-c
             pkgs.pkg-config
             pkgs.rustPlatform.bindgenHook

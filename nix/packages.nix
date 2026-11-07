@@ -7,18 +7,12 @@ let
     fileset = lib.fileset.unions [
       ../Cargo.toml
       ../Cargo.lock
-      ../rust-toolchain.toml
       ../COPYING
       ../src
       ../plugin
       ../protocol
       (lib.fileset.fileFilter (file: file.hasExt "rs") ../tests)
     ];
-  };
-  toolchain = pkgs.rust-bin.fromRustupToolchainFile ../rust-toolchain.toml;
-  rustPlatform = pkgs.makeRustPlatform {
-    cargo = toolchain;
-    rustc = toolchain;
   };
 
   # Keep upstream plugins and external plugins in the NixOS system profile.
@@ -54,7 +48,7 @@ let
     '';
   });
 
-  cargoDeps = rustPlatform.importCargoLock { lockFile = ../Cargo.lock; };
+  cargoDeps = pkgs.rustPlatform.importCargoLock { lockFile = ../Cargo.lock; };
   common = {
     inherit version src cargoDeps;
     meta = {
@@ -64,7 +58,7 @@ let
     };
   };
 
-  daemon = rustPlatform.buildRustPackage (
+  daemon = pkgs.rustPlatform.buildRustPackage (
     common
     // {
       pname = "charon-kernel-daemon";
@@ -85,13 +79,13 @@ let
     }
   );
 
-  plugin = rustPlatform.buildRustPackage (
+  plugin = pkgs.rustPlatform.buildRustPackage (
     common
     // {
       pname = "kernel-rust-plugin";
       nativeBuildInputs = [
         pkgs.cargo-c
-        rustPlatform.bindgenHook
+        pkgs.rustPlatform.bindgenHook
       ];
       # Included by strongSwan headers when configured with libcap support.
       buildInputs = [ pkgs.libcap ];
@@ -170,7 +164,6 @@ in
 {
   inherit
     pkgs
-    toolchain
     daemon
     plugin
     strongswan
